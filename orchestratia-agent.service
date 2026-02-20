@@ -18,10 +18,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=orchestratia-agent
 
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/var/log/orchestratia /var/run/orchestratia
+# Note: No filesystem restrictions (ProtectSystem, ReadWritePaths, etc.)
+# because PTY child processes (Claude Code) need full filesystem access
+# to the working directories they operate in.
 
 [Install]
 WantedBy=multi-user.target

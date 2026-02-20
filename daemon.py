@@ -578,6 +578,11 @@ async def report_alive_sessions():
             if session.reader_task is None or session.reader_task.done():
                 log.info(f"Restarting reader for session {sid[:8]}")
                 await session.start_reader()
+            # Send SIGWINCH to trigger prompt redraw for connected dashboards
+            try:
+                os.killpg(os.getpgid(session.pid), signal.SIGWINCH)
+            except (OSError, ProcessLookupError):
+                pass
 
 
 async def ws_connection_loop():

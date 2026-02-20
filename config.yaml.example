@@ -1,0 +1,26 @@
+# Orchestratia Agent Daemon Configuration
+# Copy to /etc/orchestratia/config.yaml and customize
+
+hub_url: "https://staging.orchestratia.com"
+api_key: "orc_xxxxxxxxxxxxxxxxxxxxxxxx"
+agent_name: "dev-linux-staging"
+
+repos:
+  pinaka-gateway:
+    path: /home/ubuntu/pinaka-edge-v2-rust
+    branch: staging
+  pinakaedgecom:
+    path: /home/ubuntu/pinakaedgecom
+    branch: staging
+
+claude:
+  binary: claude
+  allowed_tools: "Bash,Read,Edit,Write,Grep,Glob"
+  max_turns: 50
+  timeout_minutes: 30
+
+session:
+  backend: screen
+  log_dir: /var/log/orchestratia
+  pid_dir: /var/run/orchestratia
+  reconcile_on_start: true

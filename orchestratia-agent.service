@@ -1,0 +1,27 @@
+[Unit]
+Description=Orchestratia Agent Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/orchestratia-agent
+ExecStart=/usr/bin/python3 /opt/orchestratia-agent/daemon.py --config /etc/orchestratia/config.yaml
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=orchestratia-agent
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/orchestratia /var/run/orchestratia
+
+[Install]
+WantedBy=multi-user.target

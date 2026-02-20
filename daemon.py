@@ -45,10 +45,25 @@ config: dict = {}
 api_key: str = ""
 hub_url: str = ""
 running = True
-ws_connection = None  # Current WebSocket connection
+
+# Shared WebSocket reference - updated on reconnect, read by session readers
+ws_connection = None
+ws_lock = asyncio.Lock() if False else None  # Initialized in main()
 
 # Active PTY sessions: session_id -> PTYSession
 active_sessions: dict[str, "PTYSession"] = {}
+
+
+async def ws_send(msg: dict):
+    """Send a message on the current WebSocket, silently dropping if disconnected."""
+    ws = ws_connection
+    if ws and not getattr(ws, "close_code", None):
+        try:
+            await ws.send(json.dumps(msg))
+            return True
+        except Exception:
+            return False
+    return False
 
 
 class PTYSession:
@@ -61,30 +76,39 @@ class PTYSession:
         self.reader_task: asyncio.Task | None = None
         self.closed = False
 
-    async def start_reader(self, ws):
-        """Start async reader that relays PTY output to WebSocket."""
-        self.reader_task = asyncio.create_task(self._read_loop(ws))
+    async def start_reader(self):
+        """Start async reader that relays PTY output via the shared WebSocket."""
+        if self.reader_task and not self.reader_task.done():
+            self.reader_task.cancel()
+            try:
+                await self.reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.reader_task = asyncio.create_task(self._read_loop())
 
-    async def _read_loop(self, ws):
-        """Read from PTY master fd and send to hub as base64."""
+    async def _read_loop(self):
+        """Read from PTY master fd and send to hub as base64.
+
+        Uses the global ws_connection reference so it survives WS reconnections.
+        If WS is down, output is silently dropped (same as a real terminal with
+        no viewer connected). The PTY process keeps running regardless.
+        """
         loop = asyncio.get_event_loop()
         try:
             while not self.closed:
                 try:
-                    data = await loop.run_in_executor(
-                        None, self._blocking_read
-                    )
+                    data = await loop.run_in_executor(None, self._blocking_read)
                     if data is None:
                         # EOF - process exited
                         break
                     if data:
                         b64 = base64.b64encode(data).decode("ascii")
-                        if ws and not getattr(ws, 'close_code', None):
-                            await ws.send(json.dumps({
-                                "type": "session_output",
-                                "session_id": self.session_id,
-                                "data": b64,
-                            }))
+                        # Use shared ws_connection - may fail if WS is down, that's OK
+                        await ws_send({
+                            "type": "session_output",
+                            "session_id": self.session_id,
+                            "data": b64,
+                        })
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -99,15 +123,13 @@ class PTYSession:
                 os.close(self.master_fd)
             except OSError:
                 pass
-            if ws and not getattr(ws, 'close_code', None):
-                try:
-                    await ws.send(json.dumps({
-                        "type": "session_closed",
-                        "session_id": self.session_id,
-                        "exit_code": exit_code,
-                    }))
-                except Exception:
-                    pass
+            await ws_send({
+                "type": "session_closed",
+                "session_id": self.session_id,
+                "exit_code": exit_code,
+            })
+            # Remove from active sessions
+            active_sessions.pop(self.session_id, None)
             log.info(f"Session {self.session_id[:8]} closed (exit_code={exit_code})")
 
     def _blocking_read(self) -> bytes | None:
@@ -134,6 +156,16 @@ class PTYSession:
         except ChildProcessError:
             pass
         return None
+
+    def is_alive(self) -> bool:
+        """Check if the child process is still running."""
+        if self.closed:
+            return False
+        try:
+            os.kill(self.pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
 
     def write_input(self, data: bytes):
         """Write input data to the PTY."""
@@ -418,7 +450,7 @@ async def connect_ws():
         await ws.send(json.dumps({"type": "auth", "api_key": api_key}))
         resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
         if resp.get("type") == "auth_ok":
-            log.info("WebSocket connected to hub")
+            log.info("WebSocket connected and authenticated")
             return ws
         else:
             log.error(f"WebSocket auth failed: {resp}")
@@ -439,8 +471,10 @@ async def heartbeat_loop(client: httpx.AsyncClient):
 
 
 async def ws_receive_loop(ws):
-    """Receive messages from hub and dispatch to session handlers."""
-    global running
+    """Receive messages from hub and dispatch to session handlers.
+
+    Returns when the WebSocket connection drops (triggering reconnect in the caller).
+    """
     try:
         while running:
             raw = await ws.recv()
@@ -457,19 +491,19 @@ async def ws_receive_loop(ws):
                 session = spawn_pty_session(session_id, working_dir, cols, rows)
                 if session:
                     active_sessions[session_id] = session
-                    await session.start_reader(ws)
+                    await session.start_reader()
                     # Report success
-                    await ws.send(json.dumps({
+                    await ws_send({
                         "type": "session_started",
                         "session_id": session_id,
                         "pid": session.pid,
-                    }))
+                    })
                 else:
-                    await ws.send(json.dumps({
+                    await ws_send({
                         "type": "session_error",
                         "session_id": session_id,
                         "error": "Failed to spawn PTY",
-                    }))
+                    })
 
             elif msg_type == "session_input":
                 session_id = msg.get("session_id")
@@ -506,18 +540,79 @@ async def ws_receive_loop(ws):
 
     except websockets.exceptions.ConnectionClosed:
         log.warning("WebSocket connection closed by hub")
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         log.error(f"WebSocket receive error: {e}")
 
 
-async def ws_keepalive_loop(ws):
-    """Keep WebSocket connection alive."""
-    while running and ws and not getattr(ws, 'close_code', None):
+async def report_alive_sessions():
+    """After WS reconnect, report any sessions that are still alive.
+
+    This lets the hub know which sessions survived the disconnect
+    and re-marks them as active.
+    """
+    # Clean up dead sessions first
+    dead = [sid for sid, s in active_sessions.items() if not s.is_alive()]
+    for sid in dead:
+        session = active_sessions.pop(sid)
+        session.closed = True
         try:
-            await ws.send(json.dumps({"type": "ping"}))
-            await asyncio.sleep(30)
-        except Exception:
+            os.close(session.master_fd)
+        except OSError:
+            pass
+        log.info(f"Cleaned up dead session {sid[:8]}")
+
+    # Report alive sessions
+    alive = list(active_sessions.keys())
+    if alive:
+        log.info(f"Reporting {len(alive)} alive session(s) to hub")
+        for sid in alive:
+            session = active_sessions[sid]
+            await ws_send({
+                "type": "session_started",
+                "session_id": sid,
+                "pid": session.pid,
+            })
+            # Restart the reader if it died (it would have stopped when WS dropped)
+            if session.reader_task is None or session.reader_task.done():
+                log.info(f"Restarting reader for session {sid[:8]}")
+                await session.start_reader()
+
+
+async def ws_connection_loop():
+    """Maintain the WebSocket connection with automatic reconnection.
+
+    When the connection drops, waits with exponential backoff and reconnects.
+    Active PTY sessions survive disconnections - their output is just dropped
+    until the WS comes back, then readers are re-attached.
+    """
+    global ws_connection
+    backoff = 1  # seconds, increases up to 30
+
+    while running:
+        ws = await connect_ws()
+        if ws:
+            ws_connection = ws
+            backoff = 1  # Reset backoff on successful connect
+
+            # Report any sessions that survived the disconnect
+            await report_alive_sessions()
+
+            # Run receive loop until it returns (connection dropped)
+            await ws_receive_loop(ws)
+
+            # Connection dropped
+            ws_connection = None
+            log.info("WebSocket disconnected, will reconnect...")
+        else:
+            log.warning(f"WebSocket connect failed, retrying in {backoff}s...")
+
+        if not running:
             break
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
 
 
 async def cleanup_sessions():
@@ -589,26 +684,17 @@ async def main():
         signal.signal(signal.SIGINT, handle_signal)
         signal.signal(signal.SIGTERM, handle_signal)
 
-        # Connect WebSocket
-        ws = await connect_ws()
-        if not ws:
-            log.error("Failed to connect WebSocket. Exiting.")
-            sys.exit(1)
+        log.info("Agent daemon running. Heartbeats every 30s, WS auto-reconnect enabled.")
 
-        log.info("Agent daemon running. Heartbeats every 30s, waiting for session commands.")
-
-        loops = [
-            heartbeat_loop(client),
-            ws_receive_loop(ws),
-            ws_keepalive_loop(ws),
-        ]
-
+        # Run heartbeat loop and WS connection loop concurrently
+        # WS connection loop handles its own reconnection internally
         try:
-            await asyncio.gather(*loops)
+            await asyncio.gather(
+                heartbeat_loop(client),
+                ws_connection_loop(),
+            )
         finally:
             await cleanup_sessions()
-            if ws:
-                await ws.close()
 
     log.info("Agent daemon stopped.")
 

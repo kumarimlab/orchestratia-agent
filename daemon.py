@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import platform
+import shlex
 import shutil
 import signal
 import subprocess
@@ -191,26 +192,44 @@ def list_screen_sessions() -> list[str]:
 
 
 def spawn_claude_in_screen(task_id: str, spec: str, repo_path: str) -> tuple[bool, Path]:
-    """Spawn Claude Code in a detached screen session. Returns (success, log_path)."""
+    """Spawn Claude Code in a detached screen session. Returns (success, log_path).
+
+    Uses bash -c wrapper to avoid screen eating Claude's flags (screen has its
+    own -p flag). Writes the task spec to a file and pipes it to claude via
+    stdin to handle long/multiline specs cleanly.
+    """
     session_name = screen_session_name(task_id)
     claude_bin = config.get("claude", {}).get("binary", "claude")
     allowed_tools = config.get("claude", {}).get("allowed_tools", "Bash,Read,Edit,Write,Grep,Glob")
-    max_turns = config.get("claude", {}).get("max_turns", 50)
 
     log_dir = Path(config.get("session", {}).get("log_dir", "/var/log/orchestratia"))
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"task-{task_id}.log"
+    spec_file = log_dir / f"task-{task_id}.spec"
+
+    # Write spec to file (avoids issues with long/special-char args through screen)
+    spec_file.write_text(spec)
 
     # Clear old log file if it exists
     if log_file.exists():
         log_file.unlink()
 
+    # Build the claude command to run inside bash -c.
+    # --print: non-interactive mode (print and exit)
+    # --dangerously-skip-permissions: no interactive permission prompts in screen
+    # --allowedTools: restrict available tools for safety
+    # Spec is piped via stdin from the spec file.
+    claude_cmd = (
+        f"cat {shlex.quote(str(spec_file))} | "
+        f"{shlex.quote(claude_bin)} --print "
+        f"--dangerously-skip-permissions "
+        f"--allowedTools {shlex.quote(allowed_tools)}"
+    )
+
     cmd = [
         "screen", "-dmS", session_name,
         "-L", "-Logfile", str(log_file),
-        claude_bin, "-p", spec,
-        "--allowedTools", allowed_tools,
-        "--max-turns", str(max_turns),
+        "bash", "-c", claude_cmd,
     ]
 
     try:

@@ -559,8 +559,21 @@ async def main():
     config_path = args.config
 
     if args.register:
-        # --register mode: extract hub URL from token, create/update config, then proceed
+        # --register mode: create config, register with hub, then EXIT
         config = ensure_config_for_register(config_path, args.register)
+        hub_url = config.get("hub_url", "").rstrip("/")
+        if not hub_url:
+            log.error("hub_url not set in config")
+            sys.exit(1)
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            key = await register_with_hub(client, config_path=config_path)
+            if not key:
+                log.error("Registration failed.")
+                sys.exit(1)
+            log.info("Registration successful. Start the daemon with: sudo systemctl start orchestratia-agent")
+        return  # Exit after registration, don't start the daemon loop
+
     elif os.path.exists(config_path):
         config = load_config(config_path)
     else:

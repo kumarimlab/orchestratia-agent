@@ -9,13 +9,14 @@
 #   bash install.sh <REGISTRATION_TOKEN>
 #
 # What this does:
-#   1. Checks prerequisites (python3, git, screen, claude)
+#   0. Uninstalls any existing agent (clean slate)
+#   1. Checks prerequisites (python3, git, claude)
 #   2. Clones the agent daemon to /opt/orchestratia-agent
 #   3. Installs Python dependencies
 #   4. Registers with the hub using your one-time token
 #   5. Installs a systemd service for persistent operation
 #
-# Re-running is safe — it updates an existing installation.
+# Always safe to re-run — uninstalls first, then installs fresh.
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -41,7 +42,7 @@ LOG_DIR="/var/log/orchestratia"
 RUN_DIR="/var/run/orchestratia"
 REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 SERVICE_NAME="orchestratia-agent"
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 ERRORS=0
 
 # ── Helper functions ────────────────────────────────────────────────
@@ -130,8 +131,53 @@ fi
 
 print_header
 
-# Step 1: Prerequisites
-step 1 "Checking prerequisites"
+# Step 1: Clean up existing installation
+step 1 "Removing existing installation (if any)"
+
+EXISTING=false
+if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    EXISTING=true
+    sudo systemctl stop "$SERVICE_NAME" 2>/dev/null && ok "Stopped running service" || warn "Could not stop service"
+fi
+
+if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+    EXISTING=true
+    sudo systemctl disable "$SERVICE_NAME" 2>/dev/null && ok "Disabled service" || warn "Could not disable service"
+fi
+
+if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+    EXISTING=true
+    sudo rm -f "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null && ok "Removed service file" || warn "Could not remove service file"
+    sudo systemctl daemon-reload 2>/dev/null || true
+fi
+
+if [ -d "$INSTALL_DIR" ]; then
+    EXISTING=true
+    OLD_COMMIT=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    sudo rm -rf "$INSTALL_DIR" 2>/dev/null && ok "Removed ${INSTALL_DIR} (was ${OLD_COMMIT})" || warn "Could not remove ${INSTALL_DIR}"
+fi
+
+if [ -d "$CONFIG_DIR" ]; then
+    EXISTING=true
+    sudo rm -rf "$CONFIG_DIR" 2>/dev/null && ok "Removed ${CONFIG_DIR}" || warn "Could not remove ${CONFIG_DIR}"
+fi
+
+if [ -d "$LOG_DIR" ]; then
+    EXISTING=true
+    sudo rm -rf "$LOG_DIR" 2>/dev/null && ok "Removed ${LOG_DIR}" || warn "Could not remove ${LOG_DIR}"
+fi
+
+if [ -d "$RUN_DIR" ]; then
+    EXISTING=true
+    sudo rm -rf "$RUN_DIR" 2>/dev/null && ok "Removed ${RUN_DIR}" || warn "Could not remove ${RUN_DIR}"
+fi
+
+if [ "$EXISTING" = false ]; then
+    ok "No existing installation found"
+fi
+
+# Step 2: Prerequisites
+step 2 "Checking prerequisites"
 
 # Python 3
 if check_command python3; then
@@ -154,18 +200,6 @@ else
     fatal "git not found. Install it: sudo apt install git"
 fi
 
-# Screen
-if check_command screen; then
-    ok "screen installed"
-else
-    info "screen not found, installing..."
-    if sudo apt-get install -y screen >/dev/null 2>&1; then
-        ok "screen installed"
-    else
-        fail "Could not install screen. Install manually: sudo apt install screen"
-    fi
-fi
-
 # pip3
 if check_command pip3; then
     ok "pip3 available"
@@ -184,7 +218,7 @@ if check_command claude; then
     ok "Claude Code ${CLAUDE_VER}"
 else
     warn "Claude Code CLI not found in PATH"
-    info "The daemon needs it to execute tasks. Install later:"
+    info "The daemon needs it for interactive sessions. Install:"
     info "npm install -g @anthropic-ai/claude-code && claude auth login"
 fi
 
@@ -195,18 +229,14 @@ else
     info "sudo may prompt for your password during installation"
 fi
 
-# Step 2: Create directories
-step 2 "Creating directories"
+# Step 3: Create directories
+step 3 "Creating directories"
 
 for dir in "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"; do
-    if [ -d "$dir" ]; then
-        info "${dir} ${DIM}(exists)${NC}"
+    if sudo mkdir -p "$dir" 2>/dev/null; then
+        ok "Created ${dir}"
     else
-        if sudo mkdir -p "$dir" 2>/dev/null; then
-            ok "Created ${dir}"
-        else
-            fail "Could not create ${dir}"
-        fi
+        fail "Could not create ${dir}"
     fi
 done
 
@@ -215,36 +245,20 @@ sudo chown "$(whoami):$(whoami)" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_D
     fail "Could not set directory ownership"
 }
 
-# Step 3: Clone / update agent code
-step 3 "Installing agent daemon"
+# Step 4: Clone agent code
+step 4 "Installing agent daemon"
 
-if [ -d "$INSTALL_DIR/.git" ]; then
-    info "Existing installation found, updating..."
-    cd "$INSTALL_DIR"
-    BEFORE=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    if git pull --quiet 2>/dev/null; then
-        AFTER=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-        if [ "$BEFORE" = "$AFTER" ]; then
-            ok "Already up to date (${AFTER})"
-        else
-            ok "Updated ${BEFORE} → ${AFTER}"
-        fi
-    else
-        warn "git pull failed, continuing with existing version"
-    fi
+info "Cloning from ${REPO_URL}..."
+if git clone "$REPO_URL" "$INSTALL_DIR" 2>&1 | tail -1; then
+    COMMIT=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "")
+    ok "Installed to ${INSTALL_DIR} (${COMMIT})"
 else
-    info "Cloning from ${REPO_URL}..."
-    if git clone "$REPO_URL" "$INSTALL_DIR" 2>&1 | tail -1; then
-        COMMIT=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "")
-        ok "Installed to ${INSTALL_DIR} (${COMMIT})"
-    else
-        fail "git clone failed. Check network and repo access."
-        fatal "Cannot proceed without the agent code."
-    fi
+    fail "git clone failed. Check network and repo access."
+    fatal "Cannot proceed without the agent code."
 fi
 
-# Step 4: Python dependencies
-step 4 "Installing Python dependencies"
+# Step 5: Python dependencies
+step 5 "Installing Python dependencies"
 
 info "Installing httpx, websockets, pyyaml, psutil..."
 PIP_OUTPUT=""
@@ -266,8 +280,8 @@ else
     info "Try: pip3 install httpx websockets pyyaml psutil"
 fi
 
-# Step 5: Register with hub
-step 5 "Registering with Orchestratia hub"
+# Step 6: Register with hub
+step 6 "Registering with Orchestratia hub"
 
 info "Using one-time registration token..."
 REGISTER_OUTPUT=""
@@ -299,8 +313,8 @@ else
     info "  - Token was revoked by admin"
 fi
 
-# Step 6: Systemd service
-step 6 "Setting up systemd service"
+# Step 7: Systemd service
+step 7 "Setting up systemd service"
 
 # Update the service file with the current user if not ubuntu
 CURRENT_USER=$(whoami)

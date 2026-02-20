@@ -60,37 +60,41 @@ pip3 install -r /opt/orchestratia-agent/requirements.txt
 
 ---
 
-## Step 3: Get a Registration Token
+## Step 3: Register (One Command)
 
-Registration requires a **one-time token** from the admin dashboard. This prevents unauthorized agents from registering.
+Registration requires a **one-time token** from the admin dashboard. The token is self-contained — it encodes the hub URL, so you only need the token itself.
 
-1. Log in to the dashboard at https://staging.orchestratia.com
-2. Go to **Agents** page
-3. Click **"Register Agent"**
-4. Enter a label (e.g., your server name) and expiry
-5. Click **"Generate Token"**
-6. Copy the **Config Snippet** — it contains the hub URL and token
+1. Ask your admin to generate a token from the dashboard (Agents -> Register Agent)
+2. Run this single command with the token:
+
+```bash
+python3 /opt/orchestratia-agent/daemon.py --register <TOKEN>
+```
+
+For example:
+```bash
+python3 /opt/orchestratia-agent/daemon.py --register orcreg_aHR0cHM6Ly9zdGFnaW5nLm9yY2hlc3RyYXRpYS5jb20.abc123def456
+```
+
+**That's it.** The daemon will:
+1. Extract the hub URL from the token
+2. Create `/etc/orchestratia/config.yaml` automatically (or update existing)
+3. Register with the hub using the token
+4. Save the permanent API key to config (token is consumed and removed)
+5. Start heartbeating and polling for tasks
+
+The config file is auto-managed — no manual editing needed for registration.
 
 ---
 
-## Step 4: Configure
+## Step 4: Customize Config (Optional)
 
-```bash
-sudo mkdir -p /etc/orchestratia /var/log/orchestratia /var/run/orchestratia
-sudo chown $(whoami):$(whoami) /etc/orchestratia /var/log/orchestratia /var/run/orchestratia
-cp /opt/orchestratia-agent/config.yaml.example /etc/orchestratia/config.yaml
-```
-
-Edit `/etc/orchestratia/config.yaml` and **paste the config snippet** from the dashboard:
+After registration, you can edit `/etc/orchestratia/config.yaml` to add repos and tune settings:
 
 ```yaml
-hub_url: "https://staging.orchestratia.com"
-registration_token: "orcreg_xxx"  # One-time token from dashboard
-api_key: ""                        # Auto-set after registration
 agent_name: "your-server-name"
 
 repos:
-  # List the repos on this server that you work on
   your-repo-name:
     path: /home/ubuntu/your-repo
     branch: main
@@ -100,39 +104,11 @@ claude:
   allowed_tools: "Bash,Read,Edit,Write,Grep,Glob"
   max_turns: 50
   timeout_minutes: 30
-
-session:
-  backend: screen
-  log_dir: /var/log/orchestratia
-  pid_dir: /var/run/orchestratia
-  reconcile_on_start: true
 ```
-
-**Important fields:**
-- `hub_url`: Provided by the dashboard config snippet
-- `registration_token`: One-time token from the dashboard (consumed on first run)
-- `agent_name`: A human-readable name for this server (e.g., `dev-staging`, `prod-server`)
-- `repos`: Map of repo names to paths. When a task targets `your-repo-name`, Claude will execute in that directory
 
 ---
 
-## Step 5: First Run (Registration)
-
-```bash
-python3 /opt/orchestratia-agent/daemon.py --config /etc/orchestratia/config.yaml
-```
-
-On first run (with a `registration_token` and empty `api_key`), the daemon will:
-1. Present the token to the hub for registration
-2. Print: `SAVE THIS API KEY to your config.yaml: orc_xxxxxxxxxxxx`
-3. Start sending heartbeats
-
-**After registration:**
-1. Copy the printed API key into `/etc/orchestratia/config.yaml` as the `api_key` value
-2. Remove the `registration_token` line (it's been consumed and won't work again)
-3. Restart the daemon
-
-Press Ctrl+C to stop, update the config, then proceed to Step 6.
+## Step 5: Run as a Service (Persistent)
 
 ---
 

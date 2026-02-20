@@ -2,7 +2,13 @@
 # Copy to /etc/orchestratia/config.yaml and customize
 
 hub_url: "https://staging.orchestratia.com"
-api_key: "orc_xxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Authentication - use ONE of the following:
+# 1. For first-time registration, get a token from the dashboard (Agents -> Register Agent)
+registration_token: "orcreg_xxx"
+# 2. After registration, paste the API key here and remove registration_token
+api_key: ""
+
 agent_name: "dev-linux-staging"
 
 repos:

@@ -186,6 +186,16 @@ async def register_with_hub(client: httpx.AsyncClient) -> str | None:
         log.info(f"Using configured API key: {api_key[:8]}...")
         return api_key
 
+    # Registration requires a one-time token from the admin dashboard
+    reg_token = config.get("registration_token", "")
+    if not reg_token:
+        log.error(
+            "No api_key and no registration_token in config. "
+            "Get a registration token from the Orchestratia dashboard: "
+            "Agents -> Register Agent"
+        )
+        return None
+
     try:
         resp = await client.post(
             f"{hub_url}/api/v1/agents/register",
@@ -196,13 +206,19 @@ async def register_with_hub(client: httpx.AsyncClient) -> str | None:
                 "os": platform.system().lower(),
                 "repos": get_repos_info(),
                 "system_info": get_system_info(),
+                "registration_token": reg_token,
             },
         )
+        if resp.status_code == 401:
+            detail = resp.json().get("detail", "Unknown error")
+            log.error(f"Registration failed: {detail}")
+            return None
         resp.raise_for_status()
         data = resp.json()
         api_key = data["api_key"]
         log.info(f"Registered with hub. Agent ID: {data['id']}, Key: {api_key[:8]}...")
         log.warning(f"SAVE THIS API KEY to your config.yaml: {api_key}")
+        log.info("Then remove the registration_token from config (it's now consumed).")
         return api_key
     except httpx.HTTPError as e:
         log.error(f"Failed to register with hub: {e}")
@@ -282,7 +298,7 @@ async def notify_task_fail(client: httpx.AsyncClient, task_id: str, error: str =
 
 # --- WebSocket Output Streaming ---
 
-async def connect_ws() -> websockets.WebSocketClientProtocol | None:
+async def connect_ws():
     """Connect to the hub's agent WebSocket."""
     ws_url = hub_url.replace("https://", "wss://").replace("http://", "ws://")
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -313,7 +329,7 @@ async def connect_ws() -> websockets.WebSocketClientProtocol | None:
 
 async def stream_output(ws, task_id: str, content: str, stream: str = "stdout"):
     """Send output to the hub via WebSocket."""
-    if ws and ws.open:
+    if ws and not ws.close_code:
         try:
             await ws.send(json.dumps({
                 "type": "output",
@@ -436,7 +452,7 @@ async def task_poll_loop(client: httpx.AsyncClient, ws):
 
 async def ws_keepalive_loop(ws):
     """Keep WebSocket connection alive."""
-    while running and ws and ws.open:
+    while running and ws and not ws.close_code:
         try:
             await ws.send(json.dumps({"type": "ping"}))
             await asyncio.sleep(30)

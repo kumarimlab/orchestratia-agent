@@ -115,10 +115,13 @@ class PTYSession:
         try:
             data = os.read(self.master_fd, 4096)
             if not data:
-                return None
+                return None  # EOF — child exited
             return data
-        except OSError:
-            return None
+        except OSError as e:
+            import errno
+            if e.errno == errno.EIO:
+                return None  # EIO means child closed the PTY
+            raise  # Re-raise unexpected errors
 
     def _wait_for_exit(self) -> int | None:
         """Wait for the child process to exit and return exit code."""
@@ -216,9 +219,7 @@ def spawn_pty_session(session_id: str, working_directory: str | None, cols: int,
         else:
             # Parent process
             os.close(slave_fd)
-            # Set master to non-blocking
-            flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-            fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            # Keep master fd blocking — we read in a thread executor
             log.info(f"Spawned PTY session {session_id[:8]}: pid={pid}, cwd={cwd}")
             return PTYSession(session_id, master_fd, pid)
 

@@ -60,7 +60,20 @@ pip3 install -r /opt/orchestratia-agent/requirements.txt
 
 ---
 
-## Step 3: Configure
+## Step 3: Get a Registration Token
+
+Registration requires a **one-time token** from the admin dashboard. This prevents unauthorized agents from registering.
+
+1. Log in to the dashboard at https://staging.orchestratia.com
+2. Go to **Agents** page
+3. Click **"Register Agent"**
+4. Enter a label (e.g., your server name) and expiry
+5. Click **"Generate Token"**
+6. Copy the **Config Snippet** — it contains the hub URL and token
+
+---
+
+## Step 4: Configure
 
 ```bash
 sudo mkdir -p /etc/orchestratia /var/log/orchestratia /var/run/orchestratia
@@ -68,23 +81,22 @@ sudo chown $(whoami):$(whoami) /etc/orchestratia /var/log/orchestratia /var/run/
 cp /opt/orchestratia-agent/config.yaml.example /etc/orchestratia/config.yaml
 ```
 
-Edit `/etc/orchestratia/config.yaml`:
+Edit `/etc/orchestratia/config.yaml` and **paste the config snippet** from the dashboard:
 
 ```yaml
 hub_url: "https://staging.orchestratia.com"
-# Leave api_key empty for first run - daemon will auto-register and print a key
-api_key: ""
+registration_token: "orcreg_xxx"  # One-time token from dashboard
+api_key: ""                        # Auto-set after registration
 agent_name: "your-server-name"
 
 repos:
   # List the repos on this server that you work on
-  # The key is the repo name, path is the absolute path on disk
   your-repo-name:
     path: /home/ubuntu/your-repo
     branch: main
 
 claude:
-  binary: claude              # Path to claude CLI
+  binary: claude
   allowed_tools: "Bash,Read,Edit,Write,Grep,Glob"
   max_turns: 50
   timeout_minutes: 30
@@ -97,30 +109,34 @@ session:
 ```
 
 **Important fields:**
-- `hub_url`: The Orchestratia hub URL (ask your admin)
+- `hub_url`: Provided by the dashboard config snippet
+- `registration_token`: One-time token from the dashboard (consumed on first run)
 - `agent_name`: A human-readable name for this server (e.g., `dev-staging`, `prod-server`)
 - `repos`: Map of repo names to paths. When a task targets `your-repo-name`, Claude will execute in that directory
 
 ---
 
-## Step 4: First Run (Registration)
+## Step 5: First Run (Registration)
 
 ```bash
 python3 /opt/orchestratia-agent/daemon.py --config /etc/orchestratia/config.yaml
 ```
 
-On first run (with empty `api_key`), the daemon will:
-1. Register with the hub
+On first run (with a `registration_token` and empty `api_key`), the daemon will:
+1. Present the token to the hub for registration
 2. Print: `SAVE THIS API KEY to your config.yaml: orc_xxxxxxxxxxxx`
 3. Start sending heartbeats
 
-**Copy the printed API key** and paste it into `/etc/orchestratia/config.yaml` as the `api_key` value. This way the agent reuses its identity on restart.
+**After registration:**
+1. Copy the printed API key into `/etc/orchestratia/config.yaml` as the `api_key` value
+2. Remove the `registration_token` line (it's been consumed and won't work again)
+3. Restart the daemon
 
-Press Ctrl+C to stop, update the config, then proceed to Step 5.
+Press Ctrl+C to stop, update the config, then proceed to Step 6.
 
 ---
 
-## Step 5: Run as a Service (Persistent)
+## Step 6: Run as a Service (Persistent)
 
 ```bash
 # Install systemd service
@@ -206,10 +222,10 @@ The admin sees the request in the Interventions page and responds. The response 
 
 ## Agent API Reference
 
-All agent endpoints use `X-API-Key` header for authentication.
+All agent endpoints (except register) use `X-API-Key` header for authentication.
 
 ```
-POST /api/v1/agents/register          # Auto-register (first run only)
+POST /api/v1/agents/register          # Register with one-time token (first run only)
 POST /api/v1/agents/heartbeat         # System stats, every 30s
 GET  /api/v1/agents/tasks/poll        # Get assigned tasks
 POST /api/v1/agents/tasks/{id}/start  # Mark task as running

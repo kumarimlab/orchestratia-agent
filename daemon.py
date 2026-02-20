@@ -48,7 +48,90 @@ active_tasks: dict[str, asyncio.Task] = {}
 def load_config(path: str) -> dict:
     """Load YAML config file."""
     with open(path) as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
+
+
+def save_config(path: str, data: dict) -> None:
+    """Write config back to YAML file."""
+    with open(path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+def parse_token_hub_url(token: str) -> str | None:
+    """Extract the hub URL from a self-contained registration token.
+
+    Token format: orcreg_<base64url(hub_url)>.<secret_hex>
+    """
+    import base64
+
+    if not token.startswith("orcreg_"):
+        return None
+    payload = token[7:]  # strip "orcreg_"
+    parts = payload.split(".", 1)
+    if len(parts) != 2:
+        return None
+    url_b64 = parts[0]
+    # Re-add base64 padding
+    padding = 4 - len(url_b64) % 4
+    if padding != 4:
+        url_b64 += "=" * padding
+    try:
+        return base64.urlsafe_b64decode(url_b64).decode()
+    except Exception:
+        return None
+
+
+def ensure_config_for_register(config_path: str, token: str) -> dict:
+    """Create or update config for --register mode.
+
+    Extracts hub URL from token, sets up config, returns it.
+    """
+    hub = parse_token_hub_url(token)
+    if not hub:
+        log.error("Invalid token format — cannot extract hub URL")
+        sys.exit(1)
+
+    # Load existing config or start fresh
+    if os.path.exists(config_path):
+        cfg = load_config(config_path)
+    else:
+        cfg = {
+            "agent_name": platform.node(),
+            "repos": {},
+            "claude": {
+                "binary": "claude",
+                "allowed_tools": "Bash,Read,Edit,Write,Grep,Glob",
+                "max_turns": 50,
+                "timeout_minutes": 30,
+            },
+            "session": {
+                "backend": "screen",
+                "log_dir": "/var/log/orchestratia",
+                "pid_dir": "/var/run/orchestratia",
+                "reconcile_on_start": True,
+            },
+        }
+
+    cfg["hub_url"] = hub
+    cfg["registration_token"] = token
+    cfg.pop("api_key", None)
+
+    # Ensure config directory exists
+    os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+    save_config(config_path, cfg)
+    log.info(f"Config written to {config_path}")
+    return cfg
+
+
+def persist_api_key(config_path: str, key: str) -> None:
+    """After registration, save the API key and remove the consumed token."""
+    if not os.path.exists(config_path):
+        return
+    cfg = load_config(config_path)
+    cfg["api_key"] = key
+    cfg.pop("registration_token", None)
+    save_config(config_path, cfg)
+    log.info(f"API key saved to {config_path} (registration_token removed)")
 
 
 def get_system_info() -> dict:
@@ -177,7 +260,7 @@ def reconcile_sessions() -> list[str]:
 
 # --- Hub Communication ---
 
-async def register_with_hub(client: httpx.AsyncClient) -> str | None:
+async def register_with_hub(client: httpx.AsyncClient, config_path: str = "") -> str | None:
     """Register this agent with the hub. Returns API key if new registration needed."""
     global api_key
 
@@ -217,8 +300,13 @@ async def register_with_hub(client: httpx.AsyncClient) -> str | None:
         data = resp.json()
         api_key = data["api_key"]
         log.info(f"Registered with hub. Agent ID: {data['id']}, Key: {api_key[:8]}...")
-        log.warning(f"SAVE THIS API KEY to your config.yaml: {api_key}")
-        log.info("Then remove the registration_token from config (it's now consumed).")
+
+        # Auto-save API key to config file
+        if config_path:
+            persist_api_key(config_path, api_key)
+        else:
+            log.warning(f"SAVE THIS API KEY to your config.yaml: {api_key}")
+
         return api_key
     except httpx.HTTPError as e:
         log.error(f"Failed to register with hub: {e}")
@@ -465,14 +553,21 @@ async def main():
 
     parser = argparse.ArgumentParser(description="Orchestratia Agent Daemon")
     parser.add_argument("--config", default="/etc/orchestratia/config.yaml", help="Config file path")
+    parser.add_argument("--register", metavar="TOKEN", help="One-time registration token (hub URL encoded). Auto-creates config and registers.")
     args = parser.parse_args()
 
     config_path = args.config
-    if not os.path.exists(config_path):
+
+    if args.register:
+        # --register mode: extract hub URL from token, create/update config, then proceed
+        config = ensure_config_for_register(config_path, args.register)
+    elif os.path.exists(config_path):
+        config = load_config(config_path)
+    else:
         log.error(f"Config file not found: {config_path}")
+        log.error("Use --register TOKEN to set up, or create the config manually.")
         sys.exit(1)
 
-    config = load_config(config_path)
     hub_url = config.get("hub_url", "").rstrip("/")
 
     if not hub_url:
@@ -495,7 +590,7 @@ async def main():
     # HTTP client
     async with httpx.AsyncClient(timeout=30) as client:
         # Register or use existing key
-        key = await register_with_hub(client)
+        key = await register_with_hub(client, config_path=config_path)
         if not key:
             log.error("Failed to obtain API key. Exiting.")
             sys.exit(1)

@@ -168,8 +168,15 @@ class PTYSession:
 
 
 def spawn_pty_session(session_id: str, working_directory: str | None, cols: int, rows: int) -> PTYSession | None:
-    """Spawn a shell (for Claude Code) with a pseudo-terminal."""
-    claude_bin = config.get("claude", {}).get("binary", "claude")
+    """Spawn a login shell with a pseudo-terminal.
+
+    The admin gets a plain shell and can run whatever they want:
+    claude, git, ls, etc. This is like SSH in a browser.
+    """
+    # Use the user's default shell, fallback to bash
+    user_shell = os.environ.get("SHELL", "/bin/bash")
+    if not os.path.isfile(user_shell):
+        user_shell = "/bin/bash"
 
     # Resolve working directory
     cwd = working_directory or os.path.expanduser("~")
@@ -201,9 +208,10 @@ def spawn_pty_session(session_id: str, working_directory: str | None, cols: int,
                 os.chdir(cwd)
                 os.environ["TERM"] = "xterm-256color"
                 os.environ["COLORTERM"] = "truecolor"
-                os.execvp(claude_bin, [claude_bin])
+                # Spawn a login shell (- prefix makes it a login shell)
+                os.execvp(user_shell, [f"-{os.path.basename(user_shell)}"])
             except Exception as e:
-                os.write(2, f"Failed to exec {claude_bin}: {e}\n".encode())
+                os.write(2, f"Failed to exec shell: {e}\n".encode())
                 os._exit(1)
         else:
             # Parent process

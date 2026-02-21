@@ -349,6 +349,15 @@ else
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
 fi
 
+# Install CLI tool
+info "Installing orchestratia CLI tool..."
+if sudo chmod +x "$INSTALL_DIR/cli.py" && sudo ln -sf "$INSTALL_DIR/cli.py" /usr/local/bin/orchestratia 2>/dev/null; then
+    ok "CLI installed: /usr/local/bin/orchestratia"
+else
+    warn "Could not install CLI to /usr/local/bin/orchestratia"
+    info "Manual install: sudo ln -sf ${INSTALL_DIR}/cli.py /usr/local/bin/orchestratia"
+fi
+
 # Wait a moment and check status
 sleep 2
 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then

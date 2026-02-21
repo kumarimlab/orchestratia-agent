@@ -202,11 +202,20 @@ class PTYSession:
             pass
 
 
-def spawn_pty_session(session_id: str, working_directory: str | None, cols: int, rows: int) -> PTYSession | None:
+def spawn_pty_session(
+    session_id: str,
+    working_directory: str | None,
+    cols: int,
+    rows: int,
+    project_id: str | None = None,
+) -> PTYSession | None:
     """Spawn a login shell with a pseudo-terminal.
 
     The admin gets a plain shell and can run whatever they want:
     claude, git, ls, etc. This is like SSH in a browser.
+
+    Sets ORCHESTRATIA_* env vars so the `orchestratia` CLI tool
+    can auto-detect context (hub URL, API key, session/project ID).
     """
     # Use the user's default shell, fallback to bash
     user_shell = os.environ.get("SHELL", "/bin/bash")
@@ -243,6 +252,12 @@ def spawn_pty_session(session_id: str, working_directory: str | None, cols: int,
                 os.chdir(cwd)
                 os.environ["TERM"] = "xterm-256color"
                 os.environ["COLORTERM"] = "truecolor"
+                # Set Orchestratia env vars for the CLI tool
+                os.environ["ORCHESTRATIA_HUB_URL"] = hub_url
+                os.environ["ORCHESTRATIA_API_KEY"] = api_key
+                os.environ["ORCHESTRATIA_SESSION_ID"] = session_id
+                if project_id:
+                    os.environ["ORCHESTRATIA_PROJECT_ID"] = project_id
                 # Spawn a login shell (- prefix makes it a login shell)
                 os.execvp(user_shell, [f"-{os.path.basename(user_shell)}"])
             except Exception as e:
@@ -486,9 +501,10 @@ async def ws_receive_loop(ws):
                 working_dir = msg.get("working_directory")
                 cols = msg.get("cols", 120)
                 rows = msg.get("rows", 40)
+                project_id = msg.get("project_id")
                 log.info(f"Hub requests session start: {session_id[:8]}")
 
-                session = spawn_pty_session(session_id, working_dir, cols, rows)
+                session = spawn_pty_session(session_id, working_dir, cols, rows, project_id=project_id)
                 if session:
                     active_sessions[session_id] = session
                     await session.start_reader()
@@ -534,6 +550,35 @@ async def ws_receive_loop(ws):
                 if session and not session.closed:
                     log.info(f"Force kill requested for session {session_id[:8]}")
                     session.kill_force()
+
+            elif msg_type == "task_assigned":
+                # Inject task notification into the target session's PTY
+                target_session_id = msg.get("session_id")
+                task_id = msg.get("task_id", "")
+                title = msg.get("title", "")
+                from_name = msg.get("from_session_name", "Unknown")
+                priority = msg.get("priority", "normal")
+
+                session = active_sessions.get(target_session_id)
+                if session and not session.closed:
+                    # Build a styled notification box
+                    notification = (
+                        f"\r\n\033[38;2;212;114;47m"
+                        f"╔══════════════════════════════════════════════════════╗\r\n"
+                        f"║  ORCHESTRATIA: New task assigned                     ║\r\n"
+                        f"║  #{task_id[:8]}: \"{title[:40]}\" ({priority})         \r\n"
+                        f"║  From: {from_name[:40]}                              \r\n"
+                        f"║  Run: orchestratia task view {task_id[:8]}            \r\n"
+                        f"╚══════════════════════════════════════════════════════╝"
+                        f"\033[0m\r\n"
+                    )
+                    session.write_input(b"")  # No-op to ensure session is alive
+                    # Write directly to the PTY master fd (visible to both terminal and process)
+                    try:
+                        os.write(session.master_fd, notification.encode())
+                    except OSError:
+                        pass
+                    log.info(f"Injected task notification #{task_id[:8]} into session {target_session_id[:8]}")
 
             elif msg_type == "pong":
                 pass  # Expected response to our pings

@@ -212,6 +212,18 @@ else
     fi
 fi
 
+# tmux (required for session resilience)
+if check_command tmux; then
+    ok "tmux $(tmux -V | awk '{print $2}')"
+else
+    info "tmux not found, installing..."
+    if sudo apt-get install -y tmux >/dev/null 2>&1; then
+        ok "tmux installed"
+    else
+        fatal "Could not install tmux. Install manually: sudo apt install tmux"
+    fi
+fi
+
 # Claude Code (warning only, not fatal)
 if check_command claude; then
     CLAUDE_VER=$(claude --version 2>/dev/null || echo "installed")

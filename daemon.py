@@ -23,6 +23,7 @@ import pty
 import signal
 import ssl
 import struct
+import subprocess
 import sys
 import termios
 from datetime import datetime
@@ -67,13 +68,20 @@ async def ws_send(msg: dict):
 
 
 class PTYSession:
-    """Manages a single PTY session (one spawned process)."""
+    """Manages a single PTY session (one spawned process).
 
-    def __init__(self, session_id: str, master_fd: int, pid: int):
+    When tmux is available, the PTY wraps a tmux session. The tmux server
+    process survives daemon restarts, allowing session recovery.
+    """
+
+    def __init__(self, session_id: str, master_fd: int, pid: int, tmux_name: str = ""):
         self.session_id = session_id
         self.master_fd = master_fd
         self.pid = pid
+        self.tmux_name = tmux_name
         self.reader_task: asyncio.Task | None = None
+        self.capture_task: asyncio.Task | None = None
+        self._last_screen: list[str] = []
         self.closed = False
 
     async def start_reader(self):
@@ -85,6 +93,60 @@ class PTYSession:
             except (asyncio.CancelledError, Exception):
                 pass
         self.reader_task = asyncio.create_task(self._read_loop())
+        self._start_capture()
+
+    def _start_capture(self):
+        """Start the tmux capture loop if this is a tmux session."""
+        if not self.tmux_name:
+            return
+        if self.capture_task and not self.capture_task.done():
+            self.capture_task.cancel()
+        self.capture_task = asyncio.create_task(self._capture_loop())
+
+    async def _capture_loop(self):
+        """Periodically capture the rendered tmux pane and send diffs to the hub.
+
+        tmux capture-pane -p outputs the pane content as plain text — no escape
+        sequences, no cursor positioning. We diff against the previous snapshot
+        and only send changed lines.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            while not self.closed:
+                await asyncio.sleep(5)
+                if self.closed:
+                    break
+                try:
+                    result = await loop.run_in_executor(
+                        None,
+                        lambda: subprocess.run(
+                            ["tmux", "capture-pane", "-t", self.tmux_name, "-p"],
+                            capture_output=True, text=True, timeout=3,
+                        ),
+                    )
+                    if result.returncode != 0:
+                        continue
+                    # Split into lines, strip trailing empty lines
+                    lines = result.stdout.split("\n")
+                    while lines and not lines[-1].strip():
+                        lines.pop()
+
+                    if lines == self._last_screen:
+                        continue
+
+                    # Send the full snapshot (hub/Telegram can diff if needed)
+                    await ws_send({
+                        "type": "session_screen",
+                        "session_id": self.session_id,
+                        "lines": lines,
+                    })
+                    self._last_screen = lines
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    log.debug(f"Session {self.session_id[:8]} capture error: {e}")
+        except asyncio.CancelledError:
+            pass
 
     async def _read_loop(self):
         """Read from PTY master fd and send to hub as base64.
@@ -119,6 +181,9 @@ class PTYSession:
             # Process ended - report exit
             exit_code = self._wait_for_exit()
             self.closed = True
+            # Stop capture loop
+            if self.capture_task and not self.capture_task.done():
+                self.capture_task.cancel()
             try:
                 os.close(self.master_fd)
             except OSError:
@@ -186,6 +251,12 @@ class PTYSession:
             os.killpg(os.getpgid(self.pid), signal.SIGWINCH)
         except (OSError, ProcessLookupError) as e:
             log.warning(f"Session {self.session_id[:8]} resize error: {e}")
+        # Also resize the tmux window (for SSH-attached viewers)
+        if self.tmux_name:
+            subprocess.run(
+                ["tmux", "resize-window", "-t", self.tmux_name, "-x", str(cols), "-y", str(rows)],
+                capture_output=True, timeout=2,
+            )
 
     def close_graceful(self):
         """Send SIGHUP to the child process (graceful close)."""
@@ -193,6 +264,11 @@ class PTYSession:
             os.killpg(os.getpgid(self.pid), signal.SIGHUP)
         except (OSError, ProcessLookupError):
             pass
+        if self.tmux_name:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", self.tmux_name],
+                capture_output=True, timeout=2,
+            )
 
     def kill_force(self):
         """Send SIGKILL to the child process (force kill)."""
@@ -202,6 +278,70 @@ class PTYSession:
             pass
 
 
+def _has_tmux() -> bool:
+    """Check if tmux is available on this system."""
+    try:
+        result = subprocess.run(["tmux", "-V"], capture_output=True, timeout=2)
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def discover_tmux_sessions() -> list[str]:
+    """List existing orc-* tmux sessions."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        return [n.strip() for n in result.stdout.strip().split("\n")
+                if n.strip().startswith("orc-")]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+
+def reattach_tmux_session(
+    tmux_name: str,
+    session_id: str,
+    cols: int = 120,
+    rows: int = 40,
+) -> PTYSession | None:
+    """Create a new PTY pair and attach to an existing tmux session.
+
+    Used for recovery after daemon restart — tmux sessions survive
+    because the tmux server is a separate process.
+    """
+    try:
+        master_fd, slave_fd = pty.openpty()
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+        pid = os.fork()
+        if pid == 0:
+            # Child: attach to existing tmux session
+            try:
+                os.setsid()
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+                os.dup2(slave_fd, 0)
+                os.dup2(slave_fd, 1)
+                os.dup2(slave_fd, 2)
+                os.close(master_fd)
+                os.close(slave_fd)
+                os.environ["TERM"] = "xterm-256color"
+                os.execvp("tmux", ["tmux", "attach-session", "-t", tmux_name])
+            except Exception as e:
+                os.write(2, f"Failed to attach tmux: {e}\n".encode())
+                os._exit(1)
+        else:
+            os.close(slave_fd)
+            log.info(f"Reattached to tmux session {tmux_name}: pid={pid}")
+            return PTYSession(session_id, master_fd, pid, tmux_name=tmux_name)
+    except Exception as e:
+        log.error(f"Failed to reattach tmux session {tmux_name}: {e}")
+        return None
+
+
 def spawn_pty_session(
     session_id: str,
     working_directory: str | None,
@@ -209,14 +349,18 @@ def spawn_pty_session(
     rows: int,
     project_id: str | None = None,
 ) -> PTYSession | None:
-    """Spawn a login shell with a pseudo-terminal.
+    """Spawn a session with a pseudo-terminal.
 
-    The admin gets a plain shell and can run whatever they want:
-    claude, git, ls, etc. This is like SSH in a browser.
+    If tmux is available, wraps the shell in a tmux session named orc-{id}.
+    The tmux server process survives daemon restarts, enabling recovery.
+    Without tmux, falls back to a plain login shell (original behavior).
 
     Sets ORCHESTRATIA_* env vars so the `orchestratia` CLI tool
     can auto-detect context (hub URL, API key, session/project ID).
     """
+    use_tmux = _has_tmux()
+    tmux_name = f"orc-{session_id[:12]}" if use_tmux else ""
+
     # Use the user's default shell, fallback to bash
     user_shell = os.environ.get("SHELL", "/bin/bash")
     if not os.path.isfile(user_shell):
@@ -258,17 +402,26 @@ def spawn_pty_session(
                 os.environ["ORCHESTRATIA_SESSION_ID"] = session_id
                 if project_id:
                     os.environ["ORCHESTRATIA_PROJECT_ID"] = project_id
-                # Spawn a login shell (- prefix makes it a login shell)
-                os.execvp(user_shell, [f"-{os.path.basename(user_shell)}"])
+
+                if use_tmux:
+                    # Exec tmux new-session — tmux server persists independently
+                    os.execvp("tmux", [
+                        "tmux", "new-session", "-s", tmux_name,
+                        "-x", str(cols), "-y", str(rows),
+                    ])
+                else:
+                    # Fallback: plain login shell
+                    os.execvp(user_shell, [f"-{os.path.basename(user_shell)}"])
             except Exception as e:
-                os.write(2, f"Failed to exec shell: {e}\n".encode())
+                os.write(2, f"Failed to exec: {e}\n".encode())
                 os._exit(1)
         else:
             # Parent process
             os.close(slave_fd)
             # Keep master fd blocking — we read in a thread executor
-            log.info(f"Spawned PTY session {session_id[:8]}: pid={pid}, cwd={cwd}")
-            return PTYSession(session_id, master_fd, pid)
+            mode = f"tmux={tmux_name}" if use_tmux else "plain"
+            log.info(f"Spawned PTY session {session_id[:8]}: pid={pid}, cwd={cwd}, mode={mode}")
+            return PTYSession(session_id, master_fd, pid, tmux_name=tmux_name)
 
     except Exception as e:
         log.error(f"Failed to spawn PTY session: {e}")
@@ -513,6 +666,7 @@ async def ws_receive_loop(ws):
                         "type": "session_started",
                         "session_id": session_id,
                         "pid": session.pid,
+                        "tmux_name": session.tmux_name or "",
                     })
                 else:
                     await ws_send({
@@ -595,10 +749,24 @@ async def report_alive_sessions():
     """After WS reconnect, report any sessions that are still alive.
 
     This lets the hub know which sessions survived the disconnect
-    and re-marks them as active.
+    and re-marks them as active. Also discovers orphaned tmux sessions
+    (e.g. after a full daemon restart) and reattaches to them.
     """
-    # Clean up dead sessions first
-    dead = [sid for sid, s in active_sessions.items() if not s.is_alive()]
+    # 1. Check existing tracked sessions — try to reattach dead ones via tmux
+    dead = []
+    existing_tmux = discover_tmux_sessions()
+    for sid, s in list(active_sessions.items()):
+        if not s.is_alive():
+            if s.tmux_name and s.tmux_name in existing_tmux:
+                # PTY client died but tmux session lives — reattach
+                new = reattach_tmux_session(s.tmux_name, sid)
+                if new:
+                    active_sessions[sid] = new
+                    await new.start_reader()
+                    log.info(f"Reattached to surviving tmux session {s.tmux_name} for {sid[:8]}")
+                    continue
+            dead.append(sid)
+
     for sid in dead:
         session = active_sessions.pop(sid)
         session.closed = True
@@ -608,7 +776,22 @@ async def report_alive_sessions():
             pass
         log.info(f"Cleaned up dead session {sid[:8]}")
 
-    # Report alive sessions
+    # 2. Discover orphaned tmux sessions not tracked by us (full daemon restart)
+    tracked_tmux = {s.tmux_name for s in active_sessions.values() if s.tmux_name}
+    for tmux_name in existing_tmux:
+        if tmux_name not in tracked_tmux:
+            log.info(f"Found orphaned tmux session: {tmux_name}")
+            new = reattach_tmux_session(tmux_name, session_id=tmux_name)
+            if new:
+                active_sessions[tmux_name] = new
+                await new.start_reader()
+                await ws_send({
+                    "type": "session_recovered",
+                    "tmux_name": tmux_name,
+                    "pid": new.pid,
+                })
+
+    # 3. Report alive sessions
     alive = list(active_sessions.keys())
     if alive:
         log.info(f"Reporting {len(alive)} alive session(s) to hub")
@@ -618,6 +801,8 @@ async def report_alive_sessions():
                 "type": "session_started",
                 "session_id": sid,
                 "pid": session.pid,
+                "recovered": True,
+                "tmux_name": session.tmux_name or "",
             })
             # Restart the reader if it died (it would have stopped when WS dropped)
             if session.reader_task is None or session.reader_task.done():
@@ -666,12 +851,32 @@ async def ws_connection_loop():
 
 
 async def cleanup_sessions():
-    """Cleanup all active sessions on shutdown."""
+    """Cleanup on daemon shutdown.
+
+    For tmux sessions: detach cleanly but leave tmux server running.
+    This allows recovery when the daemon restarts.
+    For plain sessions: send SIGHUP (graceful close).
+    """
     for session_id, session in list(active_sessions.items()):
-        log.info(f"Cleaning up session {session_id[:8]}")
-        session.close_graceful()
-        if session.reader_task:
-            session.reader_task.cancel()
+        if session.tmux_name:
+            # tmux session: just close our PTY connection, leave tmux alive
+            log.info(f"Detaching from tmux session {session.tmux_name} ({session_id[:8]})")
+            if session.reader_task:
+                session.reader_task.cancel()
+            try:
+                os.close(session.master_fd)
+            except OSError:
+                pass
+            try:
+                os.kill(session.pid, signal.SIGTERM)  # Kill tmux client, NOT server
+            except (OSError, ProcessLookupError):
+                pass
+        else:
+            # Plain session: graceful close
+            log.info(f"Closing plain session {session_id[:8]}")
+            session.close_graceful()
+            if session.reader_task:
+                session.reader_task.cancel()
     active_sessions.clear()
 
 

@@ -123,10 +123,16 @@ async def main():
             sys.exit(1)
 
         # Signal handling (cross-platform)
+        loop = asyncio.get_event_loop()
+
         def handle_signal(sig, frame):
             sig_name = signal.Signals(sig).name if hasattr(signal, "Signals") else str(sig)
             log.info(f"Received {sig_name}, shutting down...")
             state.running = False
+            # Close the WebSocket to unblock ws.recv()
+            ws = state.ws_connection
+            if ws:
+                asyncio.ensure_future(ws.close())
 
         signal.signal(signal.SIGINT, handle_signal)
         if sys.platform == "win32":

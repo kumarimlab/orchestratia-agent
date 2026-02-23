@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import sys
 
 from orchestratia_agent.session_base import SessionHandle
@@ -121,19 +122,41 @@ class WindowsSessionBackend:
         proc: PtyProcess = handle.pty_process
         try:
             text = data.decode("utf-8", errors="replace")
-            # Debug: log control characters to diagnose Enter key issues
-            if any(c in text for c in "\r\n"):
-                log.info(f"Write (pid={handle.pid}): {repr(text)} ({len(data)} bytes, alive={proc.isalive()})")
-            proc.write(text)
-            # ConPTY workaround: some TUI apps (e.g. Codex CLI) don't register
-            # bare \r as Enter when written via pipe. Send \n as well — apps that
-            # already handled \r will treat \n as a no-op line feed, while apps
-            # that need \n for Enter will pick it up.
+            # For Enter key: try injecting via WriteConsoleInput first (bypasses
+            # ConPTY pipe translation which fails for some TUI apps like Codex CLI).
+            # Falls back to proc.write() if injection fails.
             if text == "\r":
-                log.info(f"ConPTY workaround: also writing \\n after \\r (pid={handle.pid})")
-                proc.write("\n")
+                if self._inject_key_event(handle.pid, "\r"):
+                    log.info(f"Enter injected via WriteConsoleInput (pid={handle.pid})")
+                    return
+                log.info(f"WriteConsoleInput failed, falling back to proc.write (pid={handle.pid})")
+            proc.write(text)
         except Exception as e:
             log.warning(f"Write error (pid={handle.pid}): {e}")
+
+    @staticmethod
+    def _inject_key_event(pid: int, char: str) -> bool:
+        """Inject a key event via WriteConsoleInput using a helper subprocess.
+
+        Spawns a short-lived process that attaches to the target's console
+        and writes a proper KEY_EVENT INPUT_RECORD, bypassing ConPTY's
+        VT-to-key-event translation.
+        """
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "orchestratia_agent.win_input_helper", str(pid), char],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            if result.returncode == 0:
+                return True
+            log.warning(f"win_input_helper failed: rc={result.returncode}, err={result.stderr.strip()}")
+            return False
+        except Exception as e:
+            log.warning(f"win_input_helper error: {e}")
+            return False
 
     def write_notification(self, handle: SessionHandle, text: str) -> None:
         proc: PtyProcess = handle.pty_process

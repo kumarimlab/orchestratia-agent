@@ -155,7 +155,11 @@ async def heartbeat_loop(client: httpx.AsyncClient, state: DaemonState):
     """Send heartbeats every 30 seconds."""
     while state.running:
         await send_heartbeat(client, state)
-        await asyncio.sleep(30)
+        # Sleep in 1s increments so we can exit promptly
+        for _ in range(30):
+            if not state.running:
+                return
+            await asyncio.sleep(1)
 
 
 async def ws_receive_loop(ws, state: DaemonState):

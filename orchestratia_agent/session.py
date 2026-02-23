@@ -32,10 +32,19 @@ _ANSI_RE = re.compile(
     r"|\x1b\[[\d;]*m"             # SGR (redundant with first, but explicit)
 )
 
+# Detect screen-clear/cursor-home sequences that indicate a full redraw.
+# ESC[H = cursor home, ESC[2J = erase display, ESC[1;1H = cursor to 1,1
+_SCREEN_CLEAR_RE = re.compile(r"\x1b\[H|\x1b\[2J|\x1b\[1;1H")
+
 
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences from terminal output."""
     return _ANSI_RE.sub("", text)
+
+
+def _has_screen_clear(raw: str) -> bool:
+    """Check if raw output contains a screen clear/redraw sequence."""
+    return bool(_SCREEN_CLEAR_RE.search(raw))
 
 
 class ScreenBuffer:
@@ -51,6 +60,11 @@ class ScreenBuffer:
         self._partial: str = ""  # Incomplete line (no trailing newline yet)
         self._max = max_lines
         self._hash: str = ""
+
+    def clear(self) -> None:
+        """Reset the buffer (called when a screen-clear sequence is detected)."""
+        self._lines.clear()
+        self._partial = ""
 
     def feed(self, raw: str) -> None:
         """Feed raw terminal output (already ANSI-stripped)."""
@@ -244,8 +258,11 @@ class ManagedSession:
                         # Feed screen buffer for synthetic capture (non-tmux)
                         if use_synthetic:
                             text = data.decode("utf-8", errors="replace")
-                            clean = _strip_ansi(text)
                             async with self._screen_lock:
+                                # Detect screen clear/redraw before stripping
+                                if _has_screen_clear(text):
+                                    self._screen.clear()
+                                clean = _strip_ansi(text)
                                 self._screen.feed(clean)
                 except asyncio.CancelledError:
                     break

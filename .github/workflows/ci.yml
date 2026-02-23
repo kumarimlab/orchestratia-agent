@@ -49,6 +49,12 @@ jobs:
           print(f'Persistence: {backend.supports_persistence()}')
           info = get_system_info()
           print(f'System info keys: {len(info)}')
+          import pyte
+          screen = pyte.Screen(80, 24)
+          stream = pyte.ByteStream(screen)
+          stream.feed(b'Hello World')
+          assert 'Hello World' in screen.display[0]
+          print('pyte virtual terminal: OK')
           "
 
       - name: Verify platform-specific backend (Linux/macOS)

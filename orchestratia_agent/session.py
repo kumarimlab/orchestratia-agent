@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-import re
 import sys
 from typing import TYPE_CHECKING, Callable, Awaitable
+
+import pyte
 
 from orchestratia_agent.session_base import SessionBackend, SessionHandle
 
@@ -20,89 +21,45 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("orchestratia-agent")
 
-# Regex to strip ANSI escape sequences (colors, cursor movement, etc.)
-_ANSI_RE = re.compile(
-    r"\x1b\[[0-9;]*[A-Za-z]"    # CSI sequences: ESC[...X
-    r"|\x1b\][^\x07]*\x07"       # OSC sequences: ESC]...BEL
-    r"|\x1b\[[\?0-9;]*[a-z]"     # Private mode: ESC[?...x
-    r"|\x1b[\(\)][AB012]"         # Character set: ESC(B etc
-    r"|\x1b[=>]"                  # Keypad mode
-    r"|\x0f"                      # SI (shift in)
-    r"|\x1b\[[\d;]*m"             # SGR (redundant with first, but explicit)
-)
 
-# Detect screen-clear/cursor-home sequences that indicate a full redraw.
-# ESC[H = cursor home, ESC[2J = erase display, ESC[1;1H = cursor to 1,1
-_SCREEN_CLEAR_RE = re.compile(r"\x1b\[H|\x1b\[2J|\x1b\[1;1H")
+class VirtualScreen:
+    """Virtual terminal emulator using pyte.
 
-
-def _strip_ansi(text: str) -> str:
-    """Remove ANSI escape sequences from terminal output."""
-    return _ANSI_RE.sub("", text)
-
-
-def _has_screen_clear(raw: str) -> bool:
-    """Check if raw output contains a screen clear/redraw sequence."""
-    return bool(_SCREEN_CLEAR_RE.search(raw))
-
-
-class OutputCollector:
-    """Collects new terminal output between capture cycles.
-
-    Unlike a screen buffer (which tries to maintain rendered state),
-    this simply accumulates new output and drains it on each send.
-    Screen-clear sequences discard pending output to prevent resize
-    redraws from being sent as "new" content.
+    Feeds raw PTY bytes into a pyte Screen+ByteStream to maintain
+    rendered terminal state. Produces clean screen snapshots identical
+    to tmux capture-pane output.
     """
 
-    def __init__(self):
-        self._pending: list[str] = []
-        self._partial: str = ""
-        self._dirty: bool = False  # True when new data arrived since last drain
+    def __init__(self, cols: int = 120, rows: int = 40):
+        self._screen = pyte.Screen(cols, rows)
+        self._stream = pyte.ByteStream(self._screen)
+        self._last_snapshot: list[str] | None = None
 
-    def clear(self) -> None:
-        """Discard pending output (called on screen clear/redraw)."""
-        self._pending.clear()
-        self._partial = ""
-        self._dirty = False
+    def feed(self, data: bytes) -> None:
+        """Feed raw PTY output bytes (with all ANSI sequences intact)."""
+        self._stream.feed(data)
 
-    def feed(self, raw: str) -> None:
-        """Feed ANSI-stripped terminal output."""
-        if not raw:
-            return
-        self._dirty = True
-        text = self._partial + raw
-        text = text.replace("\r\n", "\n")
-        parts = text.split("\n")
-        self._partial = parts[-1]
-        for line in parts[:-1]:
-            if "\r" in line:
-                line = line.rsplit("\r", 1)[-1]
-            self._pending.append(line)
+    def resize(self, cols: int, rows: int) -> None:
+        """Resize the virtual terminal."""
+        self._screen.resize(rows, cols)  # pyte takes (lines, columns)
 
-    def drain(self) -> list[str]:
-        """Return new lines since last drain, then clear the buffer.
+    def snapshot(self) -> list[str] | None:
+        """Return current screen lines if changed since last snapshot.
 
-        Includes the partial (incomplete) line if non-empty.
-        Returns empty list if nothing new since last drain.
+        Returns None if screen hasn't changed (same as tmux capture
+        returning identical content — the capture loop skips sending).
         """
-        if not self._dirty:
-            return []
+        # pyte pads each line to screen width — rstrip for clean output
+        lines = [line.rstrip() for line in self._screen.display]
 
-        lines = list(self._pending)
-        if self._partial.strip():
-            partial = self._partial
-            if "\r" in partial:
-                partial = partial.rsplit("\r", 1)[-1]
-            lines.append(partial)
-
-        # Strip trailing empty lines
-        while lines and not lines[-1].strip():
+        # Strip trailing empty lines for cleaner output
+        while lines and not lines[-1]:
             lines.pop()
 
-        # Mark as drained
-        self._pending.clear()
-        self._dirty = False
+        if lines == self._last_snapshot:
+            return None
+
+        self._last_snapshot = list(lines)
         return lines
 
 
@@ -129,9 +86,9 @@ class ManagedSession:
         self.capture_task: asyncio.Task | None = None
         self._last_screen: list[str] = []
         self.closed = False
-        # Output collector for synthesizing session_screen (non-tmux)
-        self._collector = OutputCollector()
-        self._collector_lock = asyncio.Lock()
+        # pyte virtual screen for non-tmux platforms (Windows, Linux without tmux)
+        self._vscreen = VirtualScreen(cols=handle.cols, rows=handle.rows)
+        self._vscreen_lock = asyncio.Lock()
 
     @property
     def pid(self) -> int:
@@ -156,16 +113,15 @@ class ManagedSession:
         """Start the capture loop.
 
         Uses tmux capture-pane when available (clean rendered output).
-        Falls back to synthesizing screen lines from a rolling buffer
-        (Windows, Linux without tmux) so Telegram bots still receive
-        session_screen messages.
+        Falls back to pyte virtual terminal (Windows, Linux without tmux)
+        which provides equivalent rendered screen snapshots.
         """
         if self.capture_task and not self.capture_task.done():
             self.capture_task.cancel()
         if self.handle.tmux_name:
             self.capture_task = asyncio.create_task(self._tmux_capture_loop())
         else:
-            self.capture_task = asyncio.create_task(self._synthetic_capture_loop())
+            self.capture_task = asyncio.create_task(self._pyte_capture_loop())
 
     async def _tmux_capture_loop(self):
         """Periodically capture tmux pane content and send diffs to the hub."""
@@ -194,12 +150,11 @@ class ManagedSession:
         except asyncio.CancelledError:
             pass
 
-    async def _synthetic_capture_loop(self):
-        """Periodically send new output lines to the hub.
+    async def _pyte_capture_loop(self):
+        """Periodically snapshot the pyte virtual screen and send to hub.
 
-        Drains the OutputCollector every 5 seconds and sends only the
-        genuinely new lines. Screen-clear sequences (resize redraws)
-        discard buffered output to prevent duplicates.
+        pyte maintains a rendered character grid identical to what tmux
+        capture-pane produces. snapshot() returns None if unchanged.
         """
         try:
             while not self.closed:
@@ -207,10 +162,10 @@ class ManagedSession:
                 if self.closed:
                     break
                 try:
-                    async with self._collector_lock:
-                        lines = self._collector.drain()
+                    async with self._vscreen_lock:
+                        lines = self._vscreen.snapshot()
 
-                    if not lines:
+                    if lines is None:
                         continue
 
                     await self._ws_send({
@@ -221,18 +176,17 @@ class ManagedSession:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    log.debug(f"Session {self.session_id[:8]} synthetic capture error: {e}")
+                    log.debug(f"Session {self.session_id[:8]} pyte capture error: {e}")
         except asyncio.CancelledError:
             pass
 
     async def _read_loop(self):
         """Read from the session and relay to the hub as base64.
 
-        Also feeds the screen buffer for synthetic capture when
-        tmux is not available.
+        Also feeds the pyte virtual screen for non-tmux capture.
         """
         loop = asyncio.get_event_loop()
-        use_synthetic = not self.handle.tmux_name
+        use_pyte = not self.handle.tmux_name
         try:
             while not self.closed:
                 try:
@@ -248,15 +202,10 @@ class ManagedSession:
                             "session_id": self.session_id,
                             "data": b64,
                         })
-                        # Feed output collector for synthetic capture (non-tmux)
-                        if use_synthetic:
-                            text = data.decode("utf-8", errors="replace")
-                            async with self._collector_lock:
-                                # Detect screen clear/redraw — discard pending
-                                if _has_screen_clear(text):
-                                    self._collector.clear()
-                                clean = _strip_ansi(text)
-                                self._collector.feed(clean)
+                        # Feed pyte virtual screen (non-tmux platforms)
+                        if use_pyte:
+                            async with self._vscreen_lock:
+                                self._vscreen.feed(data)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -283,6 +232,13 @@ class ManagedSession:
 
     def resize(self, cols: int, rows: int):
         self.backend.resize(self.handle, cols, rows)
+        # Keep pyte virtual screen in sync with actual terminal size
+        self.handle.cols = cols
+        self.handle.rows = rows
+        try:
+            self._vscreen.resize(cols, rows)
+        except Exception:
+            pass
 
     def close_graceful(self):
         self.backend.close_graceful(self.handle)

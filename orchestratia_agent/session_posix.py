@@ -99,7 +99,7 @@ class PosixSessionBackend:
                 os.close(slave_fd)
                 mode = f"tmux={tmux_name}" if use_tmux else "plain"
                 log.info(f"Spawned PTY session {session_id[:8]}: pid={pid}, cwd={cwd}, mode={mode}")
-                return SessionHandle(pid=pid, fd=master_fd, tmux_name=tmux_name)
+                return SessionHandle(pid=pid, fd=master_fd, tmux_name=tmux_name, cols=cols, rows=rows)
 
         except Exception as e:
             log.error(f"Failed to spawn PTY session")
@@ -138,7 +138,7 @@ class PosixSessionBackend:
             else:
                 os.close(slave_fd)
                 log.info(f"Reattached to tmux session {session_name}: pid={pid}")
-                return SessionHandle(pid=pid, fd=master_fd, tmux_name=session_name)
+                return SessionHandle(pid=pid, fd=master_fd, tmux_name=session_name, cols=cols, rows=rows)
         except Exception as e:
             log.error(f"Failed to reattach tmux session {session_name}: {e}")
             return None

@@ -13,6 +13,8 @@ class SessionHandle:
     fd: int = -1                  # master fd (POSIX) or -1 (Windows)
     tmux_name: str = ""           # tmux session name, empty if not using tmux
     pty_process: object = None    # pywinpty PtyProcess (Windows only)
+    cols: int = 120               # terminal width for pyte virtual screen
+    rows: int = 40                # terminal height for pyte virtual screen
     extra: dict = field(default_factory=dict)
 
 

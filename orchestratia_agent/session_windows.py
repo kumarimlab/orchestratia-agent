@@ -79,6 +79,8 @@ class WindowsSessionBackend:
                 pid=proc.pid,
                 fd=-1,
                 pty_process=proc,
+                cols=cols,
+                rows=rows,
             )
         except Exception as e:
             log.error(f"Failed to spawn ConPTY session")
@@ -140,8 +142,8 @@ class WindowsSessionBackend:
     def close_graceful(self, handle: SessionHandle) -> None:
         proc: PtyProcess = handle.pty_process
         try:
-            # Send Ctrl+C through the PTY
-            proc.sendcontrol("c")
+            # Send "exit" command to shell — Ctrl+C alone doesn't close PowerShell/cmd
+            proc.write("exit\r")
         except Exception:
             pass
 

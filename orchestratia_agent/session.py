@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
+import re
 import sys
 from typing import TYPE_CHECKING, Callable, Awaitable
 
@@ -19,6 +19,14 @@ if TYPE_CHECKING:
     pass
 
 log = logging.getLogger("orchestratia-agent")
+
+# Regex to strip ANSI escape sequences (colors, cursor movement, etc.)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?\x07|\x1b\[[\?0-9;]*[a-z]|\x1b\(B|\x1b=|\x1b>|\x0f")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from terminal output."""
+    return _ANSI_RE.sub("", text)
 
 
 class ManagedSession:
@@ -44,6 +52,9 @@ class ManagedSession:
         self.capture_task: asyncio.Task | None = None
         self._last_screen: list[str] = []
         self.closed = False
+        # Buffer for synthesizing session_screen from raw output (non-tmux)
+        self._raw_buffer: list[str] = []
+        self._raw_buffer_lock = asyncio.Lock()
 
     @property
     def pid(self) -> int:
@@ -65,14 +76,21 @@ class ManagedSession:
         self._start_capture()
 
     def _start_capture(self):
-        """Start the capture loop if the backend supports it."""
-        if not self.handle.tmux_name:
-            return
+        """Start the capture loop.
+
+        Uses tmux capture-pane when available (clean rendered output).
+        Falls back to synthesizing screen lines from raw output buffer
+        (Windows, Linux without tmux) so Telegram bots still receive
+        session_screen messages.
+        """
         if self.capture_task and not self.capture_task.done():
             self.capture_task.cancel()
-        self.capture_task = asyncio.create_task(self._capture_loop())
+        if self.handle.tmux_name:
+            self.capture_task = asyncio.create_task(self._tmux_capture_loop())
+        else:
+            self.capture_task = asyncio.create_task(self._synthetic_capture_loop())
 
-    async def _capture_loop(self):
+    async def _tmux_capture_loop(self):
         """Periodically capture tmux pane content and send diffs to the hub."""
         loop = asyncio.get_event_loop()
         try:
@@ -99,9 +117,58 @@ class ManagedSession:
         except asyncio.CancelledError:
             pass
 
+    async def _synthetic_capture_loop(self):
+        """Synthesize session_screen from raw output when tmux is unavailable.
+
+        Collects raw terminal output, strips ANSI escapes, splits into lines,
+        and sends periodically. This enables Telegram bots to receive output
+        on Windows and non-tmux Linux/macOS systems.
+        """
+        try:
+            while not self.closed:
+                await asyncio.sleep(5)
+                if self.closed:
+                    break
+                try:
+                    async with self._raw_buffer_lock:
+                        if not self._raw_buffer:
+                            continue
+                        raw_text = "".join(self._raw_buffer)
+                        self._raw_buffer.clear()
+
+                    # Strip ANSI escapes and normalize line endings
+                    clean = _strip_ansi(raw_text)
+                    clean = clean.replace("\r\n", "\n").replace("\r", "\n")
+                    lines = clean.split("\n")
+
+                    # Strip trailing empty lines
+                    while lines and not lines[-1].strip():
+                        lines.pop()
+
+                    if not lines or lines == self._last_screen:
+                        continue
+
+                    await self._ws_send({
+                        "type": "session_screen",
+                        "session_id": self.session_id,
+                        "lines": lines,
+                    })
+                    self._last_screen = lines
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    log.debug(f"Session {self.session_id[:8]} synthetic capture error: {e}")
+        except asyncio.CancelledError:
+            pass
+
     async def _read_loop(self):
-        """Read from the session and relay to the hub as base64."""
+        """Read from the session and relay to the hub as base64.
+
+        Also feeds the raw buffer for synthetic screen capture when
+        tmux is not available.
+        """
         loop = asyncio.get_event_loop()
+        use_synthetic = not self.handle.tmux_name
         try:
             while not self.closed:
                 try:
@@ -117,6 +184,16 @@ class ManagedSession:
                             "session_id": self.session_id,
                             "data": b64,
                         })
+                        # Feed raw buffer for synthetic capture (non-tmux)
+                        if use_synthetic:
+                            text = data.decode("utf-8", errors="replace")
+                            async with self._raw_buffer_lock:
+                                self._raw_buffer.append(text)
+                                # Cap buffer at 64KB to prevent memory growth
+                                total = sum(len(s) for s in self._raw_buffer)
+                                while total > 65536 and len(self._raw_buffer) > 1:
+                                    removed = self._raw_buffer.pop(0)
+                                    total -= len(removed)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

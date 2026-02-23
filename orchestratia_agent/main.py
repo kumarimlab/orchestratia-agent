@@ -87,7 +87,12 @@ async def main():
                 log.error("Registration failed.")
                 sys.exit(1)
             log.info("Registration successful. Start the daemon with: orchestratia-agent")
-            log.info("  Or via systemd: sudo systemctl start orchestratia-agent")
+            if sys.platform == "win32":
+                log.info("  Or install as service: see scripts/install-windows.ps1")
+            elif sys.platform == "darwin":
+                log.info("  Or via launchd: see scripts/install-macos.sh")
+            else:
+                log.info("  Or via systemd: sudo systemctl start orchestratia-agent")
         return
 
     elif os.path.exists(state.config_path):

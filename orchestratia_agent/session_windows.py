@@ -120,8 +120,11 @@ class WindowsSessionBackend:
     def write(self, handle: SessionHandle, data: bytes) -> None:
         proc: PtyProcess = handle.pty_process
         try:
-            # pywinpty write() expects str
-            proc.write(data.decode("utf-8", errors="replace"))
+            text = data.decode("utf-8", errors="replace")
+            # Debug: log control characters to diagnose Enter key issues
+            if any(c in text for c in "\r\n"):
+                log.info(f"Write (pid={handle.pid}): {repr(text)} ({len(data)} bytes, alive={proc.isalive()})")
+            proc.write(text)
         except Exception as e:
             log.warning(f"Write error (pid={handle.pid}): {e}")
 

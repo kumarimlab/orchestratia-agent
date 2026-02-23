@@ -226,7 +226,12 @@ async def ws_receive_loop(ws, state: DaemonState):
                 session = state.active_sessions.get(session_id)
                 if session and not session.closed and b64_data:
                     raw_bytes = base64.b64decode(b64_data)
+                    log.info(f"session_input: session={session_id[:8]}, bytes={repr(raw_bytes)}, closed={session.closed}")
                     session.write_input(raw_bytes)
+                elif not session:
+                    log.warning(f"session_input: session {session_id[:8]} not found in active_sessions")
+                elif session.closed:
+                    log.warning(f"session_input: session {session_id[:8]} is closed")
 
             elif msg_type == "session_resize":
                 session_id = msg.get("session_id")

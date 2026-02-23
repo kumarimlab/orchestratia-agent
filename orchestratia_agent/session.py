@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 import re
 import sys
@@ -21,12 +22,79 @@ if TYPE_CHECKING:
 log = logging.getLogger("orchestratia-agent")
 
 # Regex to strip ANSI escape sequences (colors, cursor movement, etc.)
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?\x07|\x1b\[[\?0-9;]*[a-z]|\x1b\(B|\x1b=|\x1b>|\x0f")
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;]*[A-Za-z]"    # CSI sequences: ESC[...X
+    r"|\x1b\][^\x07]*\x07"       # OSC sequences: ESC]...BEL
+    r"|\x1b\[[\?0-9;]*[a-z]"     # Private mode: ESC[?...x
+    r"|\x1b[\(\)][AB012]"         # Character set: ESC(B etc
+    r"|\x1b[=>]"                  # Keypad mode
+    r"|\x0f"                      # SI (shift in)
+    r"|\x1b\[[\d;]*m"             # SGR (redundant with first, but explicit)
+)
 
 
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences from terminal output."""
     return _ANSI_RE.sub("", text)
+
+
+class ScreenBuffer:
+    """Rolling line buffer that simulates a terminal screen.
+
+    Maintains the last `max_lines` of output. New output is appended,
+    split by newlines, and old lines are trimmed. This produces a stable
+    screen snapshot similar to tmux capture-pane.
+    """
+
+    def __init__(self, max_lines: int = 50):
+        self._lines: list[str] = []
+        self._partial: str = ""  # Incomplete line (no trailing newline yet)
+        self._max = max_lines
+        self._hash: str = ""
+
+    def feed(self, raw: str) -> None:
+        """Feed raw terminal output (already ANSI-stripped)."""
+        text = self._partial + raw
+        # Normalize \r\n to \n first, then handle bare \r (overwrites)
+        text = text.replace("\r\n", "\n")
+        parts = text.split("\n")
+        # Last element is the partial (incomplete) line
+        self._partial = parts[-1]
+        # All preceding elements are complete lines
+        for line in parts[:-1]:
+            # Bare \r means overwrite current line (progress bars, etc.)
+            if "\r" in line:
+                line = line.rsplit("\r", 1)[-1]
+            self._lines.append(line)
+
+        # Trim to max
+        if len(self._lines) > self._max * 2:
+            self._lines = self._lines[-self._max:]
+
+    def snapshot(self) -> tuple[list[str], str]:
+        """Return (lines, hash). Hash changes only when content changes."""
+        # Include partial line if non-empty
+        lines = list(self._lines[-self._max:])
+        if self._partial.strip():
+            partial = self._partial
+            if "\r" in partial:
+                partial = partial.rsplit("\r", 1)[-1]
+            lines.append(partial)
+
+        # Strip trailing empty lines
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        h = hashlib.md5("\n".join(lines).encode()).hexdigest()
+        return lines, h
+
+    def has_changed(self) -> bool:
+        """Check if content changed since last call."""
+        _, h = self.snapshot()
+        if h == self._hash:
+            return False
+        self._hash = h
+        return True
 
 
 class ManagedSession:
@@ -52,9 +120,9 @@ class ManagedSession:
         self.capture_task: asyncio.Task | None = None
         self._last_screen: list[str] = []
         self.closed = False
-        # Buffer for synthesizing session_screen from raw output (non-tmux)
-        self._raw_buffer: list[str] = []
-        self._raw_buffer_lock = asyncio.Lock()
+        # Screen buffer for synthesizing session_screen (non-tmux)
+        self._screen = ScreenBuffer(max_lines=50)
+        self._screen_lock = asyncio.Lock()
 
     @property
     def pid(self) -> int:
@@ -79,7 +147,7 @@ class ManagedSession:
         """Start the capture loop.
 
         Uses tmux capture-pane when available (clean rendered output).
-        Falls back to synthesizing screen lines from raw output buffer
+        Falls back to synthesizing screen lines from a rolling buffer
         (Windows, Linux without tmux) so Telegram bots still receive
         session_screen messages.
         """
@@ -118,11 +186,11 @@ class ManagedSession:
             pass
 
     async def _synthetic_capture_loop(self):
-        """Synthesize session_screen from raw output when tmux is unavailable.
+        """Send screen snapshots from the rolling buffer when content changes.
 
-        Collects raw terminal output, strips ANSI escapes, splits into lines,
-        and sends periodically. This enables Telegram bots to receive output
-        on Windows and non-tmux Linux/macOS systems.
+        The ScreenBuffer maintains a rendered view of the last ~50 lines.
+        We only send when the content hash changes, avoiding duplicate
+        messages from terminal redraws (e.g., resize events).
         """
         try:
             while not self.closed:
@@ -130,22 +198,12 @@ class ManagedSession:
                 if self.closed:
                     break
                 try:
-                    async with self._raw_buffer_lock:
-                        if not self._raw_buffer:
+                    async with self._screen_lock:
+                        if not self._screen.has_changed():
                             continue
-                        raw_text = "".join(self._raw_buffer)
-                        self._raw_buffer.clear()
+                        lines, _ = self._screen.snapshot()
 
-                    # Strip ANSI escapes and normalize line endings
-                    clean = _strip_ansi(raw_text)
-                    clean = clean.replace("\r\n", "\n").replace("\r", "\n")
-                    lines = clean.split("\n")
-
-                    # Strip trailing empty lines
-                    while lines and not lines[-1].strip():
-                        lines.pop()
-
-                    if not lines or lines == self._last_screen:
+                    if not lines:
                         continue
 
                     await self._ws_send({
@@ -153,7 +211,6 @@ class ManagedSession:
                         "session_id": self.session_id,
                         "lines": lines,
                     })
-                    self._last_screen = lines
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -164,7 +221,7 @@ class ManagedSession:
     async def _read_loop(self):
         """Read from the session and relay to the hub as base64.
 
-        Also feeds the raw buffer for synthetic screen capture when
+        Also feeds the screen buffer for synthetic capture when
         tmux is not available.
         """
         loop = asyncio.get_event_loop()
@@ -184,16 +241,12 @@ class ManagedSession:
                             "session_id": self.session_id,
                             "data": b64,
                         })
-                        # Feed raw buffer for synthetic capture (non-tmux)
+                        # Feed screen buffer for synthetic capture (non-tmux)
                         if use_synthetic:
                             text = data.decode("utf-8", errors="replace")
-                            async with self._raw_buffer_lock:
-                                self._raw_buffer.append(text)
-                                # Cap buffer at 64KB to prevent memory growth
-                                total = sum(len(s) for s in self._raw_buffer)
-                                while total > 65536 and len(self._raw_buffer) > 1:
-                                    removed = self._raw_buffer.pop(0)
-                                    total -= len(removed)
+                            clean = _strip_ansi(text)
+                            async with self._screen_lock:
+                                self._screen.feed(clean)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

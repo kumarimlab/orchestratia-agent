@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import logging
 import re
 import sys
@@ -47,48 +46,50 @@ def _has_screen_clear(raw: str) -> bool:
     return bool(_SCREEN_CLEAR_RE.search(raw))
 
 
-class ScreenBuffer:
-    """Rolling line buffer that simulates a terminal screen.
+class OutputCollector:
+    """Collects new terminal output between capture cycles.
 
-    Maintains the last `max_lines` of output. New output is appended,
-    split by newlines, and old lines are trimmed. This produces a stable
-    screen snapshot similar to tmux capture-pane.
+    Unlike a screen buffer (which tries to maintain rendered state),
+    this simply accumulates new output and drains it on each send.
+    Screen-clear sequences discard pending output to prevent resize
+    redraws from being sent as "new" content.
     """
 
-    def __init__(self, max_lines: int = 50):
-        self._lines: list[str] = []
-        self._partial: str = ""  # Incomplete line (no trailing newline yet)
-        self._max = max_lines
-        self._hash: str = ""
+    def __init__(self):
+        self._pending: list[str] = []
+        self._partial: str = ""
+        self._dirty: bool = False  # True when new data arrived since last drain
 
     def clear(self) -> None:
-        """Reset the buffer (called when a screen-clear sequence is detected)."""
-        self._lines.clear()
+        """Discard pending output (called on screen clear/redraw)."""
+        self._pending.clear()
         self._partial = ""
+        self._dirty = False
 
     def feed(self, raw: str) -> None:
-        """Feed raw terminal output (already ANSI-stripped)."""
+        """Feed ANSI-stripped terminal output."""
+        if not raw:
+            return
+        self._dirty = True
         text = self._partial + raw
-        # Normalize \r\n to \n first, then handle bare \r (overwrites)
         text = text.replace("\r\n", "\n")
         parts = text.split("\n")
-        # Last element is the partial (incomplete) line
         self._partial = parts[-1]
-        # All preceding elements are complete lines
         for line in parts[:-1]:
-            # Bare \r means overwrite current line (progress bars, etc.)
             if "\r" in line:
                 line = line.rsplit("\r", 1)[-1]
-            self._lines.append(line)
+            self._pending.append(line)
 
-        # Trim to max
-        if len(self._lines) > self._max * 2:
-            self._lines = self._lines[-self._max:]
+    def drain(self) -> list[str]:
+        """Return new lines since last drain, then clear the buffer.
 
-    def snapshot(self) -> tuple[list[str], str]:
-        """Return (lines, hash). Hash changes only when content changes."""
-        # Include partial line if non-empty
-        lines = list(self._lines[-self._max:])
+        Includes the partial (incomplete) line if non-empty.
+        Returns empty list if nothing new since last drain.
+        """
+        if not self._dirty:
+            return []
+
+        lines = list(self._pending)
         if self._partial.strip():
             partial = self._partial
             if "\r" in partial:
@@ -99,16 +100,10 @@ class ScreenBuffer:
         while lines and not lines[-1].strip():
             lines.pop()
 
-        h = hashlib.md5("\n".join(lines).encode()).hexdigest()
-        return lines, h
-
-    def has_changed(self) -> bool:
-        """Check if content changed since last call."""
-        _, h = self.snapshot()
-        if h == self._hash:
-            return False
-        self._hash = h
-        return True
+        # Mark as drained
+        self._pending.clear()
+        self._dirty = False
+        return lines
 
 
 class ManagedSession:
@@ -134,9 +129,9 @@ class ManagedSession:
         self.capture_task: asyncio.Task | None = None
         self._last_screen: list[str] = []
         self.closed = False
-        # Screen buffer for synthesizing session_screen (non-tmux)
-        self._screen = ScreenBuffer(max_lines=50)
-        self._screen_lock = asyncio.Lock()
+        # Output collector for synthesizing session_screen (non-tmux)
+        self._collector = OutputCollector()
+        self._collector_lock = asyncio.Lock()
 
     @property
     def pid(self) -> int:
@@ -200,11 +195,11 @@ class ManagedSession:
             pass
 
     async def _synthetic_capture_loop(self):
-        """Send screen snapshots from the rolling buffer when content changes.
+        """Periodically send new output lines to the hub.
 
-        The ScreenBuffer maintains a rendered view of the last ~50 lines.
-        We only send when the content hash changes, avoiding duplicate
-        messages from terminal redraws (e.g., resize events).
+        Drains the OutputCollector every 5 seconds and sends only the
+        genuinely new lines. Screen-clear sequences (resize redraws)
+        discard buffered output to prevent duplicates.
         """
         try:
             while not self.closed:
@@ -212,10 +207,8 @@ class ManagedSession:
                 if self.closed:
                     break
                 try:
-                    async with self._screen_lock:
-                        if not self._screen.has_changed():
-                            continue
-                        lines, _ = self._screen.snapshot()
+                    async with self._collector_lock:
+                        lines = self._collector.drain()
 
                     if not lines:
                         continue
@@ -255,15 +248,15 @@ class ManagedSession:
                             "session_id": self.session_id,
                             "data": b64,
                         })
-                        # Feed screen buffer for synthetic capture (non-tmux)
+                        # Feed output collector for synthetic capture (non-tmux)
                         if use_synthetic:
                             text = data.decode("utf-8", errors="replace")
-                            async with self._screen_lock:
-                                # Detect screen clear/redraw before stripping
+                            async with self._collector_lock:
+                                # Detect screen clear/redraw — discard pending
                                 if _has_screen_clear(text):
-                                    self._screen.clear()
+                                    self._collector.clear()
                                 clean = _strip_ansi(text)
-                                self._screen.feed(clean)
+                                self._collector.feed(clean)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Verify entry points
+        run: |
+          orchestratia-agent --version
+          orchestratia --help
+          python -m orchestratia_agent --version
+
+      - name: Verify all module imports
+        run: |
+          python -c "
+          from orchestratia_agent import __version__
+          from orchestratia_agent.config import load_config, save_config, parse_token_hub_url, default_config_path, default_log_dir
+          from orchestratia_agent.system import get_system_info, get_repos_info
+          from orchestratia_agent.session_base import SessionBackend, SessionHandle
+          from orchestratia_agent.session import ManagedSession, get_session_backend
+          from orchestratia_agent.logging_config import setup_logging, ColorFormatter
+          from orchestratia_agent.main import DaemonState
+          from orchestratia_agent.cli import main as cli_main
+          print(f'Version: {__version__}')
+          print(f'Config path: {default_config_path()}')
+          print(f'Log dir: {default_log_dir()}')
+          backend = get_session_backend()
+          print(f'Backend: {type(backend).__name__}')
+          print(f'Persistence: {backend.supports_persistence()}')
+          info = get_system_info()
+          print(f'System info keys: {len(info)}')
+          "
+
+      - name: Verify platform-specific backend (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          python -c "
+          from orchestratia_agent.session_posix import PosixSessionBackend
+          from orchestratia_agent.session_base import SessionBackend
+          b = PosixSessionBackend()
+          assert isinstance(b, SessionBackend), 'PosixSessionBackend does not conform to SessionBackend'
+          print('PosixSessionBackend: OK')
+          "
+
+      - name: Verify platform-specific backend (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -c "
+          from orchestratia_agent.session_windows import WindowsSessionBackend
+          from orchestratia_agent.session_base import SessionBackend
+          b = WindowsSessionBackend()
+          assert isinstance(b, SessionBackend), 'WindowsSessionBackend does not conform to SessionBackend'
+          print('WindowsSessionBackend: OK')
+          print(f'Persistence: {b.supports_persistence()}')
+          print(f'Surviving sessions: {b.discover_surviving_sessions()}')
+          "
+
+      - name: Test config path defaults
+        run: |
+          python -c "
+          import sys
+          from orchestratia_agent.config import default_config_path, default_log_dir
+          cp = default_config_path()
+          ld = default_log_dir()
+          print(f'Platform: {sys.platform}')
+          print(f'Config: {cp}')
+          print(f'Log dir: {ld}')
+          if sys.platform == 'win32':
+              assert 'Orchestratia' in cp and 'AppData' in cp
+          elif sys.platform == 'darwin':
+              assert 'Library' in cp
+          else:
+              assert cp == '/etc/orchestratia/config.yaml'
+          print('Path defaults: OK')
+          "
+
+      - name: Test token parsing
+        run: |
+          python -c "
+          from orchestratia_agent.config import parse_token_hub_url
+          assert parse_token_hub_url('invalid') is None
+          assert parse_token_hub_url('orcreg_aHR0cHM6Ly9leGFtcGxlLmNvbQ.secret123') == 'https://example.com'
+          print('Token parsing: OK')
+          "
+
+      - name: Test legacy shims
+        run: |
+          python daemon.py --version
+          python cli.py --help

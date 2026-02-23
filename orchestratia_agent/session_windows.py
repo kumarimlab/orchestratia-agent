@@ -130,6 +130,7 @@ class WindowsSessionBackend:
             # already handled \r will treat \n as a no-op line feed, while apps
             # that need \n for Enter will pick it up.
             if text == "\r":
+                log.info(f"ConPTY workaround: also writing \\n after \\r (pid={handle.pid})")
                 proc.write("\n")
         except Exception as e:
             log.warning(f"Write error (pid={handle.pid}): {e}")

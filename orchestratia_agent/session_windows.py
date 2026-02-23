@@ -125,6 +125,12 @@ class WindowsSessionBackend:
             if any(c in text for c in "\r\n"):
                 log.info(f"Write (pid={handle.pid}): {repr(text)} ({len(data)} bytes, alive={proc.isalive()})")
             proc.write(text)
+            # ConPTY workaround: some TUI apps (e.g. Codex CLI) don't register
+            # bare \r as Enter when written via pipe. Send \n as well — apps that
+            # already handled \r will treat \n as a no-op line feed, while apps
+            # that need \n for Enter will pick it up.
+            if text == "\r":
+                proc.write("\n")
         except Exception as e:
             log.warning(f"Write error (pid={handle.pid}): {e}")
 

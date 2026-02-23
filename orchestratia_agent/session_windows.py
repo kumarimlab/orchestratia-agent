@@ -129,7 +129,7 @@ class WindowsSessionBackend:
                 if self._inject_key_event(handle.pid, "\r"):
                     log.info(f"Enter injected via WriteConsoleInput (pid={handle.pid})")
                     return
-                log.info(f"WriteConsoleInput failed, falling back to proc.write (pid={handle.pid})")
+                log.debug(f"WriteConsoleInput failed, falling back to proc.write (pid={handle.pid})")
             proc.write(text)
         except Exception as e:
             log.warning(f"Write error (pid={handle.pid}): {e}")
@@ -143,19 +143,22 @@ class WindowsSessionBackend:
         VT-to-key-event translation.
         """
         try:
+            # DETACHED_PROCESS (0x8) creates subprocess with NO console,
+            # allowing AttachConsole to the target's ConPTY pseudo-console.
+            # CREATE_NO_WINDOW (0x08000000) still inherits parent's console.
             result = subprocess.run(
                 [sys.executable, "-m", "orchestratia_agent.win_input_helper", str(pid), char],
                 capture_output=True,
                 text=True,
                 timeout=5,
-                creationflags=0x08000000,  # CREATE_NO_WINDOW
+                creationflags=0x00000008,  # DETACHED_PROCESS
             )
             if result.returncode == 0:
                 return True
-            log.warning(f"win_input_helper failed: rc={result.returncode}, err={result.stderr.strip()}")
+            log.debug(f"win_input_helper failed: rc={result.returncode}, err={result.stderr.strip()}")
             return False
         except Exception as e:
-            log.warning(f"win_input_helper error: {e}")
+            log.debug(f"win_input_helper error: {e}")
             return False
 
     def write_notification(self, handle: SessionHandle, text: str) -> None:

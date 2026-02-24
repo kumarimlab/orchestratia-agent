@@ -127,9 +127,35 @@ if [[ ! "$TOKEN" =~ ^orcreg_ ]]; then
     exit 1
 fi
 
+# ── Resolve the real (non-root) user ─────────────────────────────────
+# The service must run as the user who owns the repos, never root.
+# If invoked via sudo, $SUDO_USER has the real user.
+
+if [ "$(id -u)" -eq 0 ]; then
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        RUN_USER="$SUDO_USER"
+    else
+        echo ""
+        echo -e "${RED}${BOLD}Error: Do not run this installer as root.${NC}"
+        echo ""
+        echo "The agent service must run as the user who owns the repos."
+        echo "Run as a regular user (sudo is used internally where needed):"
+        echo ""
+        echo "  bash install.sh <TOKEN>"
+        echo ""
+        exit 1
+    fi
+else
+    RUN_USER="$(whoami)"
+fi
+
+RUN_HOME=$(eval echo "~${RUN_USER}")
+
 # ── Main installer ──────────────────────────────────────────────────
 
 print_header
+
+info "Service will run as user: ${BOLD}${RUN_USER}${NC} (home: ${RUN_HOME})"
 
 # Step 1: Clean up existing installation
 step 1 "Removing existing installation (if any)"
@@ -252,8 +278,8 @@ for dir in "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"; do
     fi
 done
 
-# Ensure ownership
-sudo chown "$(whoami):$(whoami)" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || {
+# Ensure ownership (use the real user, not root)
+sudo chown "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || {
     fail "Could not set directory ownership"
 }
 
@@ -328,12 +354,11 @@ fi
 # Step 7: Systemd service
 step 7 "Setting up systemd service"
 
-# Update the service file with the current user if not ubuntu
-CURRENT_USER=$(whoami)
-if [ "$CURRENT_USER" != "ubuntu" ]; then
-    info "Adjusting service file for user: ${CURRENT_USER}"
-    sudo sed -i "s/User=ubuntu/User=${CURRENT_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
-    sudo sed -i "s/Group=ubuntu/Group=${CURRENT_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
+# Update the service file with the resolved user
+if [ "$RUN_USER" != "ubuntu" ]; then
+    info "Adjusting service file for user: ${RUN_USER}"
+    sudo sed -i "s/User=ubuntu/User=${RUN_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
+    sudo sed -i "s/Group=ubuntu/Group=${RUN_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
 fi
 
 if sudo cp "$INSTALL_DIR/orchestratia-agent.service" /etc/systemd/system/ 2>/dev/null; then

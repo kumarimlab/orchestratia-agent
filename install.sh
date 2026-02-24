@@ -298,24 +298,28 @@ fi
 # Step 5: Python dependencies
 step 5 "Installing Python dependencies"
 
-info "Installing httpx, websockets, pyyaml, psutil..."
+info "Installing orchestratia-agent package and dependencies..."
 PIP_OUTPUT=""
-if PIP_OUTPUT=$(pip3 install -q -r "$INSTALL_DIR/requirements.txt" 2>&1); then
-    ok "Dependencies installed"
-elif PIP_OUTPUT=$(pip3 install -q --break-system-packages -r "$INSTALL_DIR/requirements.txt" 2>&1); then
-    ok "Dependencies installed (with --break-system-packages)"
+if PIP_OUTPUT=$(pip3 install -q "$INSTALL_DIR" 2>&1); then
+    ok "Package installed"
+elif PIP_OUTPUT=$(pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
+    ok "Package installed (with --break-system-packages)"
 else
     fail "pip3 install failed:"
     echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
-    info "Try manually: pip3 install httpx websockets pyyaml psutil"
+    info "Try manually: pip3 install ${INSTALL_DIR}"
 fi
 
+# Show installed version
+PKG_VER=$(pip3 show orchestratia-agent 2>/dev/null | grep '^Version:' | awk '{print $2}' || echo "unknown")
+ok "orchestratia-agent ${PKG_VER}"
+
 # Verify imports work
-if python3 -c "import httpx, websockets, yaml, psutil" 2>/dev/null; then
+if python3 -c "import httpx, websockets, yaml, psutil, orchestratia_agent" 2>/dev/null; then
     ok "All imports verified"
 else
     fail "Some Python packages failed to import"
-    info "Try: pip3 install httpx websockets pyyaml psutil"
+    info "Try: pip3 install ${INSTALL_DIR}"
 fi
 
 # Step 6: Register with hub
@@ -386,10 +390,13 @@ else
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
 fi
 
-# Install CLI tool
+# Install CLI tool — pip may install to ~/.local/bin which isn't always on PATH
 info "Installing orchestratia CLI tool..."
-if sudo chmod +x "$INSTALL_DIR/cli.py" && sudo ln -sf "$INSTALL_DIR/cli.py" /usr/local/bin/orchestratia 2>/dev/null; then
-    ok "CLI installed: /usr/local/bin/orchestratia"
+if command -v orchestratia >/dev/null 2>&1; then
+    CLI_PATH=$(command -v orchestratia)
+    ok "CLI available: ${CLI_PATH}"
+elif sudo chmod +x "$INSTALL_DIR/cli.py" && sudo ln -sf "$INSTALL_DIR/cli.py" /usr/local/bin/orchestratia 2>/dev/null; then
+    ok "CLI installed: /usr/local/bin/orchestratia (symlink fallback)"
 else
     warn "Could not install CLI to /usr/local/bin/orchestratia"
     info "Manual install: sudo ln -sf ${INSTALL_DIR}/cli.py /usr/local/bin/orchestratia"

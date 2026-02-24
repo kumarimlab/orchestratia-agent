@@ -12,14 +12,20 @@ log = logging.getLogger("orchestratia-agent")
 
 
 def default_config_path() -> str:
-    """Return the platform-appropriate default config file path."""
+    """Return the platform-appropriate default config file path.
+
+    On Linux: /etc/orchestratia/ when running as root (system service),
+    ~/.config/orchestratia/ when running as regular user.
+    """
     if sys.platform == "darwin":
         return os.path.expanduser("~/Library/Application Support/Orchestratia/config.yaml")
     elif sys.platform == "win32":
         appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
         return os.path.join(appdata, "Orchestratia", "config.yaml")
     else:
-        return "/etc/orchestratia/config.yaml"
+        if os.geteuid() == 0:
+            return "/etc/orchestratia/config.yaml"
+        return os.path.expanduser("~/.config/orchestratia/config.yaml")
 
 
 def default_log_dir() -> str:
@@ -30,7 +36,9 @@ def default_log_dir() -> str:
         appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local"))
         return os.path.join(appdata, "Orchestratia", "logs")
     else:
-        return "/var/log/orchestratia"
+        if os.geteuid() == 0:
+            return "/var/log/orchestratia"
+        return os.path.expanduser("~/.local/share/orchestratia/logs")
 
 
 def load_config(path: str) -> dict:

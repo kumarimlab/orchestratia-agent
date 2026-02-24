@@ -100,9 +100,35 @@ if [[ ! "$TOKEN" =~ ^orcreg_ ]]; then
     exit 1
 fi
 
+# ── Resolve the real (non-root) user ─────────────────────────────────
+# The service must run as the user who owns the repos, never root.
+# If invoked via sudo, $SUDO_USER has the real user.
+
+if [ "$(id -u)" -eq 0 ]; then
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        RUN_USER="$SUDO_USER"
+    else
+        echo ""
+        echo -e "${RED}${BOLD}Error: Do not run this installer as root.${NC}"
+        echo ""
+        echo "The agent service must run as the user who owns the repos."
+        echo "Run as a regular user (sudo is used internally where needed):"
+        echo ""
+        echo "  bash install-linux.sh <TOKEN>"
+        echo ""
+        exit 1
+    fi
+else
+    RUN_USER="$(whoami)"
+fi
+
+RUN_HOME=$(eval echo "~${RUN_USER}")
+
 # ── Main installer ──────────────────────────────────────────────────
 
 print_header
+
+info "Service will run as user: ${BOLD}${RUN_USER}${NC} (home: ${RUN_HOME})"
 
 # Step 1: Clean up existing installation
 step 1 "Removing existing installation (if any)"
@@ -213,7 +239,7 @@ fi
 step 4 "Registering with Orchestratia hub"
 
 sudo mkdir -p "$CONFIG_DIR" "$LOG_DIR"
-sudo chown "$(whoami):$(whoami)" "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
+sudo chown "${RUN_USER}:${RUN_USER}" "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
 
 info "Using one-time registration token..."
 REGISTER_OUTPUT=""
@@ -242,7 +268,6 @@ fi
 # Step 5: Systemd service
 step 5 "Setting up systemd service"
 
-CURRENT_USER=$(whoami)
 AGENT_BIN=$(which orchestratia-agent 2>/dev/null || echo "/usr/local/bin/orchestratia-agent")
 
 sudo tee /etc/systemd/system/${SERVICE_NAME}.service >/dev/null <<SERVICEEOF
@@ -253,8 +278,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=${CURRENT_USER}
-Group=${CURRENT_USER}
+User=${RUN_USER}
+Group=${RUN_USER}
 ExecStart=${AGENT_BIN} --config ${CONFIG_DIR}/config.yaml
 Restart=always
 RestartSec=10

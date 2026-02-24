@@ -300,9 +300,9 @@ step 5 "Installing Python dependencies"
 
 info "Installing orchestratia-agent package and dependencies..."
 PIP_OUTPUT=""
-if PIP_OUTPUT=$(pip3 install -q "$INSTALL_DIR" 2>&1); then
+if PIP_OUTPUT=$(pip3 install -q --force-reinstall "$INSTALL_DIR" 2>&1); then
     ok "Package installed"
-elif PIP_OUTPUT=$(pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
+elif PIP_OUTPUT=$(pip3 install -q --force-reinstall --break-system-packages "$INSTALL_DIR" 2>&1); then
     ok "Package installed (with --break-system-packages)"
 else
     fail "pip3 install failed:"

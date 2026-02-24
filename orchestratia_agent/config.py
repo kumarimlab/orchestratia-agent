@@ -25,7 +25,14 @@ def default_config_path() -> str:
     else:
         if os.geteuid() == 0:
             return "/etc/orchestratia/config.yaml"
-        return os.path.expanduser("~/.config/orchestratia/config.yaml")
+        # User-level first, fall back to system-level (install.sh puts config there)
+        user_path = os.path.expanduser("~/.config/orchestratia/config.yaml")
+        if os.path.exists(user_path):
+            return user_path
+        system_path = "/etc/orchestratia/config.yaml"
+        if os.path.exists(system_path):
+            return system_path
+        return user_path  # default for new installs
 
 
 def default_log_dir() -> str:

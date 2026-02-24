@@ -321,8 +321,18 @@ def cmd_view(args):
 def cmd_complete(args):
     """Complete a task with result."""
     args.task_id = _resolve_task_id(args.task_id)
+
+    # Parse result as JSON if possible, so structured results (contracts,
+    # changes, tests) are sent as objects rather than opaque strings.
+    # This enables the hub to extract contracts for downstream tasks.
+    result_value = args.result
+    try:
+        result_value = json.loads(args.result)
+    except (json.JSONDecodeError, TypeError):
+        pass  # plain string is fine
+
     task = _api_request("POST", f"/{args.task_id}/complete", {
-        "result": args.result,
+        "result": result_value,
     })
 
     if JSON_MODE:
@@ -611,11 +621,20 @@ def cmd_pipeline_create(args):
             data["acceptance_criteria"] = task_def["acceptance_criteria"]
 
         # Resolve depends_on temp IDs to real UUIDs
+        # Supports: string temp IDs ("setup"), numeric indices (0), or real UUIDs
         if task_def.get("depends_on"):
             dep_uuids = []
             for dep_ref in task_def["depends_on"]:
+                dep_ref = str(dep_ref)  # normalize numeric indices to strings
                 if dep_ref in id_map:
                     dep_uuids.append(id_map[dep_ref])
+                elif dep_ref.isdigit():
+                    # Numeric index → reference to earlier task by position
+                    idx = int(dep_ref)
+                    if idx < len(created_tasks):
+                        dep_uuids.append(created_tasks[idx]["id"])
+                    else:
+                        _error_exit(f"Pipeline index {idx} out of range (only {len(created_tasks)} tasks created so far)")
                 else:
                     # Try as a real UUID or prefix
                     dep_uuids.append(_resolve_task_id(dep_ref))

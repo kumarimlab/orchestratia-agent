@@ -298,24 +298,38 @@ fi
 # Step 5: Python dependencies
 step 5 "Installing Python dependencies"
 
-info "Installing orchestratia-agent package and dependencies..."
+# Clean up any stale pip installs from ALL locations.
+# Python resolves user site-packages (~/.local/) before system site-packages.
+# If an old version exists in ~/.local/, it shadows any new system install.
+# So we must remove from both locations before installing fresh.
+info "Removing stale package versions..."
+sudo -u "$RUN_USER" pip3 uninstall -y orchestratia-agent --break-system-packages 2>/dev/null || true
+pip3 uninstall -y orchestratia-agent --break-system-packages 2>/dev/null || true
+# Belt-and-suspenders: wipe any leftover egg-info or package dirs
+find /home/"$RUN_USER"/.local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
+find /usr/local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
+ok "Cleaned stale installs"
+
+# Install as the real user so it lands in ~/.local/ (highest priority in Python).
+# This avoids the user-vs-system site-packages shadowing problem entirely.
+info "Installing orchestratia-agent package..."
 PIP_OUTPUT=""
-if PIP_OUTPUT=$(pip3 install -q --force-reinstall "$INSTALL_DIR" 2>&1); then
+if PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
     ok "Package installed"
-elif PIP_OUTPUT=$(pip3 install -q --force-reinstall --break-system-packages "$INSTALL_DIR" 2>&1); then
-    ok "Package installed (with --break-system-packages)"
+elif PIP_OUTPUT=$(pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
+    ok "Package installed (system-wide fallback)"
 else
     fail "pip3 install failed:"
     echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
     info "Try manually: pip3 install ${INSTALL_DIR}"
 fi
 
-# Show installed version
-PKG_VER=$(pip3 show orchestratia-agent 2>/dev/null | grep '^Version:' | awk '{print $2}' || echo "unknown")
+# Show installed version (check as the real user)
+PKG_VER=$(sudo -u "$RUN_USER" pip3 show orchestratia-agent 2>/dev/null | grep '^Version:' | awk '{print $2}' || echo "unknown")
 ok "orchestratia-agent ${PKG_VER}"
 
-# Verify imports work
-if python3 -c "import httpx, websockets, yaml, psutil, orchestratia_agent" 2>/dev/null; then
+# Verify imports work (as the real user)
+if sudo -u "$RUN_USER" python3 -c "import httpx, websockets, yaml, psutil, orchestratia_agent" 2>/dev/null; then
     ok "All imports verified"
 else
     fail "Some Python packages failed to import"
@@ -390,16 +404,26 @@ else
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
 fi
 
-# Install CLI tool — pip may install to ~/.local/bin which isn't always on PATH
+# Install CLI tool — pip installs entry point to ~/.local/bin/ (user install).
+# Ensure it's accessible system-wide via /usr/local/bin/ symlink.
 info "Installing orchestratia CLI tool..."
-if command -v orchestratia >/dev/null 2>&1; then
+USER_CLI="${RUN_HOME}/.local/bin/orchestratia"
+if [ -f "$USER_CLI" ]; then
+    # Symlink the pip-installed entry point to /usr/local/bin/ so it's always on PATH
+    sudo ln -sf "$USER_CLI" /usr/local/bin/orchestratia 2>/dev/null && \
+        ok "CLI installed: /usr/local/bin/orchestratia -> ${USER_CLI}" || \
+        warn "Could not symlink CLI; available at ${USER_CLI}"
+elif command -v orchestratia >/dev/null 2>&1; then
     CLI_PATH=$(command -v orchestratia)
     ok "CLI available: ${CLI_PATH}"
-elif sudo chmod +x "$INSTALL_DIR/cli.py" && sudo ln -sf "$INSTALL_DIR/cli.py" /usr/local/bin/orchestratia 2>/dev/null; then
-    ok "CLI installed: /usr/local/bin/orchestratia (symlink fallback)"
 else
-    warn "Could not install CLI to /usr/local/bin/orchestratia"
-    info "Manual install: sudo ln -sf ${INSTALL_DIR}/cli.py /usr/local/bin/orchestratia"
+    # Fallback: symlink the shim script directly
+    if sudo chmod +x "$INSTALL_DIR/cli.py" && sudo ln -sf "$INSTALL_DIR/cli.py" /usr/local/bin/orchestratia 2>/dev/null; then
+        ok "CLI installed: /usr/local/bin/orchestratia (shim fallback)"
+    else
+        warn "Could not install CLI to /usr/local/bin/orchestratia"
+        info "Manual install: sudo ln -sf ${INSTALL_DIR}/cli.py /usr/local/bin/orchestratia"
+    fi
 fi
 
 # Wait a moment and check status

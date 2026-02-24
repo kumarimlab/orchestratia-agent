@@ -172,7 +172,7 @@ def _print_task(task: dict, verbose: bool = False):
 
     status_color = {
         "pending": YELLOW, "assigned": CYAN, "running": CYAN,
-        "done": GREEN, "failed": RED, "needs_human": RED,
+        "done": GREEN, "failed": RED, "needs_human": RED, "cancelled": DIM,
     }.get(task["status"], "")
 
     print(f"  {BRAND}#{task['id']}{RESET} {BOLD}{task['title']}{RESET}")

@@ -84,7 +84,7 @@ jobs:
       - name: Test config path defaults
         run: |
           python -c "
-          import sys
+          import os, sys
           from orchestratia_agent.config import default_config_path, default_log_dir
           cp = default_config_path()
           ld = default_log_dir()
@@ -96,7 +96,10 @@ jobs:
           elif sys.platform == 'darwin':
               assert 'Library' in cp
           else:
-              assert cp == '/etc/orchestratia/config.yaml'
+              if os.geteuid() == 0:
+                  assert cp == '/etc/orchestratia/config.yaml'
+              else:
+                  assert '.config/orchestratia/config.yaml' in cp
           print('Path defaults: OK')
           "
 

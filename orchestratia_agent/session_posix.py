@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import termios
+import time
 
 from orchestratia_agent.session_base import SessionBackend, SessionHandle
 from orchestratia_agent.tmux import discover_tmux_sessions, has_tmux
@@ -99,6 +100,15 @@ class PosixSessionBackend:
                 os.close(slave_fd)
                 mode = f"tmux={tmux_name}" if use_tmux else "plain"
                 log.info(f"Spawned PTY session {session_id[:8]}: pid={pid}, cwd={cwd}, mode={mode}")
+
+                # Enable mouse mode so scroll wheel works in dashboards
+                if use_tmux:
+                    time.sleep(0.3)  # wait for tmux server to be ready
+                    subprocess.run(
+                        ["tmux", "set-option", "-t", tmux_name, "mouse", "on"],
+                        capture_output=True, timeout=2,
+                    )
+
                 return SessionHandle(pid=pid, fd=master_fd, tmux_name=tmux_name, cols=cols, rows=rows)
 
         except Exception as e:
@@ -138,6 +148,13 @@ class PosixSessionBackend:
             else:
                 os.close(slave_fd)
                 log.info(f"Reattached to tmux session {session_name}: pid={pid}")
+
+                # Ensure mouse mode is on for reattached sessions
+                subprocess.run(
+                    ["tmux", "set-option", "-t", session_name, "mouse", "on"],
+                    capture_output=True, timeout=2,
+                )
+
                 return SessionHandle(pid=pid, fd=master_fd, tmux_name=session_name, cols=cols, rows=rows)
         except Exception as e:
             log.error(f"Failed to reattach tmux session {session_name}: {e}")

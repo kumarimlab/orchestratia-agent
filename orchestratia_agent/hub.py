@@ -162,6 +162,40 @@ async def heartbeat_loop(client: httpx.AsyncClient, state: DaemonState):
             await asyncio.sleep(1)
 
 
+def _inject_task_trigger(state: "DaemonState", session: "ManagedSession", task_id: str):
+    """Inject a user prompt into the session to trigger task pickup.
+
+    Uses tmux send-keys for reliable input injection into the Claude Code session.
+    Falls back to direct PTY write if tmux is unavailable.
+    """
+    import subprocess
+
+    message = (
+        "A new task has been assigned to you via Orchestratia. "
+        "Please run `orchestratia task check` to see the details "
+        "and begin working on it."
+    )
+
+    tmux_name = getattr(session.handle, "tmux_name", None) if hasattr(session, "handle") else None
+    if not tmux_name:
+        tmux_name = getattr(session, "tmux_name", None)
+
+    if tmux_name and sys.platform != "win32":
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_name, message, "Enter"],
+                capture_output=True, timeout=5,
+            )
+            log.info(f"Injected task trigger via tmux send-keys to {tmux_name}")
+        except Exception as e:
+            log.warning(f"tmux send-keys failed ({e}), falling back to PTY write")
+            session.write_input(message.encode() + b"\n")
+    else:
+        # Fallback: direct PTY write
+        session.write_input(message.encode() + b"\n")
+        log.info(f"Injected task trigger via direct PTY write for task #{task_id[:8]}")
+
+
 async def ws_receive_loop(ws, state: DaemonState):
     """Receive messages from hub and dispatch to session handlers."""
     backend = state.backend
@@ -261,21 +295,53 @@ async def ws_receive_loop(ws, state: DaemonState):
                 title = msg.get("title", "")
                 from_name = msg.get("from_session_name", "Unknown")
                 priority = msg.get("priority", "normal")
+                pending_approval = msg.get("pending_approval", False)
 
                 session = state.active_sessions.get(target_session_id)
                 if session and not session.closed:
+                    if pending_approval:
+                        # Show notification only — wait for admin approval
+                        notification = (
+                            f"\r\n\033[38;2;212;114;47m"
+                            f"\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\r\n"
+                            f"\u2551  ORCHESTRATIA: Task pending approval                 \u2551\r\n"
+                            f"\u2551  #{task_id[:8]}: \"{title[:40]}\"                     \r\n"
+                            f"\u2551  Waiting for admin to approve before starting...      \r\n"
+                            f"\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"
+                            f"\033[0m\r\n"
+                        )
+                        session.write_notification(notification)
+                        log.info(f"Task #{task_id[:8]} pending approval, notification shown in session {target_session_id[:8]}")
+                    else:
+                        # Auto-trigger: inject user message into Claude session
+                        _inject_task_trigger(state, session, task_id)
+                        log.info(f"Auto-triggered task #{task_id[:8]} in session {target_session_id[:8]}")
+
+            elif msg_type == "task_approved":
+                session_id = msg.get("session_id")
+                task_id = msg.get("task_id", "")
+                session = state.active_sessions.get(session_id)
+                if session and not session.closed:
+                    _inject_task_trigger(state, session, task_id)
+                    log.info(f"Task #{task_id[:8]} approved, triggered in session {session_id[:8]}")
+
+            elif msg_type == "task_rejected":
+                session_id = msg.get("session_id")  # orchestrator's session
+                reason = msg.get("reason", "No reason given")
+                title = msg.get("title", "Unknown")
+                session = state.active_sessions.get(session_id)
+                if session and not session.closed:
                     notification = (
-                        f"\r\n\033[38;2;212;114;47m"
+                        f"\r\n\033[38;2;220;50;50m"
                         f"\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\r\n"
-                        f"\u2551  ORCHESTRATIA: New task assigned                     \u2551\r\n"
-                        f"\u2551  #{task_id[:8]}: \"{title[:40]}\" ({priority})         \r\n"
-                        f"\u2551  From: {from_name[:40]}                              \r\n"
-                        f"\u2551  Run: orchestratia task view {task_id[:8]}            \r\n"
+                        f"\u2551  ORCHESTRATIA: Task rejected by admin                 \u2551\r\n"
+                        f"\u2551  \"{title[:45]}\"                                       \r\n"
+                        f"\u2551  Reason: {reason[:40]}                                \r\n"
                         f"\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"
                         f"\033[0m\r\n"
                     )
                     session.write_notification(notification)
-                    log.info(f"Injected task notification #{task_id[:8]} into session {target_session_id[:8]}")
+                    log.info(f"Task '{title}' rejected, notification sent to session {session_id[:8]}")
 
             elif msg_type == "pong":
                 pass

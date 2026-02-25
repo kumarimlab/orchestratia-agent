@@ -86,10 +86,19 @@ class PosixSessionBackend:
                         os.environ["ORCHESTRATIA_PROJECT_ID"] = project_id
 
                     if use_tmux:
-                        os.execvp("tmux", [
+                        tmux_cmd = [
                             "tmux", "new-session", "-s", tmux_name,
                             "-x", str(cols), "-y", str(rows),
-                        ])
+                        ]
+                        # Pass env vars into tmux session via -e flags
+                        # (tmux server spawns its own shell, so os.environ
+                        # set above doesn't propagate — must use -e)
+                        if env_vars:
+                            for k, v in env_vars.items():
+                                tmux_cmd.extend(["-e", f"{k}={v}"])
+                        if project_id:
+                            tmux_cmd.extend(["-e", f"ORCHESTRATIA_PROJECT_ID={project_id}"])
+                        os.execvp("tmux", tmux_cmd)
                     else:
                         os.execvp(user_shell, [f"-{os.path.basename(user_shell)}"])
                 except Exception as e:

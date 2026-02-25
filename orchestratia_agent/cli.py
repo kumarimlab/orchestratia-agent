@@ -20,6 +20,7 @@ Usage:
   orchestratia task deps add <id> --depends-on <dep_id> [--type blocks]
   orchestratia task deps remove <id> --depends-on <dep_id>
   orchestratia agent list [--json]
+  orchestratia session list [--json]
   orchestratia pipeline create --file pipeline.json [--json]
   orchestratia init [--print]
 
@@ -562,6 +563,34 @@ def cmd_agent_list(args):
         print()
 
 
+# ── Session Commands ─────────────────────────────────────────────────
+
+
+def cmd_session_list(args):
+    """List active sessions in the current project."""
+    if not PROJECT_ID:
+        _error_exit("ORCHESTRATIA_PROJECT_ID not set (set env var or configure config.yaml)")
+
+    result = _api_request("GET", f"?project_id={PROJECT_ID}", base="/api/v1/agent/sessions")
+    sessions = result["sessions"]
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    if not sessions:
+        print(f"{DIM}[ORCHESTRATIA] No active sessions in this project.{RESET}")
+        return
+
+    print(f"{BRAND}[ORCHESTRATIA]{RESET} {len(sessions)} active session(s):")
+    for s in sessions:
+        print(f"  {CYAN}{s['name'] or 'unnamed'}{RESET} ({s['agent_name']})")
+        print(f"    ID: {s['id']}  Status: {GREEN}{s['status']}{RESET}", end="")
+        if s.get("working_directory"):
+            print(f"  Dir: {s['working_directory']}", end="")
+        print()
+
+
 # ── Pipeline Commands ────────────────────────────────────────────────
 
 
@@ -729,6 +758,11 @@ orchestratia task list --status running --json
 orchestratia agent list --json
 ```
 
+### List active sessions in your project
+```bash
+orchestratia session list --json
+```
+
 ### Create a multi-task pipeline
 ```bash
 orchestratia pipeline create --file pipeline.json --json
@@ -890,6 +924,13 @@ def main():
     # agent list
     agent_sub.add_parser("list", help="List all agents")
 
+    # ── session subcommand ──
+    session_parser = subparsers.add_parser("session", help="Session operations")
+    session_sub = session_parser.add_subparsers(dest="action")
+
+    # session list
+    session_sub.add_parser("list", help="List active sessions in this project")
+
     # ── pipeline subcommand ──
     pipeline_parser = subparsers.add_parser("pipeline", help="Multi-task pipeline operations")
     pipeline_sub = pipeline_parser.add_subparsers(dest="action")
@@ -952,6 +993,16 @@ def main():
             "list": cmd_agent_list,
         }
         agent_actions[args.action](args)
+
+    elif args.command == "session":
+        if not args.action:
+            session_parser.print_help()
+            sys.exit(1)
+
+        session_actions = {
+            "list": cmd_session_list,
+        }
+        session_actions[args.action](args)
 
     elif args.command == "pipeline":
         if not args.action:

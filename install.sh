@@ -188,6 +188,19 @@ if [ -d "$CONFIG_DIR" ]; then
     sudo rm -rf "$CONFIG_DIR" 2>/dev/null && ok "Removed ${CONFIG_DIR}" || warn "Could not remove ${CONFIG_DIR}"
 fi
 
+# Clean stale Orchestratia env vars from shell startup files.
+# Older versions or manual setup may have added exports to .bashrc/.profile
+# that override the env vars injected by tmux -e (v0.3.3+).
+BASHRC="${RUN_HOME}/.bashrc"
+if [ -f "$BASHRC" ] && grep -q 'ORCHESTRATIA' "$BASHRC" 2>/dev/null; then
+    EXISTING=true
+    # Remove the Orchestratia block: comment header + export/alias lines
+    sudo -u "$RUN_USER" sed -i '/^# Orchestratia/d;/^# All .* agents run/d;/^# Project scoping/d;/^# Per-session override/d;/^# Example: ORCHESTRATIA/d;/^export ORCHESTRATIA_/d;/^alias orc-/d' "$BASHRC"
+    # Clean up any leftover blank lines from the removal (collapse 3+ blank lines to 2)
+    sudo -u "$RUN_USER" sed -i '/^$/N;/^\n$/N;/^\n\n$/d' "$BASHRC"
+    ok "Cleaned stale ORCHESTRATIA vars from ${BASHRC}"
+fi
+
 if [ -d "$LOG_DIR" ]; then
     EXISTING=true
     sudo rm -rf "$LOG_DIR" 2>/dev/null && ok "Removed ${LOG_DIR}" || warn "Could not remove ${LOG_DIR}"

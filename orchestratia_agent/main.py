@@ -20,6 +20,7 @@ from orchestratia_agent.config import (
     load_config,
 )
 from orchestratia_agent.hub import (
+    _inject_text,
     cleanup_sessions,
     heartbeat_loop,
     register_with_hub,
@@ -43,6 +44,7 @@ class DaemonState:
     ws_connection: object | None = None
     active_sessions: dict[str, ManagedSession] = field(default_factory=dict)
     backend: SessionBackend | None = None
+    pending_notes: dict[str, list] = field(default_factory=dict)
 
 
 async def main():
@@ -146,11 +148,42 @@ async def main():
             await asyncio.gather(
                 heartbeat_loop(client, state),
                 ws_connection_loop(state),
+                idle_note_flush_loop(state),
             )
         finally:
             await cleanup_sessions(state)
 
     log.info("Agent daemon stopped.")
+
+
+async def idle_note_flush_loop(state: DaemonState):
+    """Check every 2 seconds for idle sessions and deliver queued non-urgent notes."""
+    while state.running:
+        await asyncio.sleep(2)
+        if not state.pending_notes:
+            continue
+
+        for session_id in list(state.pending_notes.keys()):
+            notes = state.pending_notes.get(session_id, [])
+            if not notes:
+                state.pending_notes.pop(session_id, None)
+                continue
+
+            session = state.active_sessions.get(session_id)
+            if not session or session.closed:
+                # Session gone — discard notes
+                state.pending_notes.pop(session_id, None)
+                continue
+
+            if session.is_idle:
+                # Deliver all queued notes
+                for note in notes:
+                    content = note.get("content", "")
+                    author = note.get("author", "")
+                    message = f"Note from {author}: {content}"
+                    _inject_text(session, message, send_enter=True)
+                state.pending_notes.pop(session_id, None)
+                log.info(f"Flushed {len(notes)} queued note(s) to idle session {session_id[:8]}")
 
 
 def entry_point():

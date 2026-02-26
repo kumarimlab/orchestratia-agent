@@ -162,38 +162,81 @@ async def heartbeat_loop(client: httpx.AsyncClient, state: DaemonState):
             await asyncio.sleep(1)
 
 
-def _inject_task_trigger(state: "DaemonState", session: "ManagedSession", task_id: str):
-    """Inject a user prompt into the session to trigger task pickup.
+def _get_tmux_name(session: "ManagedSession") -> str | None:
+    """Extract tmux session name from a ManagedSession."""
+    tmux_name = getattr(session.handle, "tmux_name", None) if hasattr(session, "handle") else None
+    if not tmux_name:
+        tmux_name = getattr(session, "tmux_name", None)
+    return tmux_name
 
-    Uses tmux send-keys for reliable input injection into the Claude Code session.
-    Falls back to direct PTY write if tmux is unavailable.
+
+def _inject_text(session: "ManagedSession", text: str, send_enter: bool = True):
+    """Inject text into a session reliably.
+
+    For tmux: uses send-keys -l (literal) for the text, then a separate
+    send-keys Enter command. This prevents special character interpretation.
+    For non-tmux: uses direct PTY write with \\r (not \\n).
     """
     import subprocess
 
+    tmux_name = _get_tmux_name(session)
+
+    if tmux_name and sys.platform != "win32":
+        try:
+            # Send text literally (no key interpretation)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_name, "-l", text],
+                capture_output=True, timeout=5,
+            )
+            if send_enter:
+                # Send Enter separately (as a named key, not literal)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", tmux_name, "Enter"],
+                    capture_output=True, timeout=5,
+                )
+            log.debug(f"Injected text via tmux send-keys -l to {tmux_name}")
+        except Exception as e:
+            log.warning(f"tmux send-keys failed ({e}), falling back to PTY write")
+            data = text.encode()
+            if send_enter:
+                data += b"\r"
+            session.write_input(data)
+    else:
+        # Fallback: direct PTY write — use \r not \n
+        data = text.encode()
+        if send_enter:
+            data += b"\r"
+        session.write_input(data)
+
+
+def _inject_escape(session: "ManagedSession"):
+    """Send Escape key to a session."""
+    import subprocess
+
+    tmux_name = _get_tmux_name(session)
+
+    if tmux_name and sys.platform != "win32":
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", tmux_name, "Escape"],
+                capture_output=True, timeout=5,
+            )
+        except Exception as e:
+            log.warning(f"tmux Escape failed ({e}), falling back to PTY write")
+            session.write_input(b"\x1b")
+    else:
+        session.write_input(b"\x1b")
+
+
+def _inject_task_trigger(state: "DaemonState", session: "ManagedSession", task_id: str):
+    """Inject a user prompt into the session to trigger task pickup."""
     message = (
         "A new task has been assigned to you via Orchestratia. "
         "Please run `orchestratia task check` to see the details "
         "and begin working on it."
     )
-
-    tmux_name = getattr(session.handle, "tmux_name", None) if hasattr(session, "handle") else None
-    if not tmux_name:
-        tmux_name = getattr(session, "tmux_name", None)
-
-    if tmux_name and sys.platform != "win32":
-        try:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_name, message, "Enter"],
-                capture_output=True, timeout=5,
-            )
-            log.info(f"Injected task trigger via tmux send-keys to {tmux_name}")
-        except Exception as e:
-            log.warning(f"tmux send-keys failed ({e}), falling back to PTY write")
-            session.write_input(message.encode() + b"\n")
-    else:
-        # Fallback: direct PTY write
-        session.write_input(message.encode() + b"\n")
-        log.info(f"Injected task trigger via direct PTY write for task #{task_id[:8]}")
+    _inject_text(session, message, send_enter=True)
+    log.info(f"Injected task trigger for task #{task_id[:8]}")
 
 
 async def ws_receive_loop(ws, state: DaemonState):
@@ -296,6 +339,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                 from_name = msg.get("from_session_name", "Unknown")
                 priority = msg.get("priority", "normal")
                 pending_approval = msg.get("pending_approval", False)
+                require_plan = msg.get("require_plan", False)
 
                 session = state.active_sessions.get(target_session_id)
                 if session and not session.closed:
@@ -312,6 +356,15 @@ async def ws_receive_loop(ws, state: DaemonState):
                         )
                         session.write_notification(notification)
                         log.info(f"Task #{task_id[:8]} pending approval, notification shown in session {target_session_id[:8]}")
+                    elif require_plan:
+                        # Plan mode: tell the worker to analyze before executing
+                        message = (
+                            "A new task has been assigned to you via Orchestratia in PLAN MODE. "
+                            "You must analyze the task and submit a plan before executing. "
+                            "Please run `orchestratia task check` to see the details."
+                        )
+                        _inject_text(session, message, send_enter=True)
+                        log.info(f"Task #{task_id[:8]} assigned in plan mode to session {target_session_id[:8]}")
                     else:
                         # Auto-trigger: inject user message into Claude session
                         _inject_task_trigger(state, session, task_id)
@@ -342,6 +395,83 @@ async def ws_receive_loop(ws, state: DaemonState):
                     )
                     session.write_notification(notification)
                     log.info(f"Task '{title}' rejected, notification sent to session {session_id[:8]}")
+
+            elif msg_type == "intervention_response":
+                session_id = msg.get("session_id")
+                response = msg.get("response", "")
+                task_id = msg.get("task_id", "")
+                session = state.active_sessions.get(session_id) if session_id else None
+                if session and not session.closed:
+                    _inject_text(session, response, send_enter=True)
+                    log.info(f"Injected intervention response into session {session_id[:8]}")
+
+            elif msg_type == "task_note":
+                session_id = msg.get("session_id")
+                content = msg.get("content", "")
+                urgent = msg.get("urgent", False)
+                author = msg.get("author", "")
+                task_id = msg.get("task_id", "")
+                session = state.active_sessions.get(session_id) if session_id else None
+                if session and not session.closed:
+                    if urgent:
+                        # Urgent: Esc + delay + inject
+                        async def _urgent_note(s, c, a):
+                            _inject_escape(s)
+                            await asyncio.sleep(2)
+                            message = f"URGENT NOTE from {a}: {c}"
+                            _inject_text(s, message, send_enter=True)
+                        asyncio.create_task(_urgent_note(session, content, author))
+                        log.info(f"Urgent note injected into session {session_id[:8]}")
+                    else:
+                        # Non-urgent: queue for idle delivery
+                        pending = state.pending_notes.setdefault(session_id, [])
+                        pending.append({"content": content, "author": author})
+                        log.info(f"Non-urgent note queued for session {session_id[:8]}")
+
+            elif msg_type == "task_updated":
+                session_id = msg.get("session_id")
+                task_id = msg.get("task_id", "")
+                session = state.active_sessions.get(session_id) if session_id else None
+                if session and not session.closed:
+                    async def _task_update_inject(s):
+                        _inject_escape(s)
+                        await asyncio.sleep(2)
+                        message = (
+                            "The task spec has been updated by the orchestrator. "
+                            "Please run `orchestratia task check` to see the latest details."
+                        )
+                        _inject_text(s, message, send_enter=True)
+                    asyncio.create_task(_task_update_inject(session))
+                    log.info(f"Task update notification injected into session {session_id[:8]}")
+
+            elif msg_type == "plan_approved":
+                session_id = msg.get("session_id")
+                task_id = msg.get("task_id", "")
+                session = state.active_sessions.get(session_id) if session_id else None
+                if session and not session.closed:
+                    message = (
+                        "Your plan has been approved. Proceed with execution. "
+                        "Run `orchestratia task check` for the full task details."
+                    )
+                    _inject_text(session, message, send_enter=True)
+                    log.info(f"Plan approved, injected into session {session_id[:8]}")
+
+            elif msg_type == "plan_revision":
+                session_id = msg.get("session_id")
+                feedback = msg.get("feedback", "")
+                task_id = msg.get("task_id", "")
+                session = state.active_sessions.get(session_id) if session_id else None
+                if session and not session.closed:
+                    async def _plan_revision_inject(s, fb):
+                        _inject_escape(s)
+                        await asyncio.sleep(2)
+                        message = (
+                            f"Plan revision requested. Feedback: {fb} "
+                            "Please run `orchestratia task check` to review and resubmit."
+                        )
+                        _inject_text(s, message, send_enter=True)
+                    asyncio.create_task(_plan_revision_inject(session, feedback))
+                    log.info(f"Plan revision injected into session {session_id[:8]}")
 
             elif msg_type == "pong":
                 pass

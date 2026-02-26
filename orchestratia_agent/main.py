@@ -111,7 +111,7 @@ async def main():
 
     log.info(f"Orchestratia Agent Daemon v{__version__} starting...")
     log.info(f"Hub URL: {state.hub_url}")
-    log.info(f"Agent name: {state.config.get('agent_name', platform.node())}")
+    log.info(f"Server name: {state.config.get('server_name', platform.node())}")
     log.info(f"Platform: {platform.system()} {platform.release()}")
     log.info(f"Session backend: {type(state.backend).__name__}")
     log.info(f"Persistence: {'yes (tmux)' if state.backend.supports_persistence() else 'no'}")

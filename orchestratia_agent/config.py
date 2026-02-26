@@ -85,7 +85,7 @@ def ensure_config_for_register(config_path: str, token: str) -> dict:
         log.error("Invalid token format — cannot extract hub URL")
         log.error("  Remediation:")
         log.error("    1. Verify the token starts with 'orcreg_'")
-        log.error("    2. Copy the full token from the dashboard (Agents -> Register Agent)")
+        log.error("    2. Copy the full token from the dashboard (Servers -> Register Server)")
         log.error("    3. Ensure no whitespace or line breaks in the token")
         sys.exit(1)
 
@@ -93,7 +93,7 @@ def ensure_config_for_register(config_path: str, token: str) -> dict:
         cfg = load_config(config_path)
     else:
         cfg = {
-            "agent_name": platform.node(),
+            "server_name": platform.node(),
             "repos": {},
             "claude": {
                 "binary": "claude",

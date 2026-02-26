@@ -4,7 +4,7 @@ Agent daemon for [Orchestratia](https://github.com/kumarimlab/orchestratia) -- c
 
 ## Quick Install
 
-Get a registration token from the Orchestratia dashboard (Agents > Register Agent), then run the one-liner for your platform:
+Get a registration token from the Orchestratia dashboard (Servers > Register Server), then run the one-liner for your platform:
 
 **Linux:**
 
@@ -77,7 +77,7 @@ hub_url: "https://staging.orchestratia.com"
 # For first-time setup, use --register instead of editing this directly.
 api_key: "orc_..."
 
-agent_name: "dev-linux-staging"
+server_name: "dev-linux-staging"
 
 repos:
   my-project:

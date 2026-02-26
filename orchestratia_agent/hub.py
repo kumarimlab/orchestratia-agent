@@ -41,7 +41,7 @@ async def register_with_hub(
     client: httpx.AsyncClient,
     state: DaemonState,
 ) -> str | None:
-    """Register this agent with the hub. Returns API key or None."""
+    """Register this server with the hub. Returns API key or None."""
     if state.config.get("api_key"):
         state.api_key = state.config["api_key"]
         log.info(f"Using configured API key: {state.api_key[:8]}...")
@@ -52,15 +52,15 @@ async def register_with_hub(
         log.error(
             "No api_key and no registration_token in config. "
             "Get a registration token from the Orchestratia dashboard: "
-            "Agents -> Register Agent"
+            "Servers -> Register Server"
         )
         return None
 
     try:
         resp = await client.post(
-            f"{state.hub_url}/api/v1/agents/register",
+            f"{state.hub_url}/api/v1/servers/register",
             json={
-                "name": state.config.get("agent_name", platform.node()),
+                "name": state.config.get("server_name", platform.node()),
                 "hostname": platform.node(),
                 "ip": "0.0.0.0",
                 "os": platform.system().lower(),
@@ -71,7 +71,7 @@ async def register_with_hub(
         )
         if resp.status_code == 401:
             detail = resp.json().get("detail", "Unknown error")
-            log.error(f"Failed to register with hub at {state.hub_url}/api/v1/agents/register")
+            log.error(f"Failed to register with hub at {state.hub_url}/api/v1/servers/register")
             log.error(f"  HTTP 401: {detail}")
             log.error(f"  Remediation:")
             log.error(f"    1. Check hub_url in config.yaml")
@@ -81,7 +81,7 @@ async def register_with_hub(
         resp.raise_for_status()
         data = resp.json()
         state.api_key = data["api_key"]
-        log.info(f"Registered with hub. Agent ID: {data['id']}, Key: {state.api_key[:8]}...")
+        log.info(f"Registered with hub. Server ID: {data['id']}, Key: {state.api_key[:8]}...")
 
         if state.config_path:
             persist_api_key(state.config_path, state.api_key)
@@ -90,11 +90,11 @@ async def register_with_hub(
 
         return state.api_key
     except httpx.HTTPStatusError as e:
-        log.error(f"Failed to register with hub at {state.hub_url}/api/v1/agents/register")
+        log.error(f"Failed to register with hub at {state.hub_url}/api/v1/servers/register")
         log.error(f"  HTTP {e.response.status_code}: {e.response.text[:200]}")
         return None
     except httpx.HTTPError as e:
-        log.error(f"Failed to register with hub at {state.hub_url}/api/v1/agents/register")
+        log.error(f"Failed to register with hub at {state.hub_url}/api/v1/servers/register")
         log.error(f"  Error: {e}")
         log.error(f"  Remediation:")
         log.error(f"    1. Check hub_url in config.yaml")
@@ -106,7 +106,7 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
     """Send a heartbeat with system stats to the hub."""
     try:
         resp = await client.post(
-            f"{state.hub_url}/api/v1/agents/heartbeat",
+            f"{state.hub_url}/api/v1/servers/heartbeat",
             json={"system_info": get_system_info()},
             headers={"X-API-Key": state.api_key},
         )
@@ -124,7 +124,7 @@ async def connect_ws(state: DaemonState):
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    target = f"{ws_url}/ws/agent"
+    target = f"{ws_url}/ws/server"
     log.debug(f"WebSocket connecting to {target}")
 
     try:

@@ -5,21 +5,21 @@ create, check, and complete tasks. Reads configuration from
 environment variables set by the daemon, with fallback to config.yaml.
 
 Usage:
-  orchestratia task create --title "..." --spec "..." [--priority high] [--assign agent-name]
+  orchestratia task create --title "..." --spec "..." [--priority high] [--assign session-name]
   orchestratia task check
   orchestratia task view <id>
   orchestratia task complete <id> --result "..."
   orchestratia task start <id>
   orchestratia task fail <id> --error "..."
   orchestratia task help <id> --question "..."
-  orchestratia task assign <id> --agent "name"
+  orchestratia task assign <id> --server "name"
   orchestratia task update <id> [--title/--spec/--priority/...]
   orchestratia task cancel <id>
   orchestratia task status <id>
   orchestratia task list [--status pending] [--json]
   orchestratia task deps add <id> --depends-on <dep_id> [--type blocks]
   orchestratia task deps remove <id> --depends-on <dep_id>
-  orchestratia agent list [--json]
+  orchestratia server list [--json]
   orchestratia session list [--json]
   orchestratia pipeline create --file pipeline.json [--json]
   orchestratia init [--print]
@@ -87,7 +87,7 @@ def _error_exit(msg, code=1):
     sys.exit(code)
 
 
-def _api_request(method: str, path: str, data: dict | None = None, base: str = "/api/v1/agent/tasks") -> dict:
+def _api_request(method: str, path: str, data: dict | None = None, base: str = "/api/v1/server/tasks") -> dict:
     """Make an authenticated API request to the hub."""
     if not HUB_URL:
         _error_exit("ORCHESTRATIA_HUB_URL not set (set env var or configure config.yaml)")
@@ -184,8 +184,8 @@ def _print_task(task: dict, verbose: bool = False):
         print(f"  Type: {task['type']}", end="")
     print()
 
-    if task.get("assigned_agent_name"):
-        print(f"    Agent: {CYAN}{task['assigned_agent_name']}{RESET}")
+    if task.get("assigned_server_name"):
+        print(f"    Server: {CYAN}{task['assigned_server_name']}{RESET}")
 
     if task.get("target_repo"):
         print(f"    Repo: {task['target_repo']}", end="")
@@ -274,7 +274,7 @@ def cmd_create(args):
     # Auto-assign if requested
     if args.assign:
         task = _api_request("POST", f"/{task['id']}/assign", {
-            "agent_name": args.assign,
+            "session_name": args.assign,
         })
 
     if JSON_MODE:
@@ -390,10 +390,10 @@ def cmd_help(args):
 
 
 def cmd_assign(args):
-    """Assign a task to an agent by name."""
+    """Assign a task to a session by name."""
     args.task_id = _resolve_task_id(args.task_id)
     task = _api_request("POST", f"/{args.task_id}/assign", {
-        "agent_name": args.agent,
+        "session_name": args.session,
     })
 
     if JSON_MODE:
@@ -530,32 +530,32 @@ def cmd_deps_remove(args):
     print(f"  #{args.task_id} no longer depends on #{args.depends_on}")
 
 
-# ── Agent Commands ───────────────────────────────────────────────────
+# ── Server Commands ──────────────────────────────────────────────────
 
 
-def cmd_agent_list(args):
-    """List all agents."""
-    result = _api_request("GET", "", base="/api/v1/agent/agents")
-    agents = result["agents"]
+def cmd_server_list(args):
+    """List all registered servers."""
+    result = _api_request("GET", "", base="/api/v1/server/servers")
+    servers = result["servers"]
 
     if JSON_MODE:
         _json_output(result)
         return
 
-    if not agents:
-        print(f"{DIM}[ORCHESTRATIA] No agents registered.{RESET}")
+    if not servers:
+        print(f"{DIM}[ORCHESTRATIA] No servers registered.{RESET}")
         return
 
-    print(f"{BRAND}[ORCHESTRATIA]{RESET} {len(agents)} agent(s):")
-    for a in agents:
-        status_color = GREEN if a["status"] == "online" else DIM
-        print(f"  {CYAN}{a['name']}{RESET} ({a['hostname']}, {a['os']})")
-        print(f"    Status: {status_color}{a['status']}{RESET}", end="")
-        if a.get("last_heartbeat"):
-            print(f"  Last heartbeat: {a['last_heartbeat']}", end="")
+    print(f"{BRAND}[ORCHESTRATIA]{RESET} {len(servers)} server(s):")
+    for s in servers:
+        status_color = GREEN if s["status"] == "online" else DIM
+        print(f"  {CYAN}{s['name']}{RESET} ({s['hostname']}, {s['os']})")
+        print(f"    Status: {status_color}{s['status']}{RESET}", end="")
+        if s.get("last_heartbeat"):
+            print(f"  Last heartbeat: {s['last_heartbeat']}", end="")
         print()
-        if a.get("repos"):
-            repos = a["repos"]
+        if s.get("repos"):
+            repos = s["repos"]
             if isinstance(repos, dict):
                 print(f"    Repos: {', '.join(repos.keys())}")
             elif isinstance(repos, list):
@@ -571,7 +571,7 @@ def cmd_session_list(args):
     if not PROJECT_ID:
         _error_exit("ORCHESTRATIA_PROJECT_ID not set (set env var or configure config.yaml)")
 
-    result = _api_request("GET", f"?project_id={PROJECT_ID}", base="/api/v1/agent/sessions")
+    result = _api_request("GET", f"?project_id={PROJECT_ID}", base="/api/v1/server/sessions")
     sessions = result["sessions"]
 
     if JSON_MODE:
@@ -584,7 +584,7 @@ def cmd_session_list(args):
 
     print(f"{BRAND}[ORCHESTRATIA]{RESET} {len(sessions)} active session(s):")
     for s in sessions:
-        print(f"  {CYAN}{s['name'] or 'unnamed'}{RESET} ({s['agent_name']})")
+        print(f"  {CYAN}{s['name'] or 'unnamed'}{RESET} ({s['server_name']})")
         print(f"    ID: {s['id']}  Status: {GREEN}{s['status']}{RESET}", end="")
         if s.get("working_directory"):
             print(f"  Dir: {s['working_directory']}", end="")
@@ -675,7 +675,7 @@ def cmd_pipeline_create(args):
         # Auto-assign if specified
         if task_def.get("assign"):
             task = _api_request("POST", f"/{task['id']}/assign", {
-                "agent_name": task_def["assign"],
+                "session_name": task_def["assign"],
             })
 
         created_tasks.append(task)
@@ -745,7 +745,7 @@ orchestratia task create --title "Fix login bug" --spec "The login form crashes 
 
 ### Create and assign in one command
 ```bash
-orchestratia task create --title "Build API" --spec "..." --assign agent-name --json
+orchestratia task create --title "Build API" --spec "..." --assign session-name --json
 ```
 
 ### List tasks
@@ -753,9 +753,9 @@ orchestratia task create --title "Build API" --spec "..." --assign agent-name --
 orchestratia task list --status running --json
 ```
 
-### List available agents
+### List registered servers
 ```bash
-orchestratia agent list --json
+orchestratia server list --json
 ```
 
 ### List active sessions in your project
@@ -841,7 +841,7 @@ def main():
                          help="Acceptance criteria (space-separated)")
     create_p.add_argument("--depends-on", nargs="+",
                          help="IDs of tasks this depends on")
-    create_p.add_argument("--assign", help="Agent name to auto-assign after creation")
+    create_p.add_argument("--assign", help="Session name to auto-assign after creation")
 
     # task check
     task_sub.add_parser("check", help="Check for assigned tasks")
@@ -871,9 +871,9 @@ def main():
     help_p.add_argument("--context", help="Additional context")
 
     # task assign
-    assign_p = task_sub.add_parser("assign", help="Assign task to an agent")
+    assign_p = task_sub.add_parser("assign", help="Assign task to a session")
     assign_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
-    assign_p.add_argument("--agent", required=True, help="Agent name")
+    assign_p.add_argument("--session", required=True, help="Session name")
 
     # task update
     update_p = task_sub.add_parser("update", help="Update task fields")
@@ -917,12 +917,12 @@ def main():
     deps_rm_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
     deps_rm_p.add_argument("--depends-on", required=True, help="ID of upstream task")
 
-    # ── agent subcommand ──
-    agent_parser = subparsers.add_parser("agent", help="Agent operations")
-    agent_sub = agent_parser.add_subparsers(dest="action")
+    # ── server subcommand ──
+    server_parser = subparsers.add_parser("server", help="Server operations")
+    server_sub = server_parser.add_subparsers(dest="action")
 
-    # agent list
-    agent_sub.add_parser("list", help="List all agents")
+    # server list
+    server_sub.add_parser("list", help="List all registered servers")
 
     # ── session subcommand ──
     session_parser = subparsers.add_parser("session", help="Session operations")
@@ -984,15 +984,15 @@ def main():
             }
             actions[args.action](args)
 
-    elif args.command == "agent":
+    elif args.command == "server":
         if not args.action:
-            agent_parser.print_help()
+            server_parser.print_help()
             sys.exit(1)
 
-        agent_actions = {
-            "list": cmd_agent_list,
+        server_actions = {
+            "list": cmd_server_list,
         }
-        agent_actions[args.action](args)
+        server_actions[args.action](args)
 
     elif args.command == "session":
         if not args.action:

@@ -64,7 +64,7 @@ pip3 install -r /opt/orchestratia-agent/requirements.txt
 
 Registration requires a **one-time token** from the admin dashboard. The token is self-contained — it encodes the hub URL, so you only need the token itself.
 
-1. Ask your admin to generate a token from the dashboard (Agents -> Register Agent)
+1. Ask your admin to generate a token from the dashboard (Servers -> Register Server)
 2. Run this single command with the token:
 
 ```bash
@@ -92,7 +92,7 @@ The config file is auto-managed — no manual editing needed for registration.
 After registration, you can edit `/etc/orchestratia/config.yaml` to add repos and tune settings:
 
 ```yaml
-agent_name: "your-server-name"
+server_name: "your-server-name"
 
 repos:
   your-repo-name:
@@ -141,7 +141,7 @@ The daemon will now:
 Once registered and running, the flow is:
 
 1. **Admin creates a task** on the dashboard (https://staging.orchestratia.com/tasks/new)
-2. **Admin assigns it to your agent** by selecting your name in the agent dropdown
+2. **Admin assigns it to a session** on your server from the dashboard
 3. **Daemon picks it up** via polling (within 10 seconds)
 4. **Daemon spawns Claude Code** in a detached `screen` session with the task spec as the prompt
 5. **Output streams in real-time** to the hub dashboard via WebSocket
@@ -154,8 +154,8 @@ Once registered and running, the flow is:
 If you (as Claude Code) are executing a task and get stuck, need clarification, or need approval, the daemon supports an intervention flow. The task execution happens in a screen session managed by the daemon, which handles the intervention API calls.
 
 The intervention endpoints available to the daemon:
-- `POST /api/v1/agents/tasks/{task_id}/help` - Request human help (body: `{"question": "...", "context": "..."}`)
-- `GET /api/v1/agents/interventions/{id}` - Poll for the human's response
+- `POST /api/v1/servers/tasks/{task_id}/help` - Request human help (body: `{"question": "...", "context": "..."}`)
+- `GET /api/v1/servers/interventions/{id}` - Poll for the human's response
 
 The admin sees the request in the Interventions page and responds. The response is relayed back.
 
@@ -201,15 +201,15 @@ The admin sees the request in the Interventions page and responds. The response 
 All agent endpoints (except register) use `X-API-Key` header for authentication.
 
 ```
-POST /api/v1/agents/register          # Register with one-time token (first run only)
-POST /api/v1/agents/heartbeat         # System stats, every 30s
-GET  /api/v1/agents/tasks/poll        # Get assigned tasks
-POST /api/v1/agents/tasks/{id}/start  # Mark task as running
-POST /api/v1/agents/tasks/{id}/complete  # Report success
-POST /api/v1/agents/tasks/{id}/fail   # Report failure
-POST /api/v1/agents/tasks/{id}/help   # Request human intervention
-GET  /api/v1/agents/interventions/{id}   # Poll for intervention response
-WS   /ws/agent                        # Real-time output streaming
+POST /api/v1/servers/register          # Register with one-time token (first run only)
+POST /api/v1/servers/heartbeat         # System stats, every 30s
+GET  /api/v1/servers/tasks/poll        # Get assigned tasks
+POST /api/v1/servers/tasks/{id}/start  # Mark task as running
+POST /api/v1/servers/tasks/{id}/complete  # Report success
+POST /api/v1/servers/tasks/{id}/fail   # Report failure
+POST /api/v1/servers/tasks/{id}/help   # Request human intervention
+GET  /api/v1/servers/interventions/{id}   # Poll for intervention response
+WS   /ws/server                        # Real-time output streaming
 ```
 
 ---

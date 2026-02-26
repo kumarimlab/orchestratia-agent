@@ -4,12 +4,12 @@
 hub_url: "https://staging.orchestratia.com"
 
 # Authentication - use ONE of the following:
-# 1. For first-time registration, get a token from the dashboard (Agents -> Register Agent)
+# 1. For first-time registration, get a token from the dashboard (Servers -> Register Server)
 registration_token: "orcreg_xxx"
 # 2. After registration, paste the API key here and remove registration_token
 api_key: ""
 
-agent_name: "dev-linux-staging"
+server_name: "dev-linux-staging"
 
 repos:
   pinaka-gateway:

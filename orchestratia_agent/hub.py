@@ -473,6 +473,27 @@ async def ws_receive_loop(ws, state: DaemonState):
                     asyncio.create_task(_plan_revision_inject(session, feedback))
                     log.info(f"Plan revision injected into session {session_id[:8]}")
 
+            elif msg_type == "task_status_update":
+                session_id = msg.get("session_id")
+                task_id = msg.get("task_id", "")
+                title = msg.get("title", "")
+                status_label = msg.get("status_label", msg.get("status", ""))
+                summary = msg.get("summary", "")
+                session = state.active_sessions.get(session_id) if session_id else None
+                if session and not session.closed:
+                    parts = [f"Task '{title}' (#{task_id[:8]}) {status_label}."]
+                    if summary:
+                        parts.append(f"Summary: {summary}")
+                    parts.append("Run `orchestratia task list` to see current status.")
+                    message = " ".join(parts)
+
+                    async def _status_update_inject(s, m):
+                        _inject_escape(s)
+                        await asyncio.sleep(2)
+                        _inject_text(s, m, send_enter=True)
+                    asyncio.create_task(_status_update_inject(session, message))
+                    log.info(f"Task status update ({msg.get('status')}) injected into orchestrator session {session_id[:8]}")
+
             elif msg_type == "pong":
                 pass
 

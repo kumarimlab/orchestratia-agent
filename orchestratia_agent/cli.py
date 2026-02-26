@@ -12,6 +12,8 @@ Usage:
   orchestratia task start <id>
   orchestratia task fail <id> --error "..."
   orchestratia task help <id> --question "..."
+  orchestratia task plan <id> --plan '{"summary": "...", "impact": "..."}'
+  orchestratia task note <id> --content "..." [--urgent]
   orchestratia task assign <id> --server "name"
   orchestratia task update <id> [--title/--spec/--priority/...]
   orchestratia task cancel <id>
@@ -172,7 +174,8 @@ def _print_task(task: dict, verbose: bool = False):
     }.get(task["priority"], "")
 
     status_color = {
-        "pending": YELLOW, "assigned": CYAN, "running": CYAN,
+        "pending": YELLOW, "assigned": CYAN, "planning": CYAN,
+        "plan_review": YELLOW, "running": CYAN,
         "done": GREEN, "failed": RED, "needs_human": RED, "cancelled": DIM,
     }.get(task["status"], "")
 
@@ -235,6 +238,15 @@ def _print_task(task: dict, verbose: bool = False):
         if task.get("completed_at"):
             print(f"    Completed: {task['completed_at']}")
 
+        if task.get("plan"):
+            plan = task["plan"]
+            if isinstance(plan, dict) and "summary" in plan:
+                print(f"    Plan: {plan['summary']}")
+            else:
+                print(f"    Plan: {json.dumps(plan)[:200]}")
+        if task.get("plan_feedback"):
+            print(f"    Plan feedback: {YELLOW}{task['plan_feedback']}{RESET}")
+
         if task.get("result"):
             result = task["result"]
             if isinstance(result, dict) and "summary" in result:
@@ -273,9 +285,10 @@ def cmd_create(args):
 
     # Auto-assign if requested
     if args.assign:
-        task = _api_request("POST", f"/{task['id']}/assign", {
-            "session_name": args.assign,
-        })
+        assign_data = {"session_name": args.assign}
+        if args.require_plan:
+            assign_data["require_plan"] = True
+        task = _api_request("POST", f"/{task['id']}/assign", assign_data)
 
     if JSON_MODE:
         _json_output(task)
@@ -389,12 +402,53 @@ def cmd_help(args):
     print(f"  Status: {result['status']}")
 
 
+def cmd_plan(args):
+    """Submit a plan for a task in planning state."""
+    args.task_id = _resolve_task_id(args.task_id)
+
+    # Parse plan as JSON if possible, otherwise wrap as {summary: ...}
+    plan_value = args.plan
+    try:
+        plan_value = json.loads(args.plan)
+    except (json.JSONDecodeError, TypeError):
+        plan_value = {"summary": args.plan}
+
+    result = _api_request("POST", f"/{args.task_id}/plan", {
+        "plan": plan_value,
+    })
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    print(f"{GREEN}[ORCHESTRATIA]{RESET} Plan submitted for review:")
+    _print_task(result)
+
+
+def cmd_note(args):
+    """Add a note to a task."""
+    args.task_id = _resolve_task_id(args.task_id)
+    data = {
+        "content": args.content,
+        "urgent": args.urgent,
+    }
+    result = _api_request("POST", f"/{args.task_id}/notes", data)
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    urgency = f"{RED}URGENT{RESET} " if args.urgent else ""
+    print(f"{GREEN}[ORCHESTRATIA]{RESET} {urgency}Note added to task #{args.task_id[:8]}")
+
+
 def cmd_assign(args):
     """Assign a task to a session by name."""
     args.task_id = _resolve_task_id(args.task_id)
-    task = _api_request("POST", f"/{args.task_id}/assign", {
-        "session_name": args.session,
-    })
+    data = {"session_name": args.session}
+    if args.require_plan:
+        data["require_plan"] = True
+    task = _api_request("POST", f"/{args.task_id}/assign", data)
 
     if JSON_MODE:
         _json_output(task)
@@ -842,6 +896,8 @@ def main():
     create_p.add_argument("--depends-on", nargs="+",
                          help="IDs of tasks this depends on")
     create_p.add_argument("--assign", help="Session name to auto-assign after creation")
+    create_p.add_argument("--require-plan", action="store_true",
+                          help="Require plan approval before execution (used with --assign)")
 
     # task check
     task_sub.add_parser("check", help="Check for assigned tasks")
@@ -870,10 +926,23 @@ def main():
     help_p.add_argument("--question", required=True, help="Question for human")
     help_p.add_argument("--context", help="Additional context")
 
+    # task plan
+    plan_p = task_sub.add_parser("plan", help="Submit a plan for review")
+    plan_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
+    plan_p.add_argument("--plan", required=True, help="Plan content (string or JSON)")
+
+    # task note
+    note_p = task_sub.add_parser("note", help="Add a note to a task")
+    note_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
+    note_p.add_argument("--content", required=True, help="Note content")
+    note_p.add_argument("--urgent", action="store_true", help="Mark as urgent (interrupts agent)")
+
     # task assign
     assign_p = task_sub.add_parser("assign", help="Assign task to a session")
     assign_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
     assign_p.add_argument("--session", required=True, help="Session name")
+    assign_p.add_argument("--require-plan", action="store_true",
+                          help="Require plan approval before execution")
 
     # task update
     update_p = task_sub.add_parser("update", help="Update task fields")
@@ -976,6 +1045,8 @@ def main():
                 "start": cmd_start,
                 "fail": cmd_fail,
                 "help": cmd_help,
+                "plan": cmd_plan,
+                "note": cmd_note,
                 "assign": cmd_assign,
                 "update": cmd_update,
                 "cancel": cmd_cancel,

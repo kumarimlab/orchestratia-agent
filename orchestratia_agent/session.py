@@ -10,6 +10,7 @@ import asyncio
 import base64
 import logging
 import sys
+import time
 from typing import TYPE_CHECKING, Callable, Awaitable
 
 import pyte
@@ -86,6 +87,7 @@ class ManagedSession:
         self.capture_task: asyncio.Task | None = None
         self._last_screen: list[str] = []
         self.closed = False
+        self._last_output_time: float = 0.0
         # pyte virtual screen for non-tmux platforms (Windows, Linux without tmux)
         self._vscreen = VirtualScreen(cols=handle.cols, rows=handle.rows)
         self._vscreen_lock = asyncio.Lock()
@@ -97,6 +99,13 @@ class ManagedSession:
     @property
     def tmux_name(self) -> str:
         return self.handle.tmux_name
+
+    @property
+    def is_idle(self) -> bool:
+        """True if no output received for >5 seconds."""
+        if self._last_output_time == 0.0:
+            return True
+        return (time.monotonic() - self._last_output_time) > 5.0
 
     async def start_reader(self):
         """Start (or restart) the async reader that relays PTY output via WebSocket."""
@@ -196,6 +205,7 @@ class ManagedSession:
                     if data is None:
                         break
                     if data:
+                        self._last_output_time = time.monotonic()
                         b64 = base64.b64encode(data).decode("ascii")
                         await self._ws_send({
                             "type": "session_output",

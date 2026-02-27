@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 from orchestratia_agent.session_base import SessionHandle
 
@@ -60,12 +61,18 @@ class WindowsSessionBackend:
             log.warning(f"Working directory {cwd} doesn't exist, using home")
             cwd = os.path.expanduser("~")
 
-        # Build environment
-        env = os.environ.copy()
+        # Set custom env vars in parent process env so child inherits them.
+        # Do NOT pass a custom env dict to PtyProcess.spawn() — pywinpty's
+        # CreateProcess with explicit env block can fail in PyInstaller bundles
+        # (missing system variables cause STATUS_CONTROL_C_EXIT / 0xC000013A).
+        added_keys: list[str] = []
         if env_vars:
-            env.update(env_vars)
+            for k, v in env_vars.items():
+                os.environ[k] = v
+                added_keys.append(k)
         if project_id:
-            env["ORCHESTRATIA_PROJECT_ID"] = project_id
+            os.environ["ORCHESTRATIA_PROJECT_ID"] = project_id
+            added_keys.append("ORCHESTRATIA_PROJECT_ID")
 
         try:
             # pywinpty takes (rows, cols) — opposite of the (cols, rows) convention
@@ -73,9 +80,39 @@ class WindowsSessionBackend:
                 shell,
                 cwd=cwd,
                 dimensions=(rows, cols),
-                env=env,
             )
-            log.info(f"Spawned ConPTY session {session_id[:8]}: shell={shell}, cwd={cwd}")
+
+            # Give the shell a moment to initialize, then verify it's alive.
+            # ConPTY + PowerShell can exit immediately with STATUS_CONTROL_C_EXIT
+            # if the pseudo-console setup fails.
+            time.sleep(0.5)
+            if not proc.isalive():
+                exit_code = getattr(proc, "exitstatus", None)
+                log.error(f"ConPTY session died immediately after spawn")
+                log.error(f"  Exit code: {exit_code} (0x{exit_code:08X})" if exit_code else f"  Exit code: {exit_code}")
+                log.error(f"  Shell: {shell}")
+                log.error(f"  Working dir: {cwd}")
+                log.error(f"  OS build: {sys.getwindowsversion().build}")
+
+                # Try fallback: cmd.exe (simpler, fewer DLL deps than PowerShell)
+                if "powershell" in shell.lower():
+                    fallback_shell = os.environ.get("COMSPEC", "cmd.exe")
+                    log.info(f"Retrying with fallback shell: {fallback_shell}")
+                    proc = PtyProcess.spawn(
+                        fallback_shell,
+                        cwd=cwd,
+                        dimensions=(rows, cols),
+                    )
+                    time.sleep(0.5)
+                    if not proc.isalive():
+                        exit_code2 = getattr(proc, "exitstatus", None)
+                        log.error(f"Fallback shell also died: exit_code={exit_code2}")
+                        return None
+                    log.info(f"Fallback shell {fallback_shell} is alive (PID {proc.pid})")
+                else:
+                    return None
+
+            log.info(f"Spawned ConPTY session {session_id[:8]}: shell={shell}, cwd={cwd}, pid={proc.pid}")
             return SessionHandle(
                 pid=proc.pid,
                 fd=-1,

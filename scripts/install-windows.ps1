@@ -33,7 +33,11 @@ if (-not $Token) {
     exit 1
 }
 
-$ErrorActionPreference = "Stop"
+# NOTE: We use "Continue" instead of "Stop" because native commands (pip,
+# winget, python) write warnings/progress to stderr, and "Stop" converts
+# those into terminating errors that crash the script. All real error
+# handling is done explicitly via exit code checks and Write-Fatal.
+$ErrorActionPreference = "Continue"
 
 # ── Logging ──────────────────────────────────────────────────────────
 # Log everything to a file so we can debug crashes
@@ -127,16 +131,9 @@ if (-not $Token.StartsWith("orcreg_")) {
 function Test-RealPython {
     param([string]$Candidate)
     try {
-        # Temporarily allow errors — the MS Store stub writes to stderr which
-        # becomes a terminating error under $ErrorActionPreference = "Stop"
-        $prevPref = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
         $out = & $Candidate -c "print('ok')" 2>&1
-        $code = $LASTEXITCODE
-        $ErrorActionPreference = $prevPref
-        return ($code -eq 0 -and "$out" -match 'ok')
+        return ($LASTEXITCODE -eq 0 -and "$out" -match 'ok')
     } catch {
-        $ErrorActionPreference = $prevPref
         return $false
     }
 }
@@ -160,15 +157,8 @@ function Install-Python {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
         Write-Info "Installing Python 3.12 via winget (this may take a minute)..."
-        try {
-            $prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-            & winget install Python.Python.3.12 --source winget --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray }
-            $wingetExit = $LASTEXITCODE
-            $ErrorActionPreference = $prevPref
-        } catch {
-            $ErrorActionPreference = $prevPref
-            $wingetExit = 1
-        }
+        & winget install Python.Python.3.12 --source winget --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray }
+        $wingetExit = $LASTEXITCODE
         # winget returns 0 on success, -1978335189 (0x8A150011) if already installed
         if ($wingetExit -eq 0 -or $wingetExit -eq -1978335189) {
             # Refresh PATH for this session
@@ -195,12 +185,9 @@ function Find-Pip {
 
     # First try: python -m pip (most reliable, doesn't need pip in PATH)
     try {
-        $prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"
         $out = & $PythonExe -m pip --version 2>&1
-        $code = $LASTEXITCODE
-        $ErrorActionPreference = $prevPref
-        if ($code -eq 0) { return @($PythonExe, "-m", "pip") }
-    } catch { $ErrorActionPreference = $prevPref }
+        if ($LASTEXITCODE -eq 0) { return @($PythonExe, "-m", "pip") }
+    } catch {}
 
     # Fallback: bare pip/pip3 commands
     $pip = Get-Command pip -ErrorAction SilentlyContinue
@@ -242,16 +229,12 @@ if ($svc) {
 # Uninstall pip package (resolve python early just for cleanup)
 $PythonExe = Find-Python
 if ($PythonExe) {
-    try {
-        $prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-        $pipCheck = & $PythonExe -m pip show orchestratia-agent 2>$null
-        $ErrorActionPreference = $prevPref
-        if ($pipCheck) {
-            $existing = $true
-            & $PythonExe -m pip uninstall -y orchestratia-agent 2>$null
-            Write-Ok "Uninstalled pip package"
-        }
-    } catch { $ErrorActionPreference = $prevPref }
+    $pipCheck = & $PythonExe -m pip show orchestratia-agent 2>$null
+    if ($pipCheck) {
+        $existing = $true
+        & $PythonExe -m pip uninstall -y orchestratia-agent 2>$null
+        Write-Ok "Uninstalled pip package"
+    }
 }
 
 if (-not $existing) { Write-Ok "No existing installation found" }

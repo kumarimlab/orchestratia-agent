@@ -354,7 +354,7 @@ step 6 "Registering with Orchestratia hub"
 
 info "Using one-time registration token..."
 REGISTER_OUTPUT=""
-if REGISTER_OUTPUT=$(python3 "$INSTALL_DIR/daemon.py" --register "$TOKEN" 2>&1); then
+if REGISTER_OUTPUT=$(sudo -u "$RUN_USER" python3 "$INSTALL_DIR/daemon.py" --register "$TOKEN" 2>&1); then
     # Check for success indicators in output
     if echo "$REGISTER_OUTPUT" | grep -qi "api.key\|registered\|success\|saved"; then
         ok "Registered successfully"
@@ -381,6 +381,18 @@ else
     info "  - Network issue (can this server reach the hub?)"
     info "  - Token was revoked by admin"
 fi
+
+# Verify config was actually created
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+if [ ! -f "$CONFIG_FILE" ]; then
+    fatal "Registration did not create ${CONFIG_FILE}. Cannot start service without config."
+fi
+
+if ! grep -q "api_key:" "$CONFIG_FILE" 2>/dev/null; then
+    fatal "Config exists but has no api_key — registration did not complete. Check the token and try again."
+fi
+
+ok "Config verified: ${CONFIG_FILE}"
 
 # Step 7: Systemd service
 step 7 "Setting up systemd service"

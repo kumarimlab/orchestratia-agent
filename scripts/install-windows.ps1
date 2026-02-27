@@ -3,7 +3,10 @@
 #
 # Installs the agent daemon via pip and registers with the hub.
 #
-# Usage (run as Administrator):
+# Usage — one-liner (paste into PowerShell as Administrator):
+#   $env:ORC_TOKEN='orcreg_...'; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex
+#
+# Or download and run directly:
 #   powershell -ExecutionPolicy Bypass -File install-windows.ps1 <TOKEN>
 #
 # What this does:
@@ -13,10 +16,22 @@
 #   4. Installs NSSM and creates a Windows service
 # ──────────────────────────────────────────────────────────────────────
 
-param(
-    [Parameter(Mandatory=$true, Position=0)]
-    [string]$Token
-)
+# Support both: direct invocation with argument AND piped via irm|iex with env var
+# param() blocks break when piped, so we use $args + $env:ORC_TOKEN fallback
+$Token = if ($args.Count -gt 0) { $args[0] } elseif ($env:ORC_TOKEN) { $env:ORC_TOKEN } else { $null }
+
+if (-not $Token) {
+    Write-Host ""
+    Write-Host "  Usage:" -ForegroundColor White
+    Write-Host ""
+    Write-Host '  One-liner (paste into PowerShell as Administrator):' -ForegroundColor DarkGray
+    Write-Host '    $env:ORC_TOKEN=''orcreg_...''; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex' -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host '  Or download and run:' -ForegroundColor DarkGray
+    Write-Host '    .\install-windows.ps1 orcreg_...' -ForegroundColor Cyan
+    Write-Host ""
+    exit 1
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -29,7 +44,11 @@ $NssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
 $NssmDir = "$env:LOCALAPPDATA\Orchestratia\nssm"
 $Errors = 0
 
-$InstallSource = if ($env:ORCHESTRATIA_INSTALL_SOURCE) { $env:ORCHESTRATIA_INSTALL_SOURCE } else { "orchestratia-agent" }
+$InstallSource = if ($env:ORCHESTRATIA_INSTALL_SOURCE) {
+    $env:ORCHESTRATIA_INSTALL_SOURCE
+} else {
+    "git+https://github.com/kumarimlab/orchestratia-agent.git"
+}
 
 # ── Helper functions ─────────────────────────────────────────────────
 
@@ -85,6 +104,43 @@ if (-not $Token.StartsWith("orcreg_")) {
     Write-Fatal "Invalid token format (must start with orcreg_)"
 }
 
+# ── Resolve Python & pip ─────────────────────────────────────────────
+# On Windows, 'pip' is often not in PATH even when Python is installed.
+# The Python Launcher 'py' is more reliable. We resolve once and reuse.
+
+function Find-Python {
+    # Prefer 'py' launcher (always in PATH on standard Python installs)
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) { return $py.Source }
+
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) { return $python.Source }
+
+    $python3 = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($python3) { return $python3.Source }
+
+    return $null
+}
+
+function Find-Pip {
+    param([string]$PythonExe)
+
+    # First try: python -m pip (most reliable, doesn't need pip in PATH)
+    try {
+        $out = & $PythonExe -m pip --version 2>&1
+        if ($LASTEXITCODE -eq 0) { return @($PythonExe, "-m", "pip") }
+    } catch {}
+
+    # Fallback: bare pip/pip3 commands
+    $pip = Get-Command pip -ErrorAction SilentlyContinue
+    if ($pip) { return @($pip.Source) }
+
+    $pip3 = Get-Command pip3 -ErrorAction SilentlyContinue
+    if ($pip3) { return @($pip3.Source) }
+
+    return $null
+}
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 Write-Header
@@ -112,12 +168,15 @@ if ($svc) {
     Write-Ok "Removed existing service"
 }
 
-# Uninstall pip package
-$pipShow = pip show orchestratia-agent 2>$null
-if ($pipShow) {
-    $existing = $true
-    pip uninstall -y orchestratia-agent 2>$null
-    Write-Ok "Uninstalled pip package"
+# Uninstall pip package (resolve python early just for cleanup)
+$PythonExe = Find-Python
+if ($PythonExe) {
+    $pipCheck = & $PythonExe -m pip show orchestratia-agent 2>$null
+    if ($pipCheck) {
+        $existing = $true
+        & $PythonExe -m pip uninstall -y orchestratia-agent 2>$null
+        Write-Ok "Uninstalled pip package"
+    }
 }
 
 if (-not $existing) { Write-Ok "No existing installation found" }
@@ -125,30 +184,23 @@ if (-not $existing) { Write-Ok "No existing installation found" }
 # Step 2: Prerequisites
 Write-Step 2 $TotalSteps "Checking prerequisites"
 
-$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-if (-not $pythonCmd) {
-    $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue
-}
-if (-not $pythonCmd) {
-    Write-Fatal "Python not found. Download from https://www.python.org/downloads/"
+if (-not $PythonExe) {
+    Write-Fatal "Python not found. Download from https://www.python.org/downloads/ (check 'Add to PATH')"
 }
 
-$pyVer = & $pythonCmd.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-$pyMinor = & $pythonCmd.Source -c "import sys; print(sys.version_info.minor)"
+$pyVer = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+$pyMinor = & $PythonExe -c "import sys; print(sys.version_info.minor)"
 if ([int]$pyMinor -ge 10) {
-    Write-Ok "Python $pyVer"
+    Write-Ok "Python $pyVer ($PythonExe)"
 } else {
     Write-Fatal "Python 3.10+ required, found $pyVer"
 }
 
-$pipCmd = Get-Command pip -ErrorAction SilentlyContinue
-if (-not $pipCmd) {
-    $pipCmd = Get-Command pip3 -ErrorAction SilentlyContinue
-}
-if ($pipCmd) {
-    Write-Ok "pip available"
+$PipCmd = Find-Pip -PythonExe $PythonExe
+if ($PipCmd) {
+    Write-Ok "pip available ($(($PipCmd -join ' ')))"
 } else {
-    Write-Fatal "pip not found. Reinstall Python with 'Add to PATH' checked."
+    Write-Fatal "pip not found. Run: $PythonExe -m ensurepip --upgrade"
 }
 
 # Check Windows version for ConPTY
@@ -172,19 +224,28 @@ Write-Step 3 $TotalSteps "Installing orchestratia-agent"
 
 Write-Info "Installing via pip (includes pywinpty)..."
 try {
-    & $pipCmd.Source install -q $InstallSource 2>&1 | Out-Null
+    & $PipCmd[0] $PipCmd[1..$PipCmd.Length] install -q $InstallSource 2>&1 | Out-Null
     Write-Ok "Package installed"
 } catch {
     Write-Fail "pip install failed: $_"
     Write-Fatal "Cannot proceed without the agent package."
 }
 
+# Verify the binary is reachable
 $agentBin = Get-Command orchestratia-agent -ErrorAction SilentlyContinue
 if ($agentBin) {
     Write-Ok "Binary: $($agentBin.Source)"
 } else {
-    Write-Fail "orchestratia-agent not found in PATH"
-    Write-Info "You may need to add Python Scripts to PATH"
+    # Try refreshing PATH for the current session
+    $scriptsDir = & $PythonExe -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+    if ($scriptsDir -and (Test-Path "$scriptsDir\orchestratia-agent.exe")) {
+        $env:PATH = "$scriptsDir;$env:PATH"
+        Write-Ok "Binary: $scriptsDir\orchestratia-agent.exe"
+        Write-Info "Added $scriptsDir to PATH for this session"
+    } else {
+        Write-Fail "orchestratia-agent not found in PATH"
+        Write-Info "You may need to add Python Scripts to PATH"
+    }
 }
 
 # Step 4: Register
@@ -204,6 +265,13 @@ try {
     }
 } catch {
     Write-Fail "Registration failed: $_"
+}
+
+# Verify config was created
+if (Test-Path "$ConfigDir\config.yaml") {
+    Write-Ok "Config: $ConfigDir\config.yaml"
+} else {
+    Write-Fatal "Registration did not create $ConfigDir\config.yaml. Cannot start service without config."
 }
 
 # Step 5: NSSM service
@@ -304,3 +372,6 @@ Write-Host "    Stop:     Stop-Service $ServiceName"
 Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 Write-Host ""
+
+# Clean up env var if set (don't leak token)
+if ($env:ORC_TOKEN) { Remove-Item Env:\ORC_TOKEN -ErrorAction SilentlyContinue }

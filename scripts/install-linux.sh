@@ -218,17 +218,32 @@ step 3 "Installing orchestratia-agent"
 
 info "Installing via pip..."
 PIP_OUTPUT=""
+# Try plain install first, then --user, then --break-system-packages (pip 23+/Python 3.11+)
 if PIP_OUTPUT=$(pip3 install -q "$INSTALL_SOURCE" 2>&1); then
     ok "Package installed"
-elif PIP_OUTPUT=$(pip3 install -q --break-system-packages "$INSTALL_SOURCE" 2>&1); then
-    ok "Package installed (with --break-system-packages)"
+elif PIP_OUTPUT=$(pip3 install -q --user "$INSTALL_SOURCE" 2>&1); then
+    ok "Package installed (--user)"
+    # Ensure ~/.local/bin is in PATH for this session and the service
+    USER_BIN="${RUN_HOME}/.local/bin"
+    if [ -d "$USER_BIN" ] && [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
+        export PATH="$USER_BIN:$PATH"
+        info "Added $USER_BIN to PATH"
+    fi
+elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
+     PIP_OUTPUT=$(pip3 install -q --break-system-packages "$INSTALL_SOURCE" 2>&1); then
+    ok "Package installed (--break-system-packages)"
 else
-    fail "pip install failed:"
+    fail "pip3 install failed:"
     echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
+    info "Try manually: pip3 install --user $INSTALL_SOURCE"
     fatal "Cannot proceed without the agent package."
 fi
 
 AGENT_BIN=$(which orchestratia-agent 2>/dev/null || echo "")
+# Fallback: check common --user install location
+if [ -z "$AGENT_BIN" ] && [ -x "${RUN_HOME}/.local/bin/orchestratia-agent" ]; then
+    AGENT_BIN="${RUN_HOME}/.local/bin/orchestratia-agent"
+fi
 if [ -n "$AGENT_BIN" ]; then
     ok "Binary: ${AGENT_BIN}"
 else

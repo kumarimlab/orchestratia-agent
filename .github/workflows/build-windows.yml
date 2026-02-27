@@ -1,0 +1,43 @@
+name: Build Windows Executable
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install .
+
+      - name: Build exe
+        run: pyinstaller orchestratia_agent.spec
+
+      - name: Test exe runs
+        run: |
+          dist\orchestratia-agent.exe --version
+          dist\orchestratia-agent.exe --help
+
+      - name: Show exe size
+        run: |
+          $size = (Get-Item dist\orchestratia-agent.exe).Length
+          $sizeMB = [math]::Round($size / 1MB, 1)
+          Write-Host "orchestratia-agent.exe: $sizeMB MB ($size bytes)"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/orchestratia-agent.exe
+          fail_on_unmatched_files: true

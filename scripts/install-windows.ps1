@@ -162,7 +162,7 @@ function Install-Python {
         Write-Info "Installing Python 3.12 via winget (this may take a minute)..."
         try {
             $prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"
-            & winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray }
+            & winget install Python.Python.3.12 --source winget --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray }
             $wingetExit = $LASTEXITCODE
             $ErrorActionPreference = $prevPref
         } catch {

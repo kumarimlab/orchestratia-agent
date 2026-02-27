@@ -114,9 +114,16 @@ if (-not $Token.StartsWith("orcreg_")) {
 function Test-RealPython {
     param([string]$Candidate)
     try {
+        # Temporarily allow errors — the MS Store stub writes to stderr which
+        # becomes a terminating error under $ErrorActionPreference = "Stop"
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         $out = & $Candidate -c "print('ok')" 2>&1
-        return ($LASTEXITCODE -eq 0 -and $out -match 'ok')
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
+        return ($code -eq 0 -and "$out" -match 'ok')
     } catch {
+        $ErrorActionPreference = $prevPref
         return $false
     }
 }
@@ -166,9 +173,12 @@ function Find-Pip {
 
     # First try: python -m pip (most reliable, doesn't need pip in PATH)
     try {
+        $prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"
         $out = & $PythonExe -m pip --version 2>&1
-        if ($LASTEXITCODE -eq 0) { return @($PythonExe, "-m", "pip") }
-    } catch {}
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
+        if ($code -eq 0) { return @($PythonExe, "-m", "pip") }
+    } catch { $ErrorActionPreference = $prevPref }
 
     # Fallback: bare pip/pip3 commands
     $pip = Get-Command pip -ErrorAction SilentlyContinue
@@ -210,12 +220,16 @@ if ($svc) {
 # Uninstall pip package (resolve python early just for cleanup)
 $PythonExe = Find-Python
 if ($PythonExe) {
-    $pipCheck = & $PythonExe -m pip show orchestratia-agent 2>$null
-    if ($pipCheck) {
-        $existing = $true
-        & $PythonExe -m pip uninstall -y orchestratia-agent 2>$null
-        Write-Ok "Uninstalled pip package"
-    }
+    try {
+        $prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+        $pipCheck = & $PythonExe -m pip show orchestratia-agent 2>$null
+        $ErrorActionPreference = $prevPref
+        if ($pipCheck) {
+            $existing = $true
+            & $PythonExe -m pip uninstall -y orchestratia-agent 2>$null
+            Write-Ok "Uninstalled pip package"
+        }
+    } catch { $ErrorActionPreference = $prevPref }
 }
 
 if (-not $existing) { Write-Ok "No existing installation found" }

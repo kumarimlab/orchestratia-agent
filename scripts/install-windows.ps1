@@ -344,84 +344,108 @@ if (Test-Path "$ConfigDir\config.yaml") {
     Write-Fatal "Registration did not create $ConfigDir\config.yaml. Cannot start service without config."
 }
 
-# Step 5: NSSM service
-Write-Step 5 $TotalSteps "Setting up Windows service (NSSM)"
-
-# Download NSSM if not present
-$nssmExe = Get-Command nssm -ErrorAction SilentlyContinue
-if (-not $nssmExe) {
-    Write-Info "Downloading NSSM..."
-    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
-    $zipPath = "$NssmDir\nssm.zip"
-
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $NssmUrl -OutFile $zipPath -UseBasicParsing
-        Expand-Archive -Path $zipPath -DestinationPath $NssmDir -Force
-        Remove-Item $zipPath
-
-        # Find the 64-bit binary
-        $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
-            Where-Object { $_.DirectoryName -like "*win64*" } |
-            Select-Object -First 1
-
-        if (-not $nssmBin) {
-            $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
-                Select-Object -First 1
-        }
-
-        if ($nssmBin) {
-            $nssmPath = $nssmBin.FullName
-            Write-Ok "NSSM downloaded: $nssmPath"
-        } else {
-            Write-Fatal "Could not find nssm.exe after extraction"
-        }
-    } catch {
-        Write-Fail "Could not download NSSM: $_"
-        Write-Info "Download manually from https://nssm.cc and place nssm.exe in PATH"
-        Write-Fatal "Cannot create service without NSSM"
-    }
-} else {
-    $nssmPath = $nssmExe.Source
-    Write-Ok "NSSM found: $nssmPath"
-}
+# Step 5: Auto-start setup
+Write-Step 5 $TotalSteps "Setting up auto-start"
 
 $agentExe = (Get-Command orchestratia-agent -ErrorAction SilentlyContinue).Source
 if (-not $agentExe) {
     Write-Fatal "Cannot find orchestratia-agent binary for service"
 }
 
-try {
-    & $nssmPath install $ServiceName $agentExe "--config" "$ConfigDir\config.yaml" 2>&1 | Out-Null
-    & $nssmPath set $ServiceName AppDirectory $ConfigDir 2>&1 | Out-Null
-    & $nssmPath set $ServiceName DisplayName "Orchestratia Agent" 2>&1 | Out-Null
-    & $nssmPath set $ServiceName Description "AI agent orchestration daemon" 2>&1 | Out-Null
-    & $nssmPath set $ServiceName Start SERVICE_AUTO_START 2>&1 | Out-Null
-    & $nssmPath set $ServiceName AppStdout "$LogDir\agent.log" 2>&1 | Out-Null
-    & $nssmPath set $ServiceName AppStderr "$LogDir\agent.err" 2>&1 | Out-Null
-    & $nssmPath set $ServiceName AppRotateFiles 1 2>&1 | Out-Null
-    & $nssmPath set $ServiceName AppRotateBytes 10485760 2>&1 | Out-Null
-    & $nssmPath set $ServiceName AppEnvironmentExtra "PYTHONUNBUFFERED=1" 2>&1 | Out-Null
-    Write-Ok "Service installed"
-} catch {
-    Write-Fail "Could not install service: $_"
-}
+$ServiceInstalled = $false
 
-try {
-    Start-Service $ServiceName
-    Write-Ok "Service started"
-} catch {
-    Write-Fail "Could not start service: $_"
-    Write-Info "Start manually: Start-Service $ServiceName"
-}
-
-Start-Sleep -Seconds 2
-$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($svc -and $svc.Status -eq "Running") {
-    Write-Ok "Service is running"
+# ── Try NSSM first (proper Windows service) ──
+$nssmPath = $null
+$nssmExe = Get-Command nssm -ErrorAction SilentlyContinue
+if ($nssmExe) {
+    $nssmPath = $nssmExe.Source
+    Write-Ok "NSSM found: $nssmPath"
 } else {
-    Write-Warn "Service may not be running"
-    Write-Info "Check: Get-Service $ServiceName"
+    Write-Info "Downloading NSSM..."
+    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
+    $zipPath = "$NssmDir\nssm.zip"
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $NssmUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 15
+        Expand-Archive -Path $zipPath -DestinationPath $NssmDir -Force
+        Remove-Item $zipPath
+
+        $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
+            Where-Object { $_.DirectoryName -like "*win64*" } |
+            Select-Object -First 1
+        if (-not $nssmBin) {
+            $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
+                Select-Object -First 1
+        }
+        if ($nssmBin) {
+            $nssmPath = $nssmBin.FullName
+            Write-Ok "NSSM downloaded: $nssmPath"
+        }
+    } catch {
+        Write-Warn "Could not download NSSM (site may be down)"
+    }
+}
+
+if ($nssmPath) {
+    try {
+        & $nssmPath install $ServiceName $agentExe "--config" "$ConfigDir\config.yaml" 2>&1 | Out-Null
+        & $nssmPath set $ServiceName AppDirectory $ConfigDir 2>&1 | Out-Null
+        & $nssmPath set $ServiceName DisplayName "Orchestratia Agent" 2>&1 | Out-Null
+        & $nssmPath set $ServiceName Description "AI agent orchestration daemon" 2>&1 | Out-Null
+        & $nssmPath set $ServiceName Start SERVICE_AUTO_START 2>&1 | Out-Null
+        & $nssmPath set $ServiceName AppStdout "$LogDir\agent.log" 2>&1 | Out-Null
+        & $nssmPath set $ServiceName AppStderr "$LogDir\agent.err" 2>&1 | Out-Null
+        & $nssmPath set $ServiceName AppRotateFiles 1 2>&1 | Out-Null
+        & $nssmPath set $ServiceName AppRotateBytes 10485760 2>&1 | Out-Null
+        & $nssmPath set $ServiceName AppEnvironmentExtra "PYTHONUNBUFFERED=1" 2>&1 | Out-Null
+        Write-Ok "Windows service installed (NSSM)"
+        $ServiceInstalled = $true
+
+        Start-Service $ServiceName -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq "Running") {
+            Write-Ok "Service is running"
+        } else {
+            Write-Warn "Service may not be running — check: Get-Service $ServiceName"
+        }
+    } catch {
+        Write-Fail "NSSM service setup failed: $_"
+    }
+}
+
+# ── Fallback: Task Scheduler (built-in, zero dependencies) ──
+if (-not $ServiceInstalled) {
+    Write-Info "Falling back to Task Scheduler (built-in)..."
+
+    $TaskName = "OrchestratiAgent"
+
+    # Remove existing task if present
+    schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
+
+    # Create a scheduled task that runs at system startup
+    $action = "cmd /c `"`"$agentExe`" --config `"$ConfigDir\config.yaml`" >> `"$LogDir\agent.log`" 2>> `"$LogDir\agent.err`"`""
+    schtasks /Create /TN $TaskName /TR $action /SC ONSTART /RU "$env:USERNAME" /RL HIGHEST /F 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Ok "Scheduled task created (runs at startup)"
+        $ServiceInstalled = $true
+
+        # Start it now
+        schtasks /Run /TN $TaskName 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Agent started"
+        } else {
+            Write-Warn "Could not start task now — it will run on next boot"
+        }
+    } else {
+        Write-Fail "Could not create scheduled task"
+    }
+}
+
+if (-not $ServiceInstalled) {
+    Write-Fail "Auto-start setup failed. Run the agent manually:"
+    Write-Info "orchestratia-agent --config `"$ConfigDir\config.yaml`""
 }
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -435,10 +459,17 @@ if ($Errors -eq 0) {
 }
 Write-Host ""
 Write-Host "  Useful commands:" -ForegroundColor DarkGray
-Write-Host "    Status:   Get-Service $ServiceName"
-Write-Host "    Logs:     Get-Content $LogDir\agent.log -Wait"
-Write-Host "    Restart:  Restart-Service $ServiceName"
-Write-Host "    Stop:     Stop-Service $ServiceName"
+if ($nssmPath -and $ServiceInstalled) {
+    Write-Host "    Status:   Get-Service $ServiceName"
+    Write-Host "    Logs:     Get-Content $LogDir\agent.log -Wait"
+    Write-Host "    Restart:  Restart-Service $ServiceName"
+    Write-Host "    Stop:     Stop-Service $ServiceName"
+} else {
+    Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"
+    Write-Host "    Logs:     Get-Content $LogDir\agent.log -Wait"
+    Write-Host "    Start:    schtasks /Run /TN OrchestratiAgent"
+    Write-Host "    Stop:     schtasks /End /TN OrchestratiAgent"
+}
 Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 Write-Host ""

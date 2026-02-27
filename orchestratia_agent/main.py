@@ -186,8 +186,143 @@ async def idle_note_flush_loop(state: DaemonState):
                 log.info(f"Flushed {len(notes)} queued note(s) to idle session {session_id[:8]}")
 
 
+def _test_pty():
+    """Diagnostic: test ConPTY session spawning outside the daemon context."""
+    import time
+    import subprocess
+
+    print(f"orchestratia-agent {__version__} — ConPTY diagnostic")
+    print(f"Platform: {platform.system()} {platform.release()}")
+    print(f"OS build: {sys.getwindowsversion().build if sys.platform == 'win32' else 'N/A'}")
+    print(f"Python: {sys.version}")
+    print(f"Executable: {sys.executable}")
+    print(f"CWD: {os.getcwd()}")
+    print()
+
+    if sys.platform != "win32":
+        print("This test is Windows-only.")
+        return
+
+    # Test 1: Basic subprocess (no ConPTY)
+    print("=" * 60)
+    print("TEST 1: subprocess.Popen (no ConPTY)")
+    print("=" * 60)
+    try:
+        p = subprocess.Popen(
+            "cmd.exe /c echo hello",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        out, _ = p.communicate(timeout=5)
+        print(f"  Result: exit_code={p.returncode}")
+        print(f"  Output: {out.strip()}")
+        if p.returncode == 0:
+            print("  PASS: Basic subprocess works")
+        else:
+            print(f"  FAIL: exit_code={p.returncode}")
+    except Exception as e:
+        print(f"  FAIL: {e}")
+    print()
+
+    # Test 2: subprocess with CREATE_NEW_CONSOLE
+    print("=" * 60)
+    print("TEST 2: subprocess with CREATE_NEW_CONSOLE")
+    print("=" * 60)
+    try:
+        p = subprocess.Popen(
+            "cmd.exe /c echo hello & timeout /t 2 >nul",
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+        time.sleep(1)
+        alive = p.poll() is None
+        print(f"  Alive after 1s: {alive}")
+        p.terminate()
+        p.wait(timeout=3)
+        print(f"  Result: exit_code={p.returncode}")
+        if alive:
+            print("  PASS: CREATE_NEW_CONSOLE works")
+        else:
+            print(f"  FAIL: Process died immediately (exit_code={p.returncode})")
+    except Exception as e:
+        print(f"  FAIL: {e}")
+    print()
+
+    # Test 3: pywinpty ConPTY
+    print("=" * 60)
+    print("TEST 3: pywinpty PtyProcess.spawn (ConPTY)")
+    print("=" * 60)
+    try:
+        from winpty import PtyProcess
+        print(f"  pywinpty imported OK")
+
+        for shell_name, shell_cmd in [("cmd.exe", "cmd.exe"), ("powershell", "powershell.exe")]:
+            print(f"\n  --- Spawning {shell_name} ---")
+            try:
+                proc = PtyProcess.spawn(shell_cmd, dimensions=(25, 80))
+                print(f"  PID: {proc.pid}")
+                time.sleep(1)
+                alive = proc.isalive()
+                print(f"  Alive after 1s: {alive}")
+
+                if alive:
+                    try:
+                        data = proc.read(4096)
+                        print(f"  Read {len(data)} chars: {data[:100]!r}")
+                    except Exception as e:
+                        print(f"  Read error: {e}")
+                    proc.terminate(force=True)
+                    print(f"  PASS: {shell_name} ConPTY works")
+                else:
+                    exit_code = getattr(proc, "exitstatus", None)
+                    print(f"  FAIL: Died immediately, exit_code={exit_code}", end="")
+                    if exit_code:
+                        print(f" (0x{exit_code:08X})")
+                    else:
+                        print()
+            except Exception as e:
+                print(f"  FAIL: {e}")
+    except ImportError as e:
+        print(f"  FAIL: Cannot import pywinpty: {e}")
+    except Exception as e:
+        print(f"  FAIL: {e}")
+    print()
+
+    # Test 4: ConPTY with explicit env=None vs env=os.environ.copy()
+    print("=" * 60)
+    print("TEST 4: ConPTY env handling")
+    print("=" * 60)
+    try:
+        from winpty import PtyProcess
+
+        for label, env_arg in [("env=None (inherit)", None), ("env=os.environ.copy()", os.environ.copy())]:
+            print(f"\n  --- {label} ---")
+            try:
+                kwargs = {"dimensions": (25, 80)}
+                if env_arg is not None:
+                    kwargs["env"] = env_arg
+                proc = PtyProcess.spawn("cmd.exe", **kwargs)
+                time.sleep(1)
+                alive = proc.isalive()
+                if alive:
+                    print(f"  PASS: alive (PID {proc.pid})")
+                    proc.terminate(force=True)
+                else:
+                    exit_code = getattr(proc, "exitstatus", None)
+                    print(f"  FAIL: exit_code={exit_code}")
+            except Exception as e:
+                print(f"  FAIL: {e}")
+    except ImportError:
+        print("  SKIP: pywinpty not available")
+    print()
+    print("Diagnostic complete.")
+
+
 def entry_point():
     """Entry point for console_scripts and legacy shims."""
+    if "--test-pty" in sys.argv:
+        _test_pty()
+        return
     asyncio.run(main())
 
 

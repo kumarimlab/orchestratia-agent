@@ -60,7 +60,7 @@ $Errors = 0
 $InstallSource = if ($env:ORCHESTRATIA_INSTALL_SOURCE) {
     $env:ORCHESTRATIA_INSTALL_SOURCE
 } else {
-    "git+https://github.com/kumarimlab/orchestratia-agent.git"
+    "https://github.com/kumarimlab/orchestratia-agent/archive/refs/heads/main.zip"
 }
 
 # ── Helper functions ─────────────────────────────────────────────────

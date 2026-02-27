@@ -1,7 +1,8 @@
 # ──────────────────────────────────────────────────────────────────────
-# Orchestratia Agent Installer — Windows (pip + NSSM service)
+# Orchestratia Agent Installer — Windows (Standalone .exe)
 #
-# Installs the agent daemon via pip and registers with the hub.
+# Downloads the standalone orchestratia-agent.exe from GitHub Releases.
+# No Python, pip, or git required.
 #
 # Usage — one-liner (paste into PowerShell as Administrator):
 #   $env:ORC_TOKEN='orcreg_...'; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex
@@ -10,14 +11,12 @@
 #   powershell -ExecutionPolicy Bypass -File install-windows.ps1 <TOKEN>
 #
 # What this does:
-#   1. Checks prerequisites (Python 3.10+)
-#   2. Installs orchestratia-agent via pip (includes pywinpty)
-#   3. Registers with the hub
-#   4. Installs NSSM and creates a Windows service
+#   1. Cleans up any existing installation
+#   2. Downloads orchestratia-agent.exe from latest GitHub Release
+#   3. Registers with the hub using the one-time token
+#   4. Creates a Windows service (NSSM) or scheduled task (fallback)
 # ──────────────────────────────────────────────────────────────────────
 
-# Support both: direct invocation with argument AND piped via irm|iex with env var
-# param() blocks break when piped, so we use $args + $env:ORC_TOKEN fallback
 $Token = if ($args.Count -gt 0) { $args[0] } elseif ($env:ORC_TOKEN) { $env:ORC_TOKEN } else { $null }
 
 if (-not $Token) {
@@ -33,47 +32,43 @@ if (-not $Token) {
     exit 1
 }
 
-# NOTE: We use "Continue" instead of "Stop" because native commands (pip,
-# winget, python) write warnings/progress to stderr, and "Stop" converts
-# those into terminating errors that crash the script. All real error
-# handling is done explicitly via exit code checks and Write-Fatal.
 $ErrorActionPreference = "Continue"
 
 # ── Logging ──────────────────────────────────────────────────────────
-# Log everything to a file so we can debug crashes
-$InstallLog = "$env:LOCALAPPDATA\Orchestratia\install.log"
-New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\Orchestratia" | Out-Null
+$ConfigDir = "$env:LOCALAPPDATA\Orchestratia"
+$LogDir = "$env:LOCALAPPDATA\Orchestratia\logs"
+$InstallLog = "$ConfigDir\install.log"
+New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Start-Transcript -Path $InstallLog -Force | Out-Null
 trap {
     Write-Host ""
-    Write-Host "  ✗ UNEXPECTED ERROR: $_" -ForegroundColor Red
+    Write-Host "  UNEXPECTED ERROR: $_" -ForegroundColor Red
     Write-Host "  Log saved to: $InstallLog" -ForegroundColor Yellow
     Write-Host ""
     Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 }
 
 # ── Constants ────────────────────────────────────────────────────────
-
 $ServiceName = "OrchestratiAgent"
-$ConfigDir = "$env:LOCALAPPDATA\Orchestratia"
-$LogDir = "$env:LOCALAPPDATA\Orchestratia\logs"
+$AgentExePath = "$ConfigDir\orchestratia-agent.exe"
 $NssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
-$NssmDir = "$env:LOCALAPPDATA\Orchestratia\nssm"
-$Errors = 0
-
-$InstallSource = if ($env:ORCHESTRATIA_INSTALL_SOURCE) {
-    $env:ORCHESTRATIA_INSTALL_SOURCE
+$NssmDir = "$ConfigDir\nssm"
+$ReleaseUrl = if ($env:ORCHESTRATIA_EXE_URL) {
+    $env:ORCHESTRATIA_EXE_URL
 } else {
-    "https://github.com/kumarimlab/orchestratia-agent/archive/refs/heads/main.zip"
+    "https://github.com/kumarimlab/orchestratia-agent/releases/latest/download/orchestratia-agent.exe"
 }
+$Errors = 0
+$TotalSteps = 4
 
 # ── Helper functions ─────────────────────────────────────────────────
 
 function Write-Header {
     Write-Host ""
-    Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor White
-    Write-Host "║      Orchestratia Agent Installer (Windows)      ║" -ForegroundColor White
-    Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor White
+    Write-Host "========================================================" -ForegroundColor White
+    Write-Host "      Orchestratia Agent Installer (Windows)            " -ForegroundColor White
+    Write-Host "========================================================" -ForegroundColor White
     Write-Host ""
 }
 
@@ -84,7 +79,7 @@ function Write-Step($Num, $Total, $Title) {
 }
 
 function Write-Ok($Msg) {
-    Write-Host "     ✓ " -ForegroundColor Green -NoNewline
+    Write-Host "     + " -ForegroundColor Green -NoNewline
     Write-Host $Msg
 }
 
@@ -95,108 +90,28 @@ function Write-Warn($Msg) {
 }
 
 function Write-Fail($Msg) {
-    Write-Host "     ✗ " -ForegroundColor Red -NoNewline
+    Write-Host "     x " -ForegroundColor Red -NoNewline
     Write-Host $Msg -ForegroundColor Red
     $script:Errors++
 }
 
 function Write-Info($Msg) {
-    Write-Host "     → " -ForegroundColor Cyan -NoNewline
+    Write-Host "     > " -ForegroundColor Cyan -NoNewline
     Write-Host $Msg
 }
 
 function Write-Fatal($Msg) {
     Write-Host ""
-    Write-Host "  ✗ FATAL: $Msg" -ForegroundColor Red
+    Write-Host "  FATAL: $Msg" -ForegroundColor Red
     Write-Host "     Installation aborted." -ForegroundColor DarkGray
     Write-Host ""
     exit 1
 }
 
-$TotalSteps = 5
-
 # ── Validate ─────────────────────────────────────────────────────────
 
 if (-not $Token.StartsWith("orcreg_")) {
     Write-Fatal "Invalid token format (must start with orcreg_)"
-}
-
-# ── Resolve Python & pip ─────────────────────────────────────────────
-# On Windows, 'pip' is often not in PATH even when Python is installed.
-# The Python Launcher 'py' is more reliable. We resolve once and reuse.
-# IMPORTANT: Windows ships a 'python.exe' stub that opens the Microsoft
-# Store instead of running Python. We must verify the candidate actually
-# executes before accepting it.
-
-function Test-RealPython {
-    param([string]$Candidate)
-    try {
-        $out = & $Candidate -c "print('ok')" 2>&1
-        return ($LASTEXITCODE -eq 0 -and "$out" -match 'ok')
-    } catch {
-        return $false
-    }
-}
-
-function Find-Python {
-    # Prefer 'py' launcher (always in PATH on standard Python installs)
-    $py = Get-Command py -ErrorAction SilentlyContinue
-    if ($py -and (Test-RealPython $py.Source)) { return $py.Source }
-
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if ($python -and (Test-RealPython $python.Source)) { return $python.Source }
-
-    $python3 = Get-Command python3 -ErrorAction SilentlyContinue
-    if ($python3 -and (Test-RealPython $python3.Source)) { return $python3.Source }
-
-    return $null
-}
-
-function Install-Python {
-    # Try winget first (built into Windows 10 1709+ / Windows 11)
-    $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if ($winget) {
-        Write-Info "Installing Python 3.12 via winget (this may take a minute)..."
-        & winget install Python.Python.3.12 --source winget --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray }
-        $wingetExit = $LASTEXITCODE
-        # winget returns 0 on success, -1978335189 (0x8A150011) if already installed
-        if ($wingetExit -eq 0 -or $wingetExit -eq -1978335189) {
-            # Refresh PATH for this session
-            $machPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-            $env:PATH = "$machPath;$userPath"
-            $found = Find-Python
-            if ($found) {
-                Write-Ok "Python installed successfully"
-                return $found
-            }
-        }
-        Write-Fail "winget install completed but Python still not found in PATH"
-        Write-Info "You may need to close and reopen PowerShell, then re-run this installer"
-        return $null
-    }
-
-    # No winget — give manual instructions
-    return $null
-}
-
-function Find-Pip {
-    param([string]$PythonExe)
-
-    # First try: python -m pip (most reliable, doesn't need pip in PATH)
-    try {
-        $out = & $PythonExe -m pip --version 2>&1
-        if ($LASTEXITCODE -eq 0) { return @($PythonExe, "-m", "pip") }
-    } catch {}
-
-    # Fallback: bare pip/pip3 commands
-    $pip = Get-Command pip -ErrorAction SilentlyContinue
-    if ($pip) { return @($pip.Source) }
-
-    $pip3 = Get-Command pip3 -ErrorAction SilentlyContinue
-    if ($pip3) { return @($pip3.Source) }
-
-    return $null
 }
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -216,7 +131,6 @@ if ($svc) {
         Stop-Service $ServiceName -Force -ErrorAction SilentlyContinue
         Write-Ok "Stopped existing service"
     }
-    # Try NSSM remove, fall back to sc.exe
     $nssmExe = Get-Command nssm -ErrorAction SilentlyContinue
     if ($nssmExe) {
         & nssm remove $ServiceName confirm 2>$null
@@ -226,52 +140,25 @@ if ($svc) {
     Write-Ok "Removed existing service"
 }
 
-# Uninstall pip package (resolve python early just for cleanup)
-$PythonExe = Find-Python
-if ($PythonExe) {
-    $pipCheck = & $PythonExe -m pip show orchestratia-agent 2>$null
-    if ($pipCheck) {
-        $existing = $true
-        & $PythonExe -m pip uninstall -y orchestratia-agent 2>$null
-        Write-Ok "Uninstalled pip package"
-    }
+# Remove existing scheduled task
+$existingTask = Get-ScheduledTask -TaskName "OrchestratiAgent" -ErrorAction SilentlyContinue
+if ($existingTask) {
+    $existing = $true
+    Unregister-ScheduledTask -TaskName "OrchestratiAgent" -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Ok "Removed existing scheduled task"
+}
+
+# Remove existing exe
+if (Test-Path $AgentExePath) {
+    $existing = $true
+    Remove-Item $AgentExePath -Force -ErrorAction SilentlyContinue
+    Write-Ok "Removed existing executable"
 }
 
 if (-not $existing) { Write-Ok "No existing installation found" }
 
-# Step 2: Prerequisites
-Write-Step 2 $TotalSteps "Checking prerequisites"
-
-if (-not $PythonExe) {
-    Write-Warn "Python not found"
-    Write-Host ""
-    Write-Host "     Python 3.10+ is required. Install it now?" -ForegroundColor White
-    Write-Host ""
-    $choice = Read-Host "     [Y] Install via winget  [N] Abort  (Y/n)"
-    if ($choice -eq '' -or $choice -match '^[Yy]') {
-        $PythonExe = Install-Python
-        if (-not $PythonExe) {
-            Write-Fatal "Python installation failed. Install manually from https://www.python.org/downloads/ (check 'Add to PATH') then re-run this installer."
-        }
-    } else {
-        Write-Fatal "Python is required. Install from https://www.python.org/downloads/ (check 'Add to PATH') then re-run."
-    }
-}
-
-$pyVer = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-$pyMinor = & $PythonExe -c "import sys; print(sys.version_info.minor)"
-if ([int]$pyMinor -ge 10) {
-    Write-Ok "Python $pyVer ($PythonExe)"
-} else {
-    Write-Fatal "Python 3.10+ required, found $pyVer"
-}
-
-$PipCmd = Find-Pip -PythonExe $PythonExe
-if ($PipCmd) {
-    Write-Ok "pip available ($(($PipCmd -join ' ')))"
-} else {
-    Write-Fatal "pip not found. Run: $PythonExe -m ensurepip --upgrade"
-}
+# Step 2: Download executable
+Write-Step 2 $TotalSteps "Downloading orchestratia-agent.exe"
 
 # Check Windows version for ConPTY
 $build = [System.Environment]::OSVersion.Version.Build
@@ -281,52 +168,31 @@ if ($build -ge 17763) {
     Write-Warn "Windows build $build — ConPTY requires build 17763+ (Windows 10 1809)"
 }
 
-$claudeCmd = Get-Command claude -ErrorAction SilentlyContinue
-if ($claudeCmd) {
-    Write-Ok "Claude Code CLI found"
-} else {
-    Write-Warn "Claude Code CLI not found"
-    Write-Info "Install: npm install -g @anthropic-ai/claude-code"
-}
-
-# Step 3: Install package
-Write-Step 3 $TotalSteps "Installing orchestratia-agent"
-
-Write-Info "Installing via pip (includes pywinpty)..."
+Write-Info "Downloading from: $ReleaseUrl"
 try {
-    & $PipCmd[0] $PipCmd[1..$PipCmd.Length] install -q $InstallSource 2>&1 | Out-Null
-    Write-Ok "Package installed"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $ReleaseUrl -OutFile $AgentExePath -UseBasicParsing -TimeoutSec 60
+    $size = (Get-Item $AgentExePath).Length
+    $sizeMB = [math]::Round($size / 1MB, 1)
+    Write-Ok "Downloaded orchestratia-agent.exe ($sizeMB MB)"
 } catch {
-    Write-Fail "pip install failed: $_"
-    Write-Fatal "Cannot proceed without the agent package."
+    Write-Fatal "Download failed: $_`n  URL: $ReleaseUrl"
 }
 
-# Verify the binary is reachable
-$agentBin = Get-Command orchestratia-agent -ErrorAction SilentlyContinue
-if ($agentBin) {
-    Write-Ok "Binary: $($agentBin.Source)"
-} else {
-    # Try refreshing PATH for the current session
-    $scriptsDir = & $PythonExe -c "import sysconfig; print(sysconfig.get_path('scripts'))"
-    if ($scriptsDir -and (Test-Path "$scriptsDir\orchestratia-agent.exe")) {
-        $env:PATH = "$scriptsDir;$env:PATH"
-        Write-Ok "Binary: $scriptsDir\orchestratia-agent.exe"
-        Write-Info "Added $scriptsDir to PATH for this session"
-    } else {
-        Write-Fail "orchestratia-agent not found in PATH"
-        Write-Info "You may need to add Python Scripts to PATH"
-    }
+# Verify it runs
+try {
+    $ver = & $AgentExePath --version 2>&1
+    Write-Ok "Verified: $ver"
+} catch {
+    Write-Fatal "Downloaded exe failed to run: $_"
 }
 
-# Step 4: Register
-Write-Step 4 $TotalSteps "Registering with Orchestratia hub"
-
-New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+# Step 3: Register
+Write-Step 3 $TotalSteps "Registering with Orchestratia hub"
 
 Write-Info "Using one-time registration token..."
 try {
-    $regOutput = & orchestratia-agent --register $Token --config "$ConfigDir\config.yaml" 2>&1
+    $regOutput = & $AgentExePath --register $Token --config "$ConfigDir\config.yaml" 2>&1
     Write-Ok "Registered successfully"
     $regOutput | ForEach-Object {
         if ($_ -match "api.key|orc_|registered|saved") {
@@ -337,20 +203,14 @@ try {
     Write-Fail "Registration failed: $_"
 }
 
-# Verify config was created
 if (Test-Path "$ConfigDir\config.yaml") {
     Write-Ok "Config: $ConfigDir\config.yaml"
 } else {
-    Write-Fatal "Registration did not create $ConfigDir\config.yaml. Cannot start service without config."
+    Write-Fatal "Registration did not create config. Cannot start service."
 }
 
-# Step 5: Auto-start setup
-Write-Step 5 $TotalSteps "Setting up auto-start"
-
-$agentExe = (Get-Command orchestratia-agent -ErrorAction SilentlyContinue).Source
-if (-not $agentExe) {
-    Write-Fatal "Cannot find orchestratia-agent binary for service"
-}
+# Step 4: Auto-start setup
+Write-Step 4 $TotalSteps "Setting up auto-start"
 
 $ServiceInstalled = $false
 
@@ -389,7 +249,7 @@ if ($nssmExe) {
 
 if ($nssmPath) {
     try {
-        & $nssmPath install $ServiceName $agentExe "--config" "$ConfigDir\config.yaml" 2>&1 | Out-Null
+        & $nssmPath install $ServiceName $AgentExePath "--config" "$ConfigDir\config.yaml" 2>&1 | Out-Null
         & $nssmPath set $ServiceName AppDirectory $ConfigDir 2>&1 | Out-Null
         & $nssmPath set $ServiceName DisplayName "Orchestratia Agent" 2>&1 | Out-Null
         & $nssmPath set $ServiceName Description "AI agent orchestration daemon" 2>&1 | Out-Null
@@ -398,7 +258,6 @@ if ($nssmPath) {
         & $nssmPath set $ServiceName AppStderr "$LogDir\agent.err" 2>&1 | Out-Null
         & $nssmPath set $ServiceName AppRotateFiles 1 2>&1 | Out-Null
         & $nssmPath set $ServiceName AppRotateBytes 10485760 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppEnvironmentExtra "PYTHONUNBUFFERED=1" 2>&1 | Out-Null
         Write-Ok "Windows service installed (NSSM)"
         $ServiceInstalled = $true
 
@@ -420,14 +279,11 @@ if (-not $ServiceInstalled) {
     Write-Info "Falling back to Task Scheduler (built-in)..."
 
     $TaskName = "OrchestratiAgent"
-
-    # Remove existing task if present
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-    # Create scheduled task using PowerShell cmdlets (handles paths with spaces)
     try {
         $taskAction = New-ScheduledTaskAction `
-            -Execute $agentExe `
+            -Execute $AgentExePath `
             -Argument "--config `"$ConfigDir\config.yaml`"" `
             -WorkingDirectory $ConfigDir `
             -ErrorAction Stop
@@ -453,7 +309,6 @@ if (-not $ServiceInstalled) {
         Write-Ok "Scheduled task created (runs at logon)"
         $ServiceInstalled = $true
 
-        # Start it now
         Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -469,7 +324,7 @@ if (-not $ServiceInstalled) {
 
 if (-not $ServiceInstalled) {
     Write-Fail "Auto-start setup failed. Run the agent manually:"
-    Write-Info "orchestratia-agent --config `"$ConfigDir\config.yaml`""
+    Write-Info "& `"$AgentExePath`" --config `"$ConfigDir\config.yaml`""
 }
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -477,10 +332,12 @@ if (-not $ServiceInstalled) {
 Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 if ($Errors -eq 0) {
-    Write-Host "  ✓ Installation complete — no errors" -ForegroundColor Green
+    Write-Host "  Installation complete — no errors" -ForegroundColor Green
 } else {
-    Write-Host "  ! Installation finished with $Errors warning(s)" -ForegroundColor Yellow
+    Write-Host "  Installation finished with $Errors warning(s)" -ForegroundColor Yellow
 }
+Write-Host ""
+Write-Host "  Installed to: $AgentExePath" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Useful commands:" -ForegroundColor DarkGray
 if ($nssmPath -and $ServiceInstalled) {
@@ -498,6 +355,5 @@ Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 Write-Host ""
 
-# Clean up
 Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 if ($env:ORC_TOKEN) { Remove-Item Env:\ORC_TOKEN -ErrorAction SilentlyContinue }

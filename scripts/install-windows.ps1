@@ -258,8 +258,9 @@ if ($nssmExe) {
 
 if ($nssmPath) {
     try {
+        # No AppParameters needed — the exe defaults to %LOCALAPPDATA%\Orchestratia\config.yaml
+        # which is exactly where we put the config. Avoids NSSM quoting issues with spaces in paths.
         & $nssmPath install $ServiceName $AgentExePath 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppParameters "--config `"$ConfigDir\config.yaml`"" 2>&1 | Out-Null
         & $nssmPath set $ServiceName AppDirectory $ConfigDir 2>&1 | Out-Null
         & $nssmPath set $ServiceName DisplayName "Orchestratia Agent" 2>&1 | Out-Null
         & $nssmPath set $ServiceName Description "AI agent orchestration daemon" 2>&1 | Out-Null
@@ -294,7 +295,6 @@ if (-not $ServiceInstalled) {
     try {
         $taskAction = New-ScheduledTaskAction `
             -Execute $AgentExePath `
-            -Argument "--config `"$ConfigDir\config.yaml`"" `
             -WorkingDirectory $ConfigDir `
             -ErrorAction Stop
 

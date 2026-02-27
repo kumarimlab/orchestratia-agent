@@ -318,24 +318,27 @@ step 5 "Installing Python dependencies"
 info "Removing stale package versions..."
 sudo -u "$RUN_USER" pip3 uninstall -y orchestratia-agent 2>/dev/null || true
 pip3 uninstall -y orchestratia-agent 2>/dev/null || true
-# Belt-and-suspenders: wipe any leftover egg-info or package dirs
+# Remove ALL leftover files including dist-info metadata (prevents pip "already satisfied" skip)
 find /home/"$RUN_USER"/.local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
+find /home/"$RUN_USER"/.local/lib -path "*/orchestratia*agent*" -exec rm -rf {} + 2>/dev/null || true
 find /usr/local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
+find /usr/local/lib -path "*/orchestratia*agent*" -exec rm -rf {} + 2>/dev/null || true
 ok "Cleaned stale installs"
 
 # Install as the real user so it lands in ~/.local/ (highest priority in Python).
-# This avoids the user-vs-system site-packages shadowing problem entirely.
+# IMPORTANT: sudo -u doesn't set HOME, so we must pass it explicitly,
+# otherwise pip/python looks in /root/.local/ instead of the user's home.
 info "Installing orchestratia-agent package..."
 PIP_OUTPUT=""
-# Try plain install first, then --user, then --break-system-packages (pip 23+/Python 3.11+)
-if PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q "$INSTALL_DIR" 2>&1); then
-    ok "Package installed"
-elif PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q --user "$INSTALL_DIR" 2>&1); then
+# Try --user first (most reliable for non-root), then plain, then --break-system-packages
+if PIP_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --user "$INSTALL_DIR" 2>&1); then
     ok "Package installed (--user)"
+elif PIP_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install "$INSTALL_DIR" 2>&1); then
+    ok "Package installed"
 elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
-     PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
+     PIP_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --break-system-packages "$INSTALL_DIR" 2>&1); then
     ok "Package installed (--break-system-packages)"
-elif PIP_OUTPUT=$(pip3 install -q "$INSTALL_DIR" 2>&1); then
+elif PIP_OUTPUT=$(pip3 install "$INSTALL_DIR" 2>&1); then
     ok "Package installed (system-wide)"
 else
     fail "pip3 install failed:"
@@ -344,23 +347,39 @@ else
 fi
 
 # Show installed version (check as the real user)
-PKG_VER=$(sudo -u "$RUN_USER" pip3 show orchestratia-agent 2>/dev/null | grep '^Version:' | awk '{print $2}' || echo "unknown")
+PKG_VER=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 show orchestratia-agent 2>/dev/null | grep '^Version:' | awk '{print $2}' || echo "unknown")
 ok "orchestratia-agent ${PKG_VER}"
 
 # Verify imports work (as the real user)
-if sudo -u "$RUN_USER" python3 -c "import httpx, websockets, yaml, psutil, orchestratia_agent" 2>/dev/null; then
+if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "import httpx, websockets, yaml, psutil, orchestratia_agent" 2>/dev/null; then
     ok "All imports verified"
 else
-    fail "Some Python packages failed to import"
-    info "Try: pip3 install ${INSTALL_DIR}"
+    warn "Some packages not importable — installing dependencies directly..."
+    sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --user -r "$INSTALL_DIR/requirements.txt" 2>&1 | tail -3
+    # Verify again
+    if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "import httpx, websockets, yaml, psutil" 2>/dev/null; then
+        ok "Dependencies installed via requirements.txt"
+    else
+        fail "Dependencies still missing after fallback install"
+        info "Try manually: pip3 install --user httpx websockets pyyaml psutil pyte"
+    fi
 fi
 
 # Step 6: Register with hub
 step 6 "Registering with Orchestratia hub"
 
 info "Using one-time registration token..."
+# Find the installed entry point; fall back to running daemon.py directly
+AGENT_CMD=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" which orchestratia-agent 2>/dev/null || echo "")
+if [ -z "$AGENT_CMD" ] && [ -x "${RUN_HOME}/.local/bin/orchestratia-agent" ]; then
+    AGENT_CMD="${RUN_HOME}/.local/bin/orchestratia-agent"
+fi
+if [ -z "$AGENT_CMD" ]; then
+    AGENT_CMD="python3 $INSTALL_DIR/daemon.py"
+    info "Using fallback: ${AGENT_CMD}"
+fi
 REGISTER_OUTPUT=""
-if REGISTER_OUTPUT=$(sudo -u "$RUN_USER" python3 "$INSTALL_DIR/daemon.py" --config "${CONFIG_DIR}/config.yaml" --register "$TOKEN" 2>&1); then
+if REGISTER_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" $AGENT_CMD --config "${CONFIG_DIR}/config.yaml" --register "$TOKEN" 2>&1); then
     # Check for success indicators in output
     if echo "$REGISTER_OUTPUT" | grep -qi "api.key\|registered\|success\|saved"; then
         ok "Registered successfully"

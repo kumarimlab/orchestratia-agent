@@ -314,56 +314,72 @@ step 5 "Installing Python dependencies"
 # Clean up any stale pip installs from ALL locations.
 # Python resolves user site-packages (~/.local/) before system site-packages.
 # If an old version exists in ~/.local/, it shadows any new system install.
-# So we must remove from both locations before installing fresh.
 info "Removing stale package versions..."
-sudo -u "$RUN_USER" pip3 uninstall -y orchestratia-agent 2>/dev/null || true
+sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 uninstall -y orchestratia-agent 2>/dev/null || true
 pip3 uninstall -y orchestratia-agent 2>/dev/null || true
-# Remove ALL leftover files including dist-info metadata (prevents pip "already satisfied" skip)
 find /home/"$RUN_USER"/.local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
 find /home/"$RUN_USER"/.local/lib -path "*/orchestratia*agent*" -exec rm -rf {} + 2>/dev/null || true
 find /usr/local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
 find /usr/local/lib -path "*/orchestratia*agent*" -exec rm -rf {} + 2>/dev/null || true
 ok "Cleaned stale installs"
 
-# Install as the real user so it lands in ~/.local/ (highest priority in Python).
-# IMPORTANT: sudo -u doesn't set HOME, so we must pass it explicitly,
-# otherwise pip/python looks in /root/.local/ instead of the user's home.
-info "Installing orchestratia-agent package..."
-PIP_OUTPUT=""
-# Try --user first (most reliable for non-root), then plain, then --break-system-packages
-if PIP_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --user "$INSTALL_DIR" 2>&1); then
-    ok "Package installed (--user)"
-elif PIP_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install "$INSTALL_DIR" 2>&1); then
-    ok "Package installed"
-elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
-     PIP_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --break-system-packages "$INSTALL_DIR" 2>&1); then
-    ok "Package installed (--break-system-packages)"
-elif PIP_OUTPUT=$(pip3 install "$INSTALL_DIR" 2>&1); then
-    ok "Package installed (system-wide)"
+# Strategy: install deps from requirements.txt FIRST (explicit, reliable),
+# then install the package with --no-deps (just entry points + code).
+# This avoids pip's unreliable dependency resolution for local directory
+# installs on older pip versions (pip 22.x on Ubuntu 22.04).
+
+# Helper: try pip install with --user, then plain, then --break-system-packages.
+# All arguments are passed directly to pip (e.g., -r file.txt, --no-deps, pkg).
+pip_install_as_user() {
+    local out=""
+    if out=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --user "$@" 2>&1); then
+        echo "$out"
+        return 0
+    elif out=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install "$@" 2>&1); then
+        echo "$out"
+        return 0
+    elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
+         out=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --break-system-packages "$@" 2>&1); then
+        echo "$out"
+        return 0
+    else
+        echo "$out"
+        return 1
+    fi
+}
+
+# 1. Install dependencies from requirements.txt (flat list, no build system needed)
+info "Installing dependencies..."
+if pip_install_as_user -q -r "$INSTALL_DIR/requirements.txt" >/dev/null 2>&1; then
+    ok "Dependencies installed"
 else
-    fail "pip3 install failed:"
+    # Retry without -q to show errors
+    PIP_OUTPUT=$(pip_install_as_user -r "$INSTALL_DIR/requirements.txt" 2>&1) || true
     echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
-    info "Try manually: pip3 install --user ${INSTALL_DIR}"
+    warn "Some dependencies may have failed to install"
 fi
 
-# Show installed version (check as the real user)
+# 2. Install the package itself (entry points + code only, deps already handled)
+info "Installing orchestratia-agent package..."
+if pip_install_as_user -q --no-deps "$INSTALL_DIR" >/dev/null 2>&1; then
+    ok "Package installed"
+else
+    PIP_OUTPUT=$(pip_install_as_user --no-deps "$INSTALL_DIR" 2>&1) || true
+    fail "pip3 install failed:"
+    echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
+fi
+
+# Show installed version
 PKG_VER=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 show orchestratia-agent 2>/dev/null | grep '^Version:' | awk '{print $2}' || echo "unknown")
 ok "orchestratia-agent ${PKG_VER}"
 
-# Verify imports work (as the real user)
+# Verify all imports work
 IMPORT_CHECK="import httpx, websockets, yaml, psutil, pyte, orchestratia_agent"
 if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "$IMPORT_CHECK" 2>/dev/null; then
     ok "All imports verified"
 else
-    warn "Some packages not importable — installing dependencies directly..."
-    sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --user -r "$INSTALL_DIR/requirements.txt" 2>&1 | tail -5
-    # Verify again
-    if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "import httpx, websockets, yaml, psutil, pyte" 2>/dev/null; then
-        ok "Dependencies installed via requirements.txt"
-    else
-        fail "Dependencies still missing after fallback install"
-        info "Try manually: pip3 install --user httpx websockets pyyaml psutil pyte"
-    fi
+    fail "Some imports failed after install"
+    info "Try manually: pip3 install --user httpx websockets pyyaml psutil pyte"
 fi
 
 # Step 6: Register with hub

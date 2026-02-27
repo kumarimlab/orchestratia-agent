@@ -316,8 +316,8 @@ step 5 "Installing Python dependencies"
 # If an old version exists in ~/.local/, it shadows any new system install.
 # So we must remove from both locations before installing fresh.
 info "Removing stale package versions..."
-sudo -u "$RUN_USER" pip3 uninstall -y orchestratia-agent --break-system-packages 2>/dev/null || true
-pip3 uninstall -y orchestratia-agent --break-system-packages 2>/dev/null || true
+sudo -u "$RUN_USER" pip3 uninstall -y orchestratia-agent 2>/dev/null || true
+pip3 uninstall -y orchestratia-agent 2>/dev/null || true
 # Belt-and-suspenders: wipe any leftover egg-info or package dirs
 find /home/"$RUN_USER"/.local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
 find /usr/local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
@@ -327,14 +327,20 @@ ok "Cleaned stale installs"
 # This avoids the user-vs-system site-packages shadowing problem entirely.
 info "Installing orchestratia-agent package..."
 PIP_OUTPUT=""
-if PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
+# Try plain install first, then --user, then --break-system-packages (pip 23+/Python 3.11+)
+if PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q "$INSTALL_DIR" 2>&1); then
     ok "Package installed"
-elif PIP_OUTPUT=$(pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
-    ok "Package installed (system-wide fallback)"
+elif PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q --user "$INSTALL_DIR" 2>&1); then
+    ok "Package installed (--user)"
+elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
+     PIP_OUTPUT=$(sudo -u "$RUN_USER" pip3 install -q --break-system-packages "$INSTALL_DIR" 2>&1); then
+    ok "Package installed (--break-system-packages)"
+elif PIP_OUTPUT=$(pip3 install -q "$INSTALL_DIR" 2>&1); then
+    ok "Package installed (system-wide)"
 else
     fail "pip3 install failed:"
     echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
-    info "Try manually: pip3 install ${INSTALL_DIR}"
+    info "Try manually: pip3 install --user ${INSTALL_DIR}"
 fi
 
 # Show installed version (check as the real user)

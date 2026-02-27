@@ -429,16 +429,18 @@ if (-not $ServiceInstalled) {
         $taskAction = New-ScheduledTaskAction `
             -Execute $agentExe `
             -Argument "--config `"$ConfigDir\config.yaml`"" `
-            -WorkingDirectory $ConfigDir
+            -WorkingDirectory $ConfigDir `
+            -ErrorAction Stop
 
-        $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+        $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -ErrorAction Stop
 
         $taskSettings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
             -RestartCount 3 `
             -RestartInterval (New-TimeSpan -Minutes 1) `
-            -ExecutionTimeLimit ([TimeSpan]::Zero)
+            -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -ErrorAction Stop
 
         Register-ScheduledTask `
             -TaskName $TaskName `
@@ -446,7 +448,7 @@ if (-not $ServiceInstalled) {
             -Trigger $taskTrigger `
             -Settings $taskSettings `
             -Description "Orchestratia agent daemon" `
-            -RunLevel Highest | Out-Null
+            -ErrorAction Stop | Out-Null
 
         Write-Ok "Scheduled task created (runs at logon)"
         $ServiceInstalled = $true

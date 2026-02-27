@@ -107,18 +107,57 @@ if (-not $Token.StartsWith("orcreg_")) {
 # ── Resolve Python & pip ─────────────────────────────────────────────
 # On Windows, 'pip' is often not in PATH even when Python is installed.
 # The Python Launcher 'py' is more reliable. We resolve once and reuse.
+# IMPORTANT: Windows ships a 'python.exe' stub that opens the Microsoft
+# Store instead of running Python. We must verify the candidate actually
+# executes before accepting it.
+
+function Test-RealPython {
+    param([string]$Candidate)
+    try {
+        $out = & $Candidate -c "print('ok')" 2>&1
+        return ($LASTEXITCODE -eq 0 -and $out -match 'ok')
+    } catch {
+        return $false
+    }
+}
 
 function Find-Python {
     # Prefer 'py' launcher (always in PATH on standard Python installs)
     $py = Get-Command py -ErrorAction SilentlyContinue
-    if ($py) { return $py.Source }
+    if ($py -and (Test-RealPython $py.Source)) { return $py.Source }
 
     $python = Get-Command python -ErrorAction SilentlyContinue
-    if ($python) { return $python.Source }
+    if ($python -and (Test-RealPython $python.Source)) { return $python.Source }
 
     $python3 = Get-Command python3 -ErrorAction SilentlyContinue
-    if ($python3) { return $python3.Source }
+    if ($python3 -and (Test-RealPython $python3.Source)) { return $python3.Source }
 
+    return $null
+}
+
+function Install-Python {
+    # Try winget first (built into Windows 10 1709+ / Windows 11)
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Info "Installing Python 3.12 via winget..."
+        & winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            # Refresh PATH for this session
+            $machPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $env:PATH = "$machPath;$userPath"
+            $found = Find-Python
+            if ($found) {
+                Write-Ok "Python installed successfully"
+                return $found
+            }
+        }
+        Write-Fail "winget install completed but Python still not found in PATH"
+        Write-Info "You may need to close and reopen PowerShell, then re-run this installer"
+        return $null
+    }
+
+    # No winget — give manual instructions
     return $null
 }
 
@@ -185,7 +224,19 @@ if (-not $existing) { Write-Ok "No existing installation found" }
 Write-Step 2 $TotalSteps "Checking prerequisites"
 
 if (-not $PythonExe) {
-    Write-Fatal "Python not found. Download from https://www.python.org/downloads/ (check 'Add to PATH')"
+    Write-Warn "Python not found"
+    Write-Host ""
+    Write-Host "     Python 3.10+ is required. Install it now?" -ForegroundColor White
+    Write-Host ""
+    $choice = Read-Host "     [Y] Install via winget  [N] Abort  (Y/n)"
+    if ($choice -eq '' -or $choice -match '^[Yy]') {
+        $PythonExe = Install-Python
+        if (-not $PythonExe) {
+            Write-Fatal "Python installation failed. Install manually from https://www.python.org/downloads/ (check 'Add to PATH') then re-run this installer."
+        }
+    } else {
+        Write-Fatal "Python is required. Install from https://www.python.org/downloads/ (check 'Add to PATH') then re-run."
+    }
 }
 
 $pyVer = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"

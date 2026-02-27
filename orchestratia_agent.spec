@@ -19,6 +19,7 @@ a = Analysis(
         'orchestratia_agent.session',
         'orchestratia_agent.session_base',
         'orchestratia_agent.session_windows',
+        'orchestratia_agent.conpty',
         'orchestratia_agent.system',
         'orchestratia_agent.tmux',
         'orchestratia_agent.win_input_helper',

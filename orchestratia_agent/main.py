@@ -288,32 +288,44 @@ def _test_pty():
         print(f"  FAIL: {e}")
     print()
 
-    # Test 4: ConPTY with explicit env=None vs env=os.environ.copy()
+    # Test 4: Native ConPTY via ctypes (our implementation)
     print("=" * 60)
-    print("TEST 4: ConPTY env handling")
+    print("TEST 4: Native ConPTY via ctypes (conpty.py)")
     print("=" * 60)
     try:
-        from winpty import PtyProcess
+        from orchestratia_agent.conpty import ConPtyProcess
+        print("  conpty module imported OK")
 
-        for label, env_arg in [("env=None (inherit)", None), ("env=os.environ.copy()", os.environ.copy())]:
-            print(f"\n  --- {label} ---")
+        for shell_name, shell_cmd in [("cmd.exe", "cmd.exe"), ("powershell", "powershell.exe")]:
+            print(f"\n  --- Spawning {shell_name} ---")
             try:
-                kwargs = {"dimensions": (25, 80)}
-                if env_arg is not None:
-                    kwargs["env"] = env_arg
-                proc = PtyProcess.spawn("cmd.exe", **kwargs)
+                proc = ConPtyProcess.spawn(shell_cmd, cols=80, rows=25)
+                print(f"  PID: {proc.pid}")
                 time.sleep(1)
                 alive = proc.isalive()
+                print(f"  Alive after 1s: {alive}")
+
                 if alive:
-                    print(f"  PASS: alive (PID {proc.pid})")
+                    try:
+                        data = proc.read(4096)
+                        print(f"  Read {len(data)} chars: {data[:100]!r}")
+                    except Exception as e:
+                        print(f"  Read error: {e}")
                     proc.terminate(force=True)
+                    proc.close()
+                    print(f"  PASS: {shell_name} native ConPTY works")
                 else:
-                    exit_code = getattr(proc, "exitstatus", None)
-                    print(f"  FAIL: exit_code={exit_code}")
+                    exit_code = proc.exitstatus
+                    print(f"  FAIL: Died immediately, exit_code={exit_code}", end="")
+                    if exit_code:
+                        print(f" (0x{exit_code:08X})")
+                    else:
+                        print()
+                    proc.close()
             except Exception as e:
                 print(f"  FAIL: {e}")
-    except ImportError:
-        print("  SKIP: pywinpty not available")
+    except Exception as e:
+        print(f"  FAIL: {e}")
     print()
     print("Diagnostic complete.")
 

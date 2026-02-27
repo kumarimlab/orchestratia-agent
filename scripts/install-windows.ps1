@@ -422,24 +422,46 @@ if (-not $ServiceInstalled) {
     $TaskName = "OrchestratiAgent"
 
     # Remove existing task if present
-    schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-    # Create a scheduled task that runs at system startup
-    $action = "cmd /c `"`"$agentExe`" --config `"$ConfigDir\config.yaml`" >> `"$LogDir\agent.log`" 2>> `"$LogDir\agent.err`"`""
-    schtasks /Create /TN $TaskName /TR $action /SC ONSTART /RU "$env:USERNAME" /RL HIGHEST /F 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Ok "Scheduled task created (runs at startup)"
+    # Create scheduled task using PowerShell cmdlets (handles paths with spaces)
+    try {
+        $taskAction = New-ScheduledTaskAction `
+            -Execute $agentExe `
+            -Argument "--config `"$ConfigDir\config.yaml`"" `
+            -WorkingDirectory $ConfigDir
+
+        $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+
+        $taskSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+        Register-ScheduledTask `
+            -TaskName $TaskName `
+            -Action $taskAction `
+            -Trigger $taskTrigger `
+            -Settings $taskSettings `
+            -Description "Orchestratia agent daemon" `
+            -RunLevel Highest | Out-Null
+
+        Write-Ok "Scheduled task created (runs at logon)"
         $ServiceInstalled = $true
 
         # Start it now
-        schtasks /Run /TN $TaskName 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($taskInfo -and $taskInfo.LastTaskResult -ne 267011) {
             Write-Ok "Agent started"
         } else {
-            Write-Warn "Could not start task now — it will run on next boot"
+            Write-Info "Task registered — will start at next logon"
         }
-    } else {
-        Write-Fail "Could not create scheduled task"
+    } catch {
+        Write-Fail "Could not create scheduled task: $_"
     }
 }
 

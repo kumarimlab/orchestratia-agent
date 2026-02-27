@@ -354,7 +354,7 @@ step 6 "Registering with Orchestratia hub"
 
 info "Using one-time registration token..."
 REGISTER_OUTPUT=""
-if REGISTER_OUTPUT=$(sudo -u "$RUN_USER" python3 "$INSTALL_DIR/daemon.py" --register "$TOKEN" 2>&1); then
+if REGISTER_OUTPUT=$(sudo -u "$RUN_USER" python3 "$INSTALL_DIR/daemon.py" --config "${CONFIG_DIR}/config.yaml" --register "$TOKEN" 2>&1); then
     # Check for success indicators in output
     if echo "$REGISTER_OUTPUT" | grep -qi "api.key\|registered\|success\|saved"; then
         ok "Registered successfully"

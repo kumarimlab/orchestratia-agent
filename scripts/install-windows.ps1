@@ -14,7 +14,7 @@
 #   1. Cleans up any existing installation
 #   2. Downloads orchestratia-agent.exe from latest GitHub Release
 #   3. Registers with the hub using the one-time token
-#   4. Creates a Windows service (NSSM) or scheduled task (fallback)
+#   4. Creates a scheduled task (runs as current user at logon)
 # ──────────────────────────────────────────────────────────────────────
 
 $Token = if ($args.Count -gt 0) { $args[0] } elseif ($env:ORC_TOKEN) { $env:ORC_TOKEN } else { $null }
@@ -52,8 +52,6 @@ trap {
 # ── Constants ────────────────────────────────────────────────────────
 $ServiceName = "OrchestratiAgent"
 $AgentExePath = "$ConfigDir\orchestratia-agent.exe"
-$NssmUrl = "https://nssm.cc/release/nssm-2.24.zip"
-$NssmDir = "$ConfigDir\nssm"
 $ReleaseUrl = if ($env:ORCHESTRATIA_EXE_URL) {
     $env:ORCHESTRATIA_EXE_URL
 } else {
@@ -209,134 +207,85 @@ if (Test-Path "$ConfigDir\config.yaml") {
     Write-Fatal "Registration did not create config. Cannot start service."
 }
 
-# Step 4: Auto-start setup
+# Step 4: Auto-start setup (Task Scheduler — runs as current user)
 Write-Step 4 $TotalSteps "Setting up auto-start"
 
+# Task Scheduler runs the agent as the current user, which is essential:
+# - ConPTY sessions need a user profile (SYSTEM can't spawn shells)
+# - Claude Code, git, node etc. are installed per-user
+# - %LOCALAPPDATA% resolves to the correct config path
+# NSSM services run as SYSTEM and can't do any of the above.
+
+$TaskName = "OrchestratiAgent"
 $ServiceInstalled = $false
 
-# ── Try NSSM first (proper Windows service) ──
-$nssmPath = $null
-$nssmExe = Get-Command nssm -ErrorAction SilentlyContinue
-if ($nssmExe) {
-    $nssmPath = $nssmExe.Source
-    Write-Ok "NSSM found: $nssmPath"
-} else {
-    # Check if we already have a local copy from a previous install
-    $localNssm = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" -ErrorAction SilentlyContinue |
-        Where-Object { $_.DirectoryName -like "*win64*" } |
-        Select-Object -First 1
-    if ($localNssm) {
-        $nssmPath = $localNssm.FullName
-        Write-Ok "NSSM found (local): $nssmPath"
+# Remove any existing NSSM service from previous installs
+$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($svc) {
+    Stop-Service $ServiceName -Force -ErrorAction SilentlyContinue
+    $nssmExe = Get-Command nssm -ErrorAction SilentlyContinue
+    if ($nssmExe) {
+        & nssm remove $ServiceName confirm 2>$null
     } else {
-        Write-Info "Downloading NSSM..."
-        New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
-        $zipPath = "$NssmDir\nssm.zip"
-
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $NssmUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 15
-            Expand-Archive -Path $zipPath -DestinationPath $NssmDir -Force
-            Remove-Item $zipPath
-
-            $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
-                Where-Object { $_.DirectoryName -like "*win64*" } |
-                Select-Object -First 1
-            if (-not $nssmBin) {
-                $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
-                    Select-Object -First 1
-            }
-            if ($nssmBin) {
-                $nssmPath = $nssmBin.FullName
-                Write-Ok "NSSM downloaded: $nssmPath"
-            }
-        } catch {
-            Write-Warn "Could not download NSSM (site may be down)"
-        }
+        sc.exe delete $ServiceName 2>$null
     }
+    Write-Ok "Removed legacy NSSM service"
 }
 
-if ($nssmPath) {
-    try {
-        # No AppParameters needed — the exe defaults to %LOCALAPPDATA%\Orchestratia\config.yaml.
-        # NSSM runs the service as SYSTEM, whose LOCALAPPDATA differs from the installing user's.
-        # We inject the user's LOCALAPPDATA so the exe finds the config at the right path.
-        & $nssmPath install $ServiceName $AgentExePath 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppDirectory $ConfigDir 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppEnvironmentExtra "LOCALAPPDATA=$env:LOCALAPPDATA" 2>&1 | Out-Null
-        & $nssmPath set $ServiceName DisplayName "Orchestratia Agent" 2>&1 | Out-Null
-        & $nssmPath set $ServiceName Description "AI agent orchestration daemon" 2>&1 | Out-Null
-        & $nssmPath set $ServiceName Start SERVICE_AUTO_START 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppStdout "$LogDir\agent.log" 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppStderr "$LogDir\agent.err" 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppRotateFiles 1 2>&1 | Out-Null
-        & $nssmPath set $ServiceName AppRotateBytes 10485760 2>&1 | Out-Null
-        Write-Ok "Windows service installed (NSSM)"
-        $ServiceInstalled = $true
+# Remove existing scheduled task
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-        Start-Service $ServiceName -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status -eq "Running") {
-            Write-Ok "Service is running"
+try {
+    $taskAction = New-ScheduledTaskAction `
+        -Execute $AgentExePath `
+        -WorkingDirectory $ConfigDir `
+        -ErrorAction Stop
+
+    $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -ErrorAction Stop
+
+    $taskSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -ErrorAction Stop
+
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $taskAction `
+        -Trigger $taskTrigger `
+        -Settings $taskSettings `
+        -Description "Orchestratia agent daemon (runs as $env:USERNAME)" `
+        -ErrorAction Stop | Out-Null
+
+    Write-Ok "Scheduled task created (runs as $env:USERNAME at logon)"
+    $ServiceInstalled = $true
+
+    # Start it now
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($taskInfo -and $taskInfo.LastTaskResult -eq 0) {
+        Write-Ok "Agent is running"
+    } elseif ($taskInfo -and $taskInfo.LastTaskResult -eq 267009) {
+        Write-Ok "Agent is running"
+    } else {
+        # Check if the process is actually running
+        $proc = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
+        if ($proc) {
+            Write-Ok "Agent is running (PID: $($proc.Id))"
         } else {
-            Write-Warn "Service may not be running — check: Get-Service $ServiceName"
+            Write-Warn "Agent may not be running — check logs"
         }
-    } catch {
-        Write-Fail "NSSM service setup failed: $_"
     }
-}
-
-# ── Fallback: Task Scheduler (built-in, zero dependencies) ──
-if (-not $ServiceInstalled) {
-    Write-Info "Falling back to Task Scheduler (built-in)..."
-
-    $TaskName = "OrchestratiAgent"
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-
-    try {
-        $taskAction = New-ScheduledTaskAction `
-            -Execute $AgentExePath `
-            -WorkingDirectory $ConfigDir `
-            -ErrorAction Stop
-
-        $taskTrigger = New-ScheduledTaskTrigger -AtLogOn -ErrorAction Stop
-
-        $taskSettings = New-ScheduledTaskSettingsSet `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -RestartCount 3 `
-            -RestartInterval (New-TimeSpan -Minutes 1) `
-            -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -ErrorAction Stop
-
-        Register-ScheduledTask `
-            -TaskName $TaskName `
-            -Action $taskAction `
-            -Trigger $taskTrigger `
-            -Settings $taskSettings `
-            -Description "Orchestratia agent daemon" `
-            -ErrorAction Stop | Out-Null
-
-        Write-Ok "Scheduled task created (runs at logon)"
-        $ServiceInstalled = $true
-
-        Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($taskInfo -and $taskInfo.LastTaskResult -ne 267011) {
-            Write-Ok "Agent started"
-        } else {
-            Write-Info "Task registered — will start at next logon"
-        }
-    } catch {
-        Write-Fail "Could not create scheduled task: $_"
-    }
+} catch {
+    Write-Fail "Could not create scheduled task: $_"
 }
 
 if (-not $ServiceInstalled) {
     Write-Fail "Auto-start setup failed. Run the agent manually:"
-    Write-Info "& `"$AgentExePath`" --config `"$ConfigDir\config.yaml`""
+    Write-Info "& `"$AgentExePath`""
 }
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -352,17 +301,10 @@ Write-Host ""
 Write-Host "  Installed to: $AgentExePath" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Useful commands:" -ForegroundColor DarkGray
-if ($nssmPath -and $ServiceInstalled) {
-    Write-Host "    Status:   Get-Service $ServiceName"
-    Write-Host "    Logs:     Get-Content $LogDir\agent.log -Wait"
-    Write-Host "    Restart:  Restart-Service $ServiceName"
-    Write-Host "    Stop:     Stop-Service $ServiceName"
-} else {
-    Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"
-    Write-Host "    Logs:     Get-Content $LogDir\agent.log -Wait"
-    Write-Host "    Start:    schtasks /Run /TN OrchestratiAgent"
-    Write-Host "    Stop:     schtasks /End /TN OrchestratiAgent"
-}
+Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"
+Write-Host "    Start:    schtasks /Run /TN OrchestratiAgent"
+Write-Host "    Stop:     schtasks /End /TN OrchestratiAgent"
+Write-Host "    Logs:     Get-Content $LogDir\agent.log -Wait"
 Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 Write-Host ""

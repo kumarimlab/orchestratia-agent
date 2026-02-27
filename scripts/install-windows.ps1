@@ -221,35 +221,45 @@ if ($nssmExe) {
     $nssmPath = $nssmExe.Source
     Write-Ok "NSSM found: $nssmPath"
 } else {
-    Write-Info "Downloading NSSM..."
-    New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
-    $zipPath = "$NssmDir\nssm.zip"
+    # Check if we already have a local copy from a previous install
+    $localNssm = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" -ErrorAction SilentlyContinue |
+        Where-Object { $_.DirectoryName -like "*win64*" } |
+        Select-Object -First 1
+    if ($localNssm) {
+        $nssmPath = $localNssm.FullName
+        Write-Ok "NSSM found (local): $nssmPath"
+    } else {
+        Write-Info "Downloading NSSM..."
+        New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
+        $zipPath = "$NssmDir\nssm.zip"
 
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $NssmUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 15
-        Expand-Archive -Path $zipPath -DestinationPath $NssmDir -Force
-        Remove-Item $zipPath
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $NssmUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 15
+            Expand-Archive -Path $zipPath -DestinationPath $NssmDir -Force
+            Remove-Item $zipPath
 
-        $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
-            Where-Object { $_.DirectoryName -like "*win64*" } |
-            Select-Object -First 1
-        if (-not $nssmBin) {
             $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
+                Where-Object { $_.DirectoryName -like "*win64*" } |
                 Select-Object -First 1
+            if (-not $nssmBin) {
+                $nssmBin = Get-ChildItem -Path $NssmDir -Recurse -Filter "nssm.exe" |
+                    Select-Object -First 1
+            }
+            if ($nssmBin) {
+                $nssmPath = $nssmBin.FullName
+                Write-Ok "NSSM downloaded: $nssmPath"
+            }
+        } catch {
+            Write-Warn "Could not download NSSM (site may be down)"
         }
-        if ($nssmBin) {
-            $nssmPath = $nssmBin.FullName
-            Write-Ok "NSSM downloaded: $nssmPath"
-        }
-    } catch {
-        Write-Warn "Could not download NSSM (site may be down)"
     }
 }
 
 if ($nssmPath) {
     try {
-        & $nssmPath install $ServiceName $AgentExePath "--config" "$ConfigDir\config.yaml" 2>&1 | Out-Null
+        & $nssmPath install $ServiceName $AgentExePath 2>&1 | Out-Null
+        & $nssmPath set $ServiceName AppParameters "--config `"$ConfigDir\config.yaml`"" 2>&1 | Out-Null
         & $nssmPath set $ServiceName AppDirectory $ConfigDir 2>&1 | Out-Null
         & $nssmPath set $ServiceName DisplayName "Orchestratia Agent" 2>&1 | Out-Null
         & $nssmPath set $ServiceName Description "AI agent orchestration daemon" 2>&1 | Out-Null

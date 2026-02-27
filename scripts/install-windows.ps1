@@ -146,9 +146,18 @@ function Install-Python {
     # Try winget first (built into Windows 10 1709+ / Windows 11)
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
-        Write-Info "Installing Python 3.12 via winget..."
-        & winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        Write-Info "Installing Python 3.12 via winget (this may take a minute)..."
+        try {
+            $prevPref = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+            & winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements 2>&1 | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray }
+            $wingetExit = $LASTEXITCODE
+            $ErrorActionPreference = $prevPref
+        } catch {
+            $ErrorActionPreference = $prevPref
+            $wingetExit = 1
+        }
+        # winget returns 0 on success, -1978335189 (0x8A150011) if already installed
+        if ($wingetExit -eq 0 -or $wingetExit -eq -1978335189) {
             # Refresh PATH for this session
             $machPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
             $userPath = [Environment]::GetEnvironmentVariable("Path", "User")

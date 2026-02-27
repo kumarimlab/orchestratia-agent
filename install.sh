@@ -351,13 +351,14 @@ PKG_VER=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 show orchestratia-agent 2>/d
 ok "orchestratia-agent ${PKG_VER}"
 
 # Verify imports work (as the real user)
-if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "import httpx, websockets, yaml, psutil, orchestratia_agent" 2>/dev/null; then
+IMPORT_CHECK="import httpx, websockets, yaml, psutil, pyte, orchestratia_agent"
+if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "$IMPORT_CHECK" 2>/dev/null; then
     ok "All imports verified"
 else
     warn "Some packages not importable — installing dependencies directly..."
-    sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --user -r "$INSTALL_DIR/requirements.txt" 2>&1 | tail -3
+    sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 install --user -r "$INSTALL_DIR/requirements.txt" 2>&1 | tail -5
     # Verify again
-    if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "import httpx, websockets, yaml, psutil" 2>/dev/null; then
+    if sudo -u "$RUN_USER" HOME="$RUN_HOME" python3 -c "import httpx, websockets, yaml, psutil, pyte" 2>/dev/null; then
         ok "Dependencies installed via requirements.txt"
     else
         fail "Dependencies still missing after fallback install"

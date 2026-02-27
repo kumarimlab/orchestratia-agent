@@ -35,6 +35,19 @@ if (-not $Token) {
 
 $ErrorActionPreference = "Stop"
 
+# ── Logging ──────────────────────────────────────────────────────────
+# Log everything to a file so we can debug crashes
+$InstallLog = "$env:LOCALAPPDATA\Orchestratia\install.log"
+New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\Orchestratia" | Out-Null
+Start-Transcript -Path $InstallLog -Force | Out-Null
+trap {
+    Write-Host ""
+    Write-Host "  ✗ UNEXPECTED ERROR: $_" -ForegroundColor Red
+    Write-Host "  Log saved to: $InstallLog" -ForegroundColor Yellow
+    Write-Host ""
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+}
+
 # ── Constants ────────────────────────────────────────────────────────
 
 $ServiceName = "OrchestratiAgent"
@@ -447,5 +460,6 @@ Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 Write-Host ""
 
-# Clean up env var if set (don't leak token)
+# Clean up
+Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 if ($env:ORC_TOKEN) { Remove-Item Env:\ORC_TOKEN -ErrorAction SilentlyContinue }

@@ -11,10 +11,11 @@
 #   powershell -ExecutionPolicy Bypass -File install-windows.ps1 <TOKEN>
 #
 # What this does:
-#   1. Cleans up any existing installation
+#   1. Removes any existing installation (pip, exe, services, scheduled tasks)
 #   2. Downloads orchestratia-agent.exe from latest GitHub Release
 #   3. Registers with the hub using the one-time token
-#   4. Creates a scheduled task (runs as current user at logon)
+#   4. Adds exe to user PATH
+#   5. Creates a scheduled task (runs as current user at logon)
 # ──────────────────────────────────────────────────────────────────────
 
 $Token = if ($args.Count -gt 0) { $args[0] } elseif ($env:ORC_TOKEN) { $env:ORC_TOKEN } else { $null }
@@ -58,7 +59,7 @@ $ReleaseUrl = if ($env:ORCHESTRATIA_EXE_URL) {
     "https://github.com/kumarimlab/orchestratia-agent/releases/latest/download/orchestratia-agent.exe"
 }
 $Errors = 0
-$TotalSteps = 4
+$TotalSteps = 5
 
 # ── Helper functions ─────────────────────────────────────────────────
 
@@ -116,12 +117,33 @@ if (-not $Token.StartsWith("orcreg_")) {
 
 Write-Header
 
-# Step 1: Cleanup
+# Step 1: Cleanup — remove ALL existing installations
 Write-Step 1 $TotalSteps "Removing existing installation (if any)"
 
 $existing = $false
 
-# Stop and remove existing service
+# 1a. Kill any running orchestratia-agent processes
+$runningProcs = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
+if ($runningProcs) {
+    $existing = $true
+    $runningProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    Write-Ok "Killed running agent process(es)"
+}
+
+# 1b. Also kill any python-based agent (pip install runs as python.exe)
+$pythonProcs = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match "orchestratia" }
+if ($pythonProcs) {
+    $existing = $true
+    foreach ($p in $pythonProcs) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+    Write-Ok "Killed running pip-based agent process(es)"
+}
+
+# 1c. Stop and remove existing Windows service (NSSM)
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($svc) {
     $existing = $true
@@ -138,7 +160,7 @@ if ($svc) {
     Write-Ok "Removed existing service"
 }
 
-# Remove existing scheduled task
+# 1d. Remove existing scheduled task
 $existingTask = Get-ScheduledTask -TaskName "OrchestratiAgent" -ErrorAction SilentlyContinue
 if ($existingTask) {
     $existing = $true
@@ -146,11 +168,57 @@ if ($existingTask) {
     Write-Ok "Removed existing scheduled task"
 }
 
-# Remove existing exe
+# 1e. Remove existing exe
 if (Test-Path $AgentExePath) {
     $existing = $true
     Remove-Item $AgentExePath -Force -ErrorAction SilentlyContinue
     Write-Ok "Removed existing executable"
+}
+
+# 1f. Detect and remove pip-installed version
+$pipAgent = Get-Command "orchestratia-agent" -ErrorAction SilentlyContinue
+if ($pipAgent -and $pipAgent.Source -ne $AgentExePath) {
+    $existing = $true
+    $pipPath = $pipAgent.Source
+    Write-Info "Found existing installation at: $pipPath"
+
+    # Check if it's a pip-installed script (lives in a Python Scripts directory)
+    if ($pipPath -match "Python.*Scripts" -or $pipPath -match "site-packages") {
+        Write-Info "Detected pip-installed version, removing..."
+        # Try pip uninstall
+        $pipExe = Get-Command pip -ErrorAction SilentlyContinue
+        if (-not $pipExe) { $pipExe = Get-Command pip3 -ErrorAction SilentlyContinue }
+        if ($pipExe) {
+            & $pipExe.Source uninstall orchestratia-agent -y 2>&1 | Out-Null
+            Write-Ok "Ran pip uninstall orchestratia-agent"
+        }
+        # Also try python -m pip (more reliable)
+        $pythonExe = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $pythonExe) { $pythonExe = Get-Command python3 -ErrorAction SilentlyContinue }
+        if ($pythonExe) {
+            & $pythonExe.Source -m pip uninstall orchestratia-agent -y 2>&1 | Out-Null
+            Write-Ok "Ran python -m pip uninstall orchestratia-agent"
+        }
+        # Verify removal — delete script files directly if pip uninstall missed them
+        if (Test-Path $pipPath) {
+            Remove-Item $pipPath -Force -ErrorAction SilentlyContinue
+            # Also remove the -script.py and .exe.manifest variants
+            $pipDir = Split-Path $pipPath
+            Remove-Item "$pipDir\orchestratia-agent-script.py" -Force -ErrorAction SilentlyContinue
+            Remove-Item "$pipDir\orchestratia.exe" -Force -ErrorAction SilentlyContinue
+            Remove-Item "$pipDir\orchestratia-script.py" -Force -ErrorAction SilentlyContinue
+            Write-Ok "Cleaned up leftover pip script files"
+        }
+    } else {
+        # It's some other installation (manual copy, etc.)
+        Write-Warn "Found unknown installation at: $pipPath — remove it manually if needed"
+    }
+}
+
+# 1g. Remove old config if it exists (but preserve api_key if already registered)
+if (Test-Path "$ConfigDir\config.yaml") {
+    # Keep the old config — registration will overwrite it anyway
+    Write-Info "Existing config.yaml found (will be updated during registration)"
 }
 
 if (-not $existing) { Write-Ok "No existing installation found" }
@@ -169,7 +237,7 @@ if ($build -ge 17763) {
 Write-Info "Downloading from: $ReleaseUrl"
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $ReleaseUrl -OutFile $AgentExePath -UseBasicParsing -TimeoutSec 60
+    Invoke-WebRequest -Uri $ReleaseUrl -OutFile $AgentExePath -UseBasicParsing -TimeoutSec 120
     $size = (Get-Item $AgentExePath).Length
     $sizeMB = [math]::Round($size / 1MB, 1)
     Write-Ok "Downloaded orchestratia-agent.exe ($sizeMB MB)"
@@ -177,7 +245,7 @@ try {
     Write-Fatal "Download failed: $_`n  URL: $ReleaseUrl"
 }
 
-# Verify it runs
+# Verify it runs and show version
 try {
     $ver = & $AgentExePath --version 2>&1
     Write-Ok "Verified: $ver"
@@ -207,8 +275,38 @@ if (Test-Path "$ConfigDir\config.yaml") {
     Write-Fatal "Registration did not create config. Cannot start service."
 }
 
-# Step 4: Auto-start setup (Task Scheduler — runs as current user)
-Write-Step 4 $TotalSteps "Setting up auto-start"
+# Step 4: Add to user PATH
+Write-Step 4 $TotalSteps "Adding to user PATH"
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -and $userPath.Split(";") -contains $ConfigDir) {
+    Write-Ok "Already in PATH: $ConfigDir"
+} else {
+    try {
+        $newPath = if ($userPath) { "$userPath;$ConfigDir" } else { $ConfigDir }
+        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+        # Also update current session so orchestratia-agent works immediately
+        $env:Path = "$env:Path;$ConfigDir"
+        Write-Ok "Added to user PATH: $ConfigDir"
+    } catch {
+        Write-Warn "Could not add to PATH: $_"
+        Write-Info "Run manually: [Environment]::SetEnvironmentVariable('Path', `"$userPath;$ConfigDir`", 'User')"
+    }
+}
+
+# Verify that orchestratia-agent now resolves to our exe
+$resolvedCmd = Get-Command "orchestratia-agent" -ErrorAction SilentlyContinue
+if ($resolvedCmd -and $resolvedCmd.Source -eq $AgentExePath) {
+    Write-Ok "Verified: 'orchestratia-agent' resolves to $AgentExePath"
+} elseif ($resolvedCmd) {
+    Write-Warn "'orchestratia-agent' resolves to $($resolvedCmd.Source) instead of $AgentExePath"
+    Write-Info "An old installation may still be in PATH. Remove it or reorder PATH entries."
+} else {
+    Write-Info "Open a new PowerShell window for PATH changes to take effect"
+}
+
+# Step 5: Auto-start setup (Task Scheduler — runs as current user)
+Write-Step 5 $TotalSteps "Setting up auto-start"
 
 # Task Scheduler runs the agent as the current user, which is essential:
 # - ConPTY sessions need a user profile (SYSTEM can't spawn shells)
@@ -301,6 +399,8 @@ Write-Host ""
 Write-Host "  Installed to: $AgentExePath" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Useful commands:" -ForegroundColor DarkGray
+Write-Host "    Version:  orchestratia-agent --version"
+Write-Host "    Test PTY: orchestratia-agent --test-pty"
 Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"
 Write-Host "    Start:    schtasks /Run /TN OrchestratiAgent"
 Write-Host "    Stop:     schtasks /End /TN OrchestratiAgent"

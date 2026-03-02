@@ -625,25 +625,22 @@ async def ws_connection_loop(state: DaemonState):
 
 
 async def cleanup_sessions(state: DaemonState):
-    """Cleanup on daemon shutdown."""
+    """Cleanup on daemon shutdown.
+
+    tmux sessions are intentionally LEFT ALIVE so they survive daemon
+    restarts.  On next startup, report_alive_sessions() will discover
+    and reattach to them.  Only non-tmux (plain PTY) sessions are
+    terminated, since they cannot outlive the daemon anyway.
+    """
     backend = state.backend
     for session_id, session in list(state.active_sessions.items()):
+        if session.reader_task:
+            session.reader_task.cancel()
         if session.tmux_name:
             log.info(f"Detaching from tmux session {session.tmux_name} ({session_id[:8]})")
-            if session.reader_task:
-                session.reader_task.cancel()
             backend.close_handle(session.handle)
-            # Kill the tmux client process, NOT the server
-            if sys.platform != "win32":
-                import signal as _signal
-                try:
-                    import os as _os
-                    _os.kill(session.pid, _signal.SIGTERM)
-                except (OSError, ProcessLookupError):
-                    pass
+            # Do NOT kill the tmux session — let it survive for recovery
         else:
             log.info(f"Closing plain session {session_id[:8]}")
             session.close_graceful()
-            if session.reader_task:
-                session.reader_task.cancel()
     state.active_sessions.clear()

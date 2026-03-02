@@ -301,35 +301,61 @@ def _test_pty():
             try:
                 proc = ConPtyProcess.spawn(shell_cmd, cols=80, rows=25)
                 print(f"  PID: {proc.pid}")
+                print(f"  Handles: out_read=0x{proc._output_read.value or 0:X}, in_write=0x{proc._input_write.value or 0:X}")
                 time.sleep(1)
                 alive = proc.isalive()
                 print(f"  Alive after 1s: {alive}")
 
+                # Check for conhost.exe child process
+                try:
+                    import subprocess as _sp
+                    result = _sp.run(
+                        f'wmic process where (ParentProcessId={os.getpid()}) get Name,ProcessId /format:list',
+                        capture_output=True, text=True, timeout=5
+                    )
+                    conhosts = [l for l in result.stdout.splitlines() if 'conhost' in l.lower()]
+                    if conhosts:
+                        print(f"  conhost.exe child: YES ({'; '.join(l.strip() for l in conhosts if l.strip())})")
+                    else:
+                        print(f"  conhost.exe child: NOT FOUND (ConPTY may not have started)")
+                except Exception:
+                    print(f"  conhost.exe check: skipped")
+
                 if alive:
-                    # Check pipe with PeekNamedPipe before attempting blocking read
-                    print(f"  Checking output pipe...")
-                    for attempt in range(10):
+                    # Phase 1: Check pipe for spontaneous output (shell banner/prompt)
+                    print(f"  Phase 1: Checking for shell banner output...")
+                    avail = 0
+                    for attempt in range(6):
                         avail = proc.peek()
-                        print(f"    PeekNamedPipe attempt {attempt+1}: {avail} bytes available")
-                        if avail > 0:
-                            break
-                        if avail < 0:
-                            print(f"    PeekNamedPipe failed (pipe error)")
+                        if avail > 0 or avail < 0:
                             break
                         time.sleep(0.5)
+                    print(f"    After 3s: {avail} bytes available")
 
+                    # Phase 2: Write input to trigger output
+                    if avail == 0:
+                        print(f"  Phase 2: Writing 'echo hello' to input pipe...")
+                        try:
+                            proc.write("echo hello\r\n")
+                            time.sleep(2)
+                            avail = proc.peek()
+                            print(f"    After write + 2s: {avail} bytes available")
+                        except Exception as e:
+                            print(f"    Write failed: {e}")
+
+                    # Phase 3: Try reading
                     if avail > 0:
                         try:
                             data = proc.read(4096)
-                            print(f"  Read {len(data)} chars: {data[:100]!r}")
+                            print(f"  Read {len(data)} chars: {data[:200]!r}")
                             print(f"  PASS: {shell_name} native ConPTY works")
                         except Exception as e:
                             print(f"  Read error: {e}")
                     elif avail == 0:
-                        print(f"  FAIL: Process alive but no output after 5s (pipe empty)")
-                        print(f"  Hint: ConPTY may not be routing output to the pipe")
+                        print(f"  FAIL: No output even after writing to input pipe")
+                        print(f"  ConPTY created but I/O not routing through pipes")
                     else:
-                        print(f"  FAIL: Pipe error — handle may be invalid")
+                        print(f"  FAIL: Pipe error (PeekNamedPipe returned FALSE)")
 
                     proc.terminate(force=True)
                     proc.close()
@@ -342,9 +368,13 @@ def _test_pty():
                         print()
                     proc.close()
             except Exception as e:
+                import traceback
                 print(f"  FAIL: {e}")
+                traceback.print_exc()
     except Exception as e:
+        import traceback
         print(f"  FAIL: {e}")
+        traceback.print_exc()
     print()
     print("Diagnostic complete.")
 

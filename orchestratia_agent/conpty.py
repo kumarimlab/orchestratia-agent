@@ -81,14 +81,9 @@ class PROCESS_INFORMATION(ctypes.Structure):
 
 
 # ── API prototypes ───────────────────────────────────────────────────
-# Setting argtypes for ALL kernel32 functions we use is critical on
-# 64-bit Windows. Without argtypes, ctypes defaults to c_int (32-bit)
-# for integer arguments, which truncates 64-bit HANDLE values and
-# causes silent failures (e.g. ReadFile blocking forever on an invalid
-# handle).
-
-# COORD is a 4-byte struct (SHORT X, SHORT Y) passed by value.
-# We pack it as a DWORD: cols (X) in low 16 bits, rows (Y) in high 16 bits.
+# Setting argtypes for ALL kernel32 functions is critical on 64-bit
+# Windows. Without argtypes, ctypes defaults to c_int (32-bit) for
+# integer arguments, which can truncate 64-bit HANDLE values.
 
 kernel32.CreatePseudoConsole.restype = wt.LONG  # HRESULT
 kernel32.CreatePseudoConsole.argtypes = [
@@ -117,78 +112,49 @@ kernel32.UpdateProcThreadAttribute.argtypes = [
 kernel32.DeleteProcThreadAttributeList.restype = None
 kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
 
-# Pipe creation
 kernel32.CreatePipe.restype = wt.BOOL
 kernel32.CreatePipe.argtypes = [
     ctypes.POINTER(wt.HANDLE),  # hReadPipe
     ctypes.POINTER(wt.HANDLE),  # hWritePipe
-    ctypes.c_void_p,            # lpPipeAttributes (SECURITY_ATTRIBUTES*)
+    ctypes.POINTER(SECURITY_ATTRIBUTES),  # lpPipeAttributes
     wt.DWORD,                   # nSize
 ]
 
-# File I/O — HANDLE args must be typed to prevent 64-bit truncation
 kernel32.ReadFile.restype = wt.BOOL
 kernel32.ReadFile.argtypes = [
-    wt.HANDLE,                  # hFile
-    ctypes.c_void_p,            # lpBuffer
-    wt.DWORD,                   # nNumberOfBytesToRead
-    ctypes.POINTER(wt.DWORD),   # lpNumberOfBytesRead
-    ctypes.c_void_p,            # lpOverlapped
+    wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+    ctypes.POINTER(wt.DWORD), ctypes.c_void_p,
 ]
 
 kernel32.WriteFile.restype = wt.BOOL
 kernel32.WriteFile.argtypes = [
-    wt.HANDLE,                  # hFile
-    ctypes.c_void_p,            # lpBuffer
-    wt.DWORD,                   # nNumberOfBytesToWrite
-    ctypes.POINTER(wt.DWORD),   # lpNumberOfBytesWritten
-    ctypes.c_void_p,            # lpOverlapped
+    wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+    ctypes.POINTER(wt.DWORD), ctypes.c_void_p,
 ]
 
 kernel32.PeekNamedPipe.restype = wt.BOOL
 kernel32.PeekNamedPipe.argtypes = [
-    wt.HANDLE,                  # hNamedPipe
-    ctypes.c_void_p,            # lpBuffer
-    wt.DWORD,                   # nBufferSize
-    ctypes.POINTER(wt.DWORD),   # lpBytesRead
-    ctypes.POINTER(wt.DWORD),   # lpTotalBytesAvail
-    ctypes.POINTER(wt.DWORD),   # lpBytesLeftThisMessage
+    wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+    ctypes.POINTER(wt.DWORD), ctypes.POINTER(wt.DWORD),
+    ctypes.POINTER(wt.DWORD),
 ]
 
-# Process management
 kernel32.CreateProcessW.restype = wt.BOOL
 kernel32.CreateProcessW.argtypes = [
-    wt.LPCWSTR,                 # lpApplicationName
-    wt.LPWSTR,                  # lpCommandLine
-    ctypes.c_void_p,            # lpProcessAttributes
-    ctypes.c_void_p,            # lpThreadAttributes
-    wt.BOOL,                    # bInheritHandles
-    wt.DWORD,                   # dwCreationFlags
-    ctypes.c_void_p,            # lpEnvironment
-    wt.LPCWSTR,                 # lpCurrentDirectory
-    ctypes.c_void_p,            # lpStartupInfo
-    ctypes.POINTER(PROCESS_INFORMATION),  # lpProcessInformation
+    wt.LPCWSTR, wt.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+    wt.BOOL, wt.DWORD, ctypes.c_void_p, wt.LPCWSTR,
+    ctypes.c_void_p, ctypes.POINTER(PROCESS_INFORMATION),
 ]
 
 kernel32.GetExitCodeProcess.restype = wt.BOOL
-kernel32.GetExitCodeProcess.argtypes = [
-    wt.HANDLE,                  # hProcess
-    ctypes.POINTER(wt.DWORD),   # lpExitCode
-]
+kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
 
 kernel32.TerminateProcess.restype = wt.BOOL
-kernel32.TerminateProcess.argtypes = [
-    wt.HANDLE,                  # hProcess
-    wt.UINT,                    # uExitCode
-]
+kernel32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
 
 kernel32.WaitForSingleObject.restype = wt.DWORD
-kernel32.WaitForSingleObject.argtypes = [
-    wt.HANDLE,                  # hHandle
-    wt.DWORD,                   # dwMilliseconds
-]
+kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
 
-# Handle management
 kernel32.CloseHandle.restype = wt.BOOL
 kernel32.CloseHandle.argtypes = [wt.HANDLE]
 
@@ -213,6 +179,9 @@ class ConPtyProcess:
         self._process_handle: wt.HANDLE | None = None
         self._input_write: wt.HANDLE | None = None
         self._output_read: wt.HANDLE | None = None
+        # Keep references to objects that must stay alive for the ConPTY
+        self._attr_buf = None
+        self._hpc_ref = None
         self.pid: int = 0
         self._exit_code: int | None = None
 
@@ -239,30 +208,39 @@ class ConPtyProcess:
         self = cls()
 
         # ── 1. Create pipes ──────────────────────────────────────────
-        # Input:  we write → pipe_in_write → [ConPTY] → child stdin
-        # Output: child stdout → [ConPTY] → pipe_out_write → pipe_out_read → we read
+        # Use SECURITY_ATTRIBUTES with bInheritHandle=TRUE.
+        # While the Microsoft sample passes NULL, some Windows 11 builds
+        # require inheritable handles for the ConPTY to properly duplicate
+        # and use the pipe ends internally.
+        sa = SECURITY_ATTRIBUTES()
+        sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+        sa.lpSecurityDescriptor = None
+        sa.bInheritHandle = True
+
         pipe_in_read = wt.HANDLE()
         pipe_in_write = wt.HANDLE()
         pipe_out_read = wt.HANDLE()
         pipe_out_write = wt.HANDLE()
 
         if not kernel32.CreatePipe(
-            ctypes.byref(pipe_in_read), ctypes.byref(pipe_in_write), None, 0
+            ctypes.byref(pipe_in_read), ctypes.byref(pipe_in_write),
+            ctypes.byref(sa), 0
         ):
             raise ctypes.WinError()
 
         if not kernel32.CreatePipe(
-            ctypes.byref(pipe_out_read), ctypes.byref(pipe_out_write), None, 0
+            ctypes.byref(pipe_out_read), ctypes.byref(pipe_out_write),
+            ctypes.byref(sa), 0
         ):
             kernel32.CloseHandle(pipe_in_read)
             kernel32.CloseHandle(pipe_in_write)
             raise ctypes.WinError()
 
         log.debug(
-            f"ConPTY pipes created: in_read=0x{pipe_in_read.value or 0:X}, "
-            f"in_write=0x{pipe_in_write.value or 0:X}, "
-            f"out_read=0x{pipe_out_read.value or 0:X}, "
-            f"out_write=0x{pipe_out_write.value or 0:X}"
+            f"ConPTY pipes: in_r=0x{pipe_in_read.value or 0:X} "
+            f"in_w=0x{pipe_in_write.value or 0:X} "
+            f"out_r=0x{pipe_out_read.value or 0:X} "
+            f"out_w=0x{pipe_out_write.value or 0:X}"
         )
 
         # ── 2. Create pseudo-console ─────────────────────────────────
@@ -280,9 +258,10 @@ class ConPtyProcess:
                 kernel32.CloseHandle(h)
             raise OSError(f"CreatePseudoConsole failed: HRESULT 0x{hr:08X}")
 
-        log.debug(f"ConPTY pseudo-console created: hpc=0x{hpc.value or 0:X}")
+        log.debug(f"ConPTY hpc=0x{hpc.value or 0:X}")
 
-        # Pseudo-console now owns these pipe ends — close our copies
+        # Close the pipe ends that the pseudo-console now owns.
+        # ConPTY internally duplicates these handles.
         kernel32.CloseHandle(pipe_in_read)
         kernel32.CloseHandle(pipe_out_write)
 
@@ -299,7 +278,10 @@ class ConPtyProcess:
             kernel32.CloseHandle(pipe_out_read)
             raise ctypes.WinError()
 
-        # Store HPCON in a ctypes pointer so we can pass its address
+        # Store HPCON in a ctypes handle so we can pass its address.
+        # CRITICAL: keep a reference to both attr_buf and hpc_ref on self
+        # so they are NOT garbage collected while the process is running.
+        # UpdateProcThreadAttribute stores a POINTER to hpc_ref, not a copy.
         hpc_ref = wt.HANDLE(hpc.value)
         if not kernel32.UpdateProcThreadAttribute(
             attr_buf,
@@ -323,12 +305,11 @@ class ConPtyProcess:
 
         pi = PROCESS_INFORMATION()
 
-        # CreateProcessW requires a mutable command-line buffer
         cmd_buf = ctypes.create_unicode_buffer(command)
 
         success = kernel32.CreateProcessW(
             None,                          # lpApplicationName
-            cmd_buf,                       # lpCommandLine (mutable)
+            cmd_buf,                       # lpCommandLine
             None,                          # lpProcessAttributes
             None,                          # lpThreadAttributes
             False,                         # bInheritHandles
@@ -339,6 +320,7 @@ class ConPtyProcess:
             ctypes.byref(pi),              # lpProcessInformation
         )
 
+        # Clean up attribute list AFTER CreateProcessW
         kernel32.DeleteProcThreadAttributeList(attr_buf)
 
         if not success:
@@ -348,21 +330,22 @@ class ConPtyProcess:
             kernel32.CloseHandle(pipe_out_read)
             raise err
 
-        # Close thread handle — we only need the process handle
         kernel32.CloseHandle(pi.hThread)
 
-        # Store handles as wt.HANDLE objects to preserve 64-bit type info
         self._hpc = wt.HANDLE(hpc.value)
         self._process_handle = wt.HANDLE(pi.hProcess)
         self._input_write = wt.HANDLE(pipe_in_write.value)
         self._output_read = wt.HANDLE(pipe_out_read.value)
         self.pid = pi.dwProcessId
+        # Prevent GC of objects that the attribute list pointed to
+        self._attr_buf = attr_buf
+        self._hpc_ref = hpc_ref
 
         log.debug(
-            f"ConPTY process created: pid={self.pid}, "
-            f"process_handle=0x{pi.hProcess or 0:X}, "
-            f"input_write=0x{pipe_in_write.value or 0:X}, "
-            f"output_read=0x{pipe_out_read.value or 0:X}"
+            f"ConPTY process pid={self.pid} "
+            f"proc=0x{pi.hProcess or 0:X} "
+            f"in=0x{pipe_in_write.value or 0:X} "
+            f"out=0x{pipe_out_read.value or 0:X}"
         )
 
         return self
@@ -376,7 +359,7 @@ class ConPtyProcess:
             self._output_read, None, 0, None, ctypes.byref(available), None,
         )
         if not success:
-            return -1  # pipe error
+            return -1
         return available.value
 
     def read(self, size: int = 4096) -> str:
@@ -444,6 +427,8 @@ class ConPtyProcess:
         if self._process_handle:
             kernel32.CloseHandle(self._process_handle)
             self._process_handle = None
+        self._attr_buf = None
+        self._hpc_ref = None
 
     def __del__(self) -> None:
         self.close()

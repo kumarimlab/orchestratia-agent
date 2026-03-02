@@ -288,89 +288,175 @@ def _test_pty():
         print(f"  FAIL: {e}")
     print()
 
-    # Test 4: Native ConPTY via ctypes (our implementation)
+    # Test 4: Native ConPTY via ctypes — structure validation
     print("=" * 60)
-    print("TEST 4: Native ConPTY via ctypes (conpty.py)")
+    print("TEST 4: ConPTY structure sizes (alignment check)")
+    print("=" * 60)
+    try:
+        import ctypes
+        from orchestratia_agent.conpty import (
+            STARTUPINFOW, STARTUPINFOEX, PROCESS_INFORMATION,
+            SECURITY_ATTRIBUTES, ConPtyProcess,
+        )
+        si_size = ctypes.sizeof(STARTUPINFOW)
+        siex_size = ctypes.sizeof(STARTUPINFOEX)
+        pi_size = ctypes.sizeof(PROCESS_INFORMATION)
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        print(f"  sizeof(c_void_p) = {ptr_size} ({'64-bit' if ptr_size == 8 else '32-bit'})")
+        print(f"  sizeof(STARTUPINFOW) = {si_size} (expected: 104 on x64, 68 on x86)")
+        print(f"  sizeof(STARTUPINFOEX) = {siex_size} (expected: 112 on x64, 72 on x86)")
+        print(f"  sizeof(PROCESS_INFORMATION) = {pi_size} (expected: 24 on x64, 16 on x86)")
+        # Verify expected sizes
+        if ptr_size == 8:
+            ok = si_size == 104 and siex_size == 112 and pi_size == 24
+        else:
+            ok = si_size == 68 and siex_size == 72 and pi_size == 16
+        print(f"  {'PASS' if ok else 'FAIL'}: Structure sizes {'match' if ok else 'MISMATCH'}")
+    except Exception as e:
+        print(f"  FAIL: {e}")
+    print()
+
+    # Test 5: ConPTY with deterministic command (cmd /c echo)
+    print("=" * 60)
+    print("TEST 5: ConPTY with 'cmd /c echo' (deterministic output)")
     print("=" * 60)
     try:
         from orchestratia_agent.conpty import ConPtyProcess
-        print("  conpty module imported OK")
+        print("  Spawning: cmd.exe /c echo ConPTY_WORKS && exit /b 0")
+        proc = ConPtyProcess.spawn("cmd.exe /c echo ConPTY_WORKS", cols=80, rows=25)
+        print(f"  PID: {proc.pid}")
 
-        for shell_name, shell_cmd in [("cmd.exe", "cmd.exe"), ("powershell", "powershell.exe")]:
-            print(f"\n  --- Spawning {shell_name} ---")
-            try:
-                proc = ConPtyProcess.spawn(shell_cmd, cols=80, rows=25)
-                print(f"  PID: {proc.pid}")
-                print(f"  Handles: out_read=0x{proc._output_read.value or 0:X}, in_write=0x{proc._input_write.value or 0:X}")
-                time.sleep(1)
-                alive = proc.isalive()
-                print(f"  Alive after 1s: {alive}")
+        # Wait for process to finish (it should exit quickly)
+        for i in range(20):
+            if not proc.isalive():
+                break
+            time.sleep(0.25)
 
-                # Check for conhost.exe child process
-                try:
-                    import subprocess as _sp
-                    result = _sp.run(
-                        f'wmic process where (ParentProcessId={os.getpid()}) get Name,ProcessId /format:list',
-                        capture_output=True, text=True, timeout=5
-                    )
-                    conhosts = [l for l in result.stdout.splitlines() if 'conhost' in l.lower()]
-                    if conhosts:
-                        print(f"  conhost.exe child: YES ({'; '.join(l.strip() for l in conhosts if l.strip())})")
-                    else:
-                        print(f"  conhost.exe child: NOT FOUND (ConPTY may not have started)")
-                except Exception:
-                    print(f"  conhost.exe check: skipped")
+        alive = proc.isalive()
+        exit_code = proc.exitstatus
+        print(f"  Alive after 5s: {alive}, exit_code: {exit_code}")
 
-                if alive:
-                    # Phase 1: Check pipe for spontaneous output (shell banner/prompt)
-                    print(f"  Phase 1: Checking for shell banner output...")
-                    avail = 0
-                    for attempt in range(6):
-                        avail = proc.peek()
-                        if avail > 0 or avail < 0:
-                            break
-                        time.sleep(0.5)
-                    print(f"    After 3s: {avail} bytes available")
+        # Check pipe
+        avail = proc.peek()
+        print(f"  Bytes in output pipe: {avail}")
 
-                    # Phase 2: Write input to trigger output
-                    if avail == 0:
-                        print(f"  Phase 2: Writing 'echo hello' to input pipe...")
-                        try:
-                            proc.write("echo hello\r\n")
-                            time.sleep(2)
-                            avail = proc.peek()
-                            print(f"    After write + 2s: {avail} bytes available")
-                        except Exception as e:
-                            print(f"    Write failed: {e}")
+        if avail > 0:
+            data = proc.read(avail)
+            print(f"  Output: {data!r}")
+            if "ConPTY_WORKS" in data:
+                print(f"  PASS: ConPTY I/O works!")
+            else:
+                print(f"  PARTIAL: Got output but not expected string")
+        else:
+            print(f"  FAIL: No output in pipe (ConPTY not routing)")
 
-                    # Phase 3: Try reading
-                    if avail > 0:
-                        try:
-                            data = proc.read(4096)
-                            print(f"  Read {len(data)} chars: {data[:200]!r}")
-                            print(f"  PASS: {shell_name} native ConPTY works")
-                        except Exception as e:
-                            print(f"  Read error: {e}")
-                    elif avail == 0:
-                        print(f"  FAIL: No output even after writing to input pipe")
-                        print(f"  ConPTY created but I/O not routing through pipes")
-                    else:
-                        print(f"  FAIL: Pipe error (PeekNamedPipe returned FALSE)")
+        proc.close()
+    except Exception as e:
+        import traceback
+        print(f"  FAIL: {e}")
+        traceback.print_exc()
+    print()
 
-                    proc.terminate(force=True)
-                    proc.close()
-                else:
-                    exit_code = proc.exitstatus
-                    print(f"  FAIL: Died immediately, exit_code={exit_code}", end="")
-                    if exit_code:
-                        print(f" (0x{exit_code:08X})")
-                    else:
-                        print()
-                    proc.close()
-            except Exception as e:
-                import traceback
-                print(f"  FAIL: {e}")
-                traceback.print_exc()
+    # Test 6: Raw pipe self-test (verify pipe itself works)
+    print("=" * 60)
+    print("TEST 6: Raw pipe self-test (no ConPTY)")
+    print("=" * 60)
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        _k32 = ctypes.windll.kernel32
+
+        _k32.CreatePipe.restype = wt.BOOL
+        _k32.CreatePipe.argtypes = [
+            ctypes.POINTER(wt.HANDLE), ctypes.POINTER(wt.HANDLE),
+            ctypes.c_void_p, wt.DWORD,
+        ]
+        _k32.WriteFile.restype = wt.BOOL
+        _k32.WriteFile.argtypes = [
+            wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+            ctypes.POINTER(wt.DWORD), ctypes.c_void_p,
+        ]
+        _k32.ReadFile.restype = wt.BOOL
+        _k32.ReadFile.argtypes = [
+            wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+            ctypes.POINTER(wt.DWORD), ctypes.c_void_p,
+        ]
+        _k32.PeekNamedPipe.restype = wt.BOOL
+        _k32.PeekNamedPipe.argtypes = [
+            wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+            ctypes.POINTER(wt.DWORD), ctypes.POINTER(wt.DWORD),
+            ctypes.POINTER(wt.DWORD),
+        ]
+        _k32.CloseHandle.restype = wt.BOOL
+        _k32.CloseHandle.argtypes = [wt.HANDLE]
+
+        r = wt.HANDLE()
+        w = wt.HANDLE()
+        if not _k32.CreatePipe(ctypes.byref(r), ctypes.byref(w), None, 0):
+            raise ctypes.WinError()
+
+        test_msg = b"PIPE_TEST_12345"
+        written = wt.DWORD()
+        _k32.WriteFile(w, test_msg, len(test_msg), ctypes.byref(written), None)
+        print(f"  Wrote {written.value} bytes to pipe")
+
+        avail = wt.DWORD()
+        _k32.PeekNamedPipe(r, None, 0, None, ctypes.byref(avail), None)
+        print(f"  PeekNamedPipe: {avail.value} bytes available")
+
+        buf = ctypes.create_string_buffer(4096)
+        bytes_read = wt.DWORD()
+        _k32.ReadFile(r, buf, 4096, ctypes.byref(bytes_read), None)
+        result = buf.raw[:bytes_read.value]
+        print(f"  Read: {result!r}")
+
+        _k32.CloseHandle(r)
+        _k32.CloseHandle(w)
+
+        if result == test_msg:
+            print(f"  PASS: Pipes work correctly")
+        else:
+            print(f"  FAIL: Read data doesn't match written data")
+    except Exception as e:
+        print(f"  FAIL: {e}")
+    print()
+
+    # Test 7: ConPTY interactive shell with deferred pipe close
+    print("=" * 60)
+    print("TEST 7: ConPTY interactive shell")
+    print("=" * 60)
+    try:
+        from orchestratia_agent.conpty import ConPtyProcess
+        proc = ConPtyProcess.spawn("cmd.exe", cols=80, rows=25)
+        print(f"  PID: {proc.pid}")
+        print(f"  Handles: hpc=0x{proc._hpc.value or 0:X}, out=0x{proc._output_read.value or 0:X}, in=0x{proc._input_write.value or 0:X}")
+
+        # Wait longer for shell startup
+        print(f"  Waiting 8s for shell to produce output...")
+        for i in range(16):
+            avail = proc.peek()
+            if avail > 0:
+                print(f"    [{i*0.5:.1f}s] {avail} bytes available!")
+                break
+            time.sleep(0.5)
+        else:
+            print(f"    [8.0s] Still 0 bytes")
+
+        if avail > 0:
+            data = proc.read(avail)
+            print(f"  Output: {data[:200]!r}")
+            print(f"  PASS: ConPTY shell works!")
+        else:
+            # Last resort: check if ResizePseudoConsole works (validates hpc)
+            import ctypes.wintypes as wt
+            from orchestratia_agent.conpty import kernel32 as _k32, _pack_coord
+            hr = _k32.ResizePseudoConsole(proc._hpc, _pack_coord(81, 26))
+            print(f"  ResizePseudoConsole returned: 0x{hr:08X} ({'OK' if hr == 0 else 'FAIL'})")
+            print(f"  Process alive: {proc.isalive()}")
+            print(f"  FAIL: Shell alive but no output through ConPTY pipes")
+
+        proc.terminate(force=True)
+        proc.close()
     except Exception as e:
         import traceback
         print(f"  FAIL: {e}")

@@ -117,6 +117,12 @@ async def main():
     log.info(f"Platform: {platform.system()} {platform.release()}")
     log.info(f"Session backend: {type(state.backend).__name__}")
     log.info(f"Persistence: {'yes (tmux)' if state.backend.supports_persistence() else 'no'}")
+    if sys.platform == "win32":
+        try:
+            from orchestratia_agent.conpty import _use_bundled
+            log.info(f"ConPTY: {'bundled conpty.dll + OpenConsole.exe' if _use_bundled else 'kernel32 (system conhost.exe)'}")
+        except ImportError:
+            pass
 
     async with httpx.AsyncClient(timeout=30) as client:
         key = await register_with_hub(client, state)
@@ -196,12 +202,39 @@ def _test_pty():
     print(f"OS build: {sys.getwindowsversion().build if sys.platform == 'win32' else 'N/A'}")
     print(f"Python: {sys.version}")
     print(f"Executable: {sys.executable}")
+    print(f"Frozen: {getattr(sys, 'frozen', False)}")
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        print(f"_MEIPASS: {meipass}")
     print(f"CWD: {os.getcwd()}")
     print()
 
     if sys.platform != "win32":
         print("This test is Windows-only.")
         return
+
+    # Test 0: Bundled ConPTY DLL detection
+    print("=" * 60)
+    print("TEST 0: Bundled ConPTY DLL detection")
+    print("=" * 60)
+    try:
+        from orchestratia_agent.conpty import (
+            _use_bundled, _conpty_dll, _find_bundled_conpty_dll,
+        )
+        dll_path = _find_bundled_conpty_dll()
+        print(f"  Bundled conpty.dll found: {dll_path or 'NOT FOUND'}")
+        print(f"  Using bundled DLL: {_use_bundled}")
+        if _use_bundled:
+            dll_dir = os.path.dirname(dll_path)
+            openconsole = os.path.join(dll_dir, "OpenConsole.exe")
+            print(f"  OpenConsole.exe: {openconsole} (exists: {os.path.isfile(openconsole)})")
+            print(f"  PASS: Bundled ConPTY will bypass system conhost.exe")
+        else:
+            print(f"  INFO: Will use kernel32 (system conhost.exe)")
+            print(f"  NOTE: If ConPTY tests fail below, bundle conpty.dll + OpenConsole.exe")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+    print()
 
     # Test 1: Basic subprocess (no ConPTY)
     print("=" * 60)

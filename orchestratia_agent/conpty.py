@@ -3,7 +3,15 @@
 Replaces pywinpty, which fails in PyInstaller-bundled executables on
 Windows 11 24H2+ due to handle lifecycle issues in the .pyd extension.
 
-Uses the Windows Pseudo Console API directly through kernel32.dll.
+**Primary path**: Loads a bundled `conpty.dll` + `OpenConsole.exe` from the
+Windows Terminal project (MIT-licensed). This bypasses the system conhost.exe,
+which has a bug on Win 11 24H2/25H2 where child processes crash with
+STATUS_DLL_INIT_FAILED (0xC0000142) when launched via ConPTY.
+
+**Fallback path**: If the bundled DLL is not found, falls back to
+kernel32.CreatePseudoConsole (system conhost.exe). This works on older
+Windows 10/11 builds that don't have the conhost bug.
+
 Requires Windows 10 build 17763+ (version 1809).
 """
 
@@ -12,6 +20,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import logging
+import os
 import sys
 import time
 
@@ -80,23 +89,114 @@ class PROCESS_INFORMATION(ctypes.Structure):
     ]
 
 
-# ── API prototypes ───────────────────────────────────────────────────
-# Setting argtypes for ALL kernel32 functions is critical on 64-bit
-# Windows. Without argtypes, ctypes defaults to c_int (32-bit) for
-# integer arguments, which can truncate 64-bit HANDLE values.
+# ── Load bundled conpty.dll or fall back to kernel32 ─────────────────
 
-kernel32.CreatePseudoConsole.restype = wt.LONG  # HRESULT
-kernel32.CreatePseudoConsole.argtypes = [
+def _find_bundled_conpty_dll() -> str | None:
+    """Locate bundled conpty.dll relative to the running executable/script.
+
+    Search order:
+      1. <exe_dir>/conpty/conpty.dll  (PyInstaller one-file: _MEIPASS temp dir)
+      2. <script_dir>/conpty/conpty.dll  (development / pip install)
+      3. <exe_dir>/conpty.dll  (flat layout)
+      4. <script_dir>/conpty.dll  (flat layout)
+    """
+    search_roots = []
+
+    # PyInstaller sets sys._MEIPASS to the temp extraction directory
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        search_roots.append(meipass)
+
+    # Directory of the running executable (for PyInstaller one-dir or frozen)
+    if getattr(sys, "frozen", False):
+        search_roots.append(os.path.dirname(sys.executable))
+
+    # Directory of this source file (for development / pip install)
+    search_roots.append(os.path.dirname(os.path.abspath(__file__)))
+
+    for root in search_roots:
+        # Try conpty/ subdirectory first (matches node-pty layout)
+        candidate = os.path.join(root, "conpty", "conpty.dll")
+        if os.path.isfile(candidate):
+            return candidate
+        # Try flat layout
+        candidate = os.path.join(root, "conpty.dll")
+        if os.path.isfile(candidate):
+            return candidate
+
+    return None
+
+
+def _load_conpty_library():
+    """Load the ConPTY library — bundled conpty.dll preferred, kernel32 fallback.
+
+    Returns (dll_handle, use_bundled: bool) tuple.
+    When use_bundled=True, function names have a "Conpty" prefix.
+    When use_bundled=False, function names are the standard Win32 API names.
+    """
+    dll_path = _find_bundled_conpty_dll()
+
+    if dll_path:
+        # Verify that OpenConsole.exe is alongside the DLL (required by conpty.dll)
+        dll_dir = os.path.dirname(dll_path)
+        openconsole = os.path.join(dll_dir, "OpenConsole.exe")
+        if not os.path.isfile(openconsole):
+            log.warning(
+                f"Found conpty.dll at {dll_path} but OpenConsole.exe is missing "
+                f"from {dll_dir} — falling back to kernel32 (system conhost.exe)"
+            )
+            return kernel32, False
+
+        try:
+            # Use LoadLibraryW so Windows resolves DLL dependencies from its directory
+            dll = ctypes.WinDLL(dll_path)
+            log.info(f"Loaded bundled conpty.dll from {dll_path}")
+            log.info(f"OpenConsole.exe found at {openconsole}")
+            return dll, True
+        except OSError as e:
+            log.warning(f"Failed to load bundled conpty.dll: {e} — falling back to kernel32")
+            return kernel32, False
+
+    log.info("Bundled conpty.dll not found — using kernel32 (system conhost.exe)")
+    return kernel32, False
+
+
+_conpty_dll, _use_bundled = _load_conpty_library()
+
+
+# ── API prototypes ───────────────────────────────────────────────────
+# Setting argtypes for ALL functions is critical on 64-bit Windows.
+# Without argtypes, ctypes defaults to c_int (32-bit) for integer
+# arguments, which can truncate 64-bit HANDLE values.
+#
+# When using bundled conpty.dll, function names have a "Conpty" prefix:
+#   CreatePseudoConsole  -> ConptyCreatePseudoConsole
+#   ResizePseudoConsole  -> ConptyResizePseudoConsole
+#   ClosePseudoConsole   -> ConptyClosePseudoConsole
+
+def _get_fn(name: str, conpty_name: str):
+    """Get function from the loaded DLL, using Conpty-prefixed name if bundled."""
+    if _use_bundled:
+        return getattr(_conpty_dll, conpty_name)
+    return getattr(_conpty_dll, name)
+
+
+_CreatePseudoConsole = _get_fn("CreatePseudoConsole", "ConptyCreatePseudoConsole")
+_CreatePseudoConsole.restype = wt.LONG  # HRESULT
+_CreatePseudoConsole.argtypes = [
     wt.DWORD, wt.HANDLE, wt.HANDLE, wt.DWORD,
     ctypes.POINTER(wt.HANDLE),
 ]
 
-kernel32.ResizePseudoConsole.restype = wt.LONG
-kernel32.ResizePseudoConsole.argtypes = [wt.HANDLE, wt.DWORD]
+_ResizePseudoConsole = _get_fn("ResizePseudoConsole", "ConptyResizePseudoConsole")
+_ResizePseudoConsole.restype = wt.LONG
+_ResizePseudoConsole.argtypes = [wt.HANDLE, wt.DWORD]
 
-kernel32.ClosePseudoConsole.restype = None
-kernel32.ClosePseudoConsole.argtypes = [wt.HANDLE]
+_ClosePseudoConsole = _get_fn("ClosePseudoConsole", "ConptyClosePseudoConsole")
+_ClosePseudoConsole.restype = None
+_ClosePseudoConsole.argtypes = [wt.HANDLE]
 
+# These always come from kernel32 (not part of the ConPTY DLL exports)
 kernel32.InitializeProcThreadAttributeList.restype = wt.BOOL
 kernel32.InitializeProcThreadAttributeList.argtypes = [
     ctypes.c_void_p, wt.DWORD, wt.DWORD, ctypes.POINTER(ctypes.c_size_t),
@@ -171,6 +271,10 @@ class ConPtyProcess:
     """A process running inside a Windows ConPTY pseudo-console.
 
     Pure ctypes implementation — zero dependency on pywinpty.
+    Uses bundled conpty.dll + OpenConsole.exe when available (bypasses
+    broken system conhost.exe on Win 11 24H2/25H2). Falls back to
+    kernel32 CreatePseudoConsole on older builds.
+
     API is compatible with pywinpty's PtyProcess for drop-in replacement.
     """
 
@@ -189,6 +293,7 @@ class ConPtyProcess:
         self._hpc_ref = None
         self.pid: int = 0
         self._exit_code: int | None = None
+        self.using_bundled_conpty: bool = _use_bundled
 
     @property
     def exitstatus(self) -> int | None:
@@ -241,8 +346,10 @@ class ConPtyProcess:
             kernel32.CloseHandle(pipe_in_write)
             raise ctypes.WinError()
 
+        conpty_mode = "bundled conpty.dll" if _use_bundled else "kernel32 (system conhost)"
         log.debug(
-            f"ConPTY pipes: in_r=0x{pipe_in_read.value or 0:X} "
+            f"ConPTY pipes ({conpty_mode}): "
+            f"in_r=0x{pipe_in_read.value or 0:X} "
             f"in_w=0x{pipe_in_write.value or 0:X} "
             f"out_r=0x{pipe_out_read.value or 0:X} "
             f"out_w=0x{pipe_out_write.value or 0:X}"
@@ -251,7 +358,7 @@ class ConPtyProcess:
         # ── 2. Create pseudo-console ─────────────────────────────────
         hpc = wt.HANDLE()
         coord = _pack_coord(cols, rows)
-        hr = kernel32.CreatePseudoConsole(
+        hr = _CreatePseudoConsole(
             coord,
             pipe_in_read,
             pipe_out_write,
@@ -263,7 +370,7 @@ class ConPtyProcess:
                 kernel32.CloseHandle(h)
             raise OSError(f"CreatePseudoConsole failed: HRESULT 0x{hr:08X}")
 
-        log.debug(f"ConPTY hpc=0x{hpc.value or 0:X}")
+        log.debug(f"ConPTY hpc=0x{hpc.value or 0:X} (via {'bundled DLL' if _use_bundled else 'kernel32'})")
 
         # IMPORTANT: Do NOT close pipe_in_read / pipe_out_write here.
         # On Windows 11 24H2 (build 26100+), CreatePseudoConsole does NOT
@@ -280,7 +387,7 @@ class ConPtyProcess:
         if not kernel32.InitializeProcThreadAttributeList(
             attr_buf, 1, 0, ctypes.byref(attr_size)
         ):
-            kernel32.ClosePseudoConsole(hpc)
+            _ClosePseudoConsole(hpc)
             for h in (pipe_in_read, pipe_in_write, pipe_out_read, pipe_out_write):
                 kernel32.CloseHandle(h)
             raise ctypes.WinError()
@@ -300,7 +407,7 @@ class ConPtyProcess:
             None,
         ):
             kernel32.DeleteProcThreadAttributeList(attr_buf)
-            kernel32.ClosePseudoConsole(hpc)
+            _ClosePseudoConsole(hpc)
             for h in (pipe_in_read, pipe_in_write, pipe_out_read, pipe_out_write):
                 kernel32.CloseHandle(h)
             raise ctypes.WinError()
@@ -332,7 +439,7 @@ class ConPtyProcess:
 
         if not success:
             err = ctypes.WinError()
-            kernel32.ClosePseudoConsole(hpc)
+            _ClosePseudoConsole(hpc)
             for h in (pipe_in_read, pipe_in_write, pipe_out_read, pipe_out_write):
                 kernel32.CloseHandle(h)
             raise err
@@ -416,7 +523,7 @@ class ConPtyProcess:
     def setwinsize(self, rows: int, cols: int) -> None:
         """Resize the pseudo-console."""
         if self._hpc:
-            kernel32.ResizePseudoConsole(self._hpc, _pack_coord(cols, rows))
+            _ResizePseudoConsole(self._hpc, _pack_coord(cols, rows))
 
     def terminate(self, force: bool = False) -> None:
         """Terminate the child process."""
@@ -426,7 +533,7 @@ class ConPtyProcess:
     def close(self) -> None:
         """Close all handles."""
         if self._hpc:
-            kernel32.ClosePseudoConsole(self._hpc)
+            _ClosePseudoConsole(self._hpc)
             self._hpc = None
         # Close ConPTY-side pipe ends AFTER ClosePseudoConsole
         if self._pty_input_read:

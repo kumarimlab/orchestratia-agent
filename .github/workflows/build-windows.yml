@@ -22,8 +22,33 @@ jobs:
           pip install pyinstaller
           pip install .
 
+      - name: Download bundled ConPTY (OpenConsole.exe + conpty.dll)
+        run: |
+          # Download conpty.dll and OpenConsole.exe from node-pty (MIT-licensed)
+          # These bypass the broken system conhost.exe on Win 11 24H2/25H2
+          # where child processes crash with STATUS_DLL_INIT_FAILED (0xC0000142)
+          New-Item -ItemType Directory -Force -Path "conpty"
+          $base = "https://raw.githubusercontent.com/microsoft/node-pty/main/third_party/conpty/1.23.251008001/win10-x64"
+          Invoke-WebRequest -Uri "$base/conpty.dll" -OutFile "conpty/conpty.dll"
+          Invoke-WebRequest -Uri "$base/OpenConsole.exe" -OutFile "conpty/OpenConsole.exe"
+          Write-Host "Downloaded conpty.dll: $((Get-Item conpty/conpty.dll).Length) bytes"
+          Write-Host "Downloaded OpenConsole.exe: $((Get-Item conpty/OpenConsole.exe).Length) bytes"
+
       - name: Build exe
         run: pyinstaller orchestratia_agent.spec
+
+      - name: Verify bundled ConPTY files
+        run: |
+          if (Test-Path "dist\conpty\conpty.dll") {
+            Write-Host "conpty.dll bundled OK: $((Get-Item dist\conpty\conpty.dll).Length) bytes"
+          } else {
+            Write-Host "WARNING: conpty.dll not found in dist\"
+          }
+          if (Test-Path "dist\conpty\OpenConsole.exe") {
+            Write-Host "OpenConsole.exe bundled OK: $((Get-Item dist\conpty\OpenConsole.exe).Length) bytes"
+          } else {
+            Write-Host "WARNING: OpenConsole.exe not found in dist\"
+          }
 
       - name: Test exe runs
         run: |
@@ -36,8 +61,17 @@ jobs:
           $sizeMB = [math]::Round($size / 1MB, 1)
           Write-Host "orchestratia-agent.exe: $sizeMB MB ($size bytes)"
 
+      - name: Package release archive
+        run: |
+          # Create a zip with the exe + conpty files for easy distribution
+          Compress-Archive -Path "dist\orchestratia-agent.exe", "dist\conpty" -DestinationPath "dist\orchestratia-agent-windows-x64.zip"
+          $zipSize = [math]::Round((Get-Item dist\orchestratia-agent-windows-x64.zip).Length / 1MB, 1)
+          Write-Host "Release archive: $zipSize MB"
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/orchestratia-agent.exe
+          files: |
+            dist/orchestratia-agent.exe
+            dist/orchestratia-agent-windows-x64.zip
           fail_on_unmatched_files: true

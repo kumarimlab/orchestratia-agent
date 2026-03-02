@@ -101,9 +101,10 @@ class WindowsSessionBackend:
                 else:
                     return None
 
+            conpty_mode = "bundled" if proc.using_bundled_conpty else "system"
             log.info(
                 f"Spawned ConPTY session {session_id[:8]}: "
-                f"shell={shell}, cwd={cwd}, pid={proc.pid}"
+                f"shell={shell}, cwd={cwd}, pid={proc.pid}, conpty={conpty_mode}"
             )
             return SessionHandle(
                 pid=proc.pid,

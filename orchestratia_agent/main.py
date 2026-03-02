@@ -306,14 +306,33 @@ def _test_pty():
                 print(f"  Alive after 1s: {alive}")
 
                 if alive:
-                    try:
-                        data = proc.read(4096)
-                        print(f"  Read {len(data)} chars: {data[:100]!r}")
-                    except Exception as e:
-                        print(f"  Read error: {e}")
+                    # Check pipe with PeekNamedPipe before attempting blocking read
+                    print(f"  Checking output pipe...")
+                    for attempt in range(10):
+                        avail = proc.peek()
+                        print(f"    PeekNamedPipe attempt {attempt+1}: {avail} bytes available")
+                        if avail > 0:
+                            break
+                        if avail < 0:
+                            print(f"    PeekNamedPipe failed (pipe error)")
+                            break
+                        time.sleep(0.5)
+
+                    if avail > 0:
+                        try:
+                            data = proc.read(4096)
+                            print(f"  Read {len(data)} chars: {data[:100]!r}")
+                            print(f"  PASS: {shell_name} native ConPTY works")
+                        except Exception as e:
+                            print(f"  Read error: {e}")
+                    elif avail == 0:
+                        print(f"  FAIL: Process alive but no output after 5s (pipe empty)")
+                        print(f"  Hint: ConPTY may not be routing output to the pipe")
+                    else:
+                        print(f"  FAIL: Pipe error — handle may be invalid")
+
                     proc.terminate(force=True)
                     proc.close()
-                    print(f"  PASS: {shell_name} native ConPTY works")
                 else:
                     exit_code = proc.exitstatus
                     print(f"  FAIL: Died immediately, exit_code={exit_code}", end="")

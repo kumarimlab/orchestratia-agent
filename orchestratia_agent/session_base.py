@@ -97,6 +97,10 @@ class SessionBackend(Protocol):
         """Capture the current screen content (tmux capture-pane). None if unsupported."""
         ...
 
+    def capture_scrollback(self, handle: SessionHandle) -> list[str] | None:
+        """Capture full scrollback history (tmux capture-pane -S -). None if unsupported."""
+        ...
+
     def send_sigwinch(self, handle: SessionHandle) -> None:
         """Send SIGWINCH to trigger terminal redraw. No-op on platforms that don't support it."""
         ...

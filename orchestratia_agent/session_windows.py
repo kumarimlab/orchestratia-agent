@@ -210,5 +210,8 @@ class WindowsSessionBackend:
     def capture_screen(self, handle: SessionHandle) -> list[str] | None:
         return None
 
+    def capture_scrollback(self, handle: SessionHandle) -> list[str] | None:
+        return None
+
     def send_sigwinch(self, handle: SessionHandle) -> None:
         pass

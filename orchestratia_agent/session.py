@@ -264,6 +264,9 @@ class ManagedSession:
     def write_notification(self, text: str):
         self.backend.write_notification(self.handle, text)
 
+    def capture_scrollback(self) -> list[str] | None:
+        return self.backend.capture_scrollback(self.handle)
+
     def send_sigwinch(self):
         self.backend.send_sigwinch(self.handle)
 

@@ -179,6 +179,11 @@ class ConPtyProcess:
         self._process_handle: wt.HANDLE | None = None
         self._input_write: wt.HANDLE | None = None
         self._output_read: wt.HANDLE | None = None
+        # ConPTY-side pipe ends — must stay open for lifetime of pseudo-console.
+        # On Windows 11 24H2+, CreatePseudoConsole does NOT reliably duplicate
+        # these handles; closing them severs the ConPTY→pipe I/O path.
+        self._pty_input_read: wt.HANDLE | None = None
+        self._pty_output_write: wt.HANDLE | None = None
         # Keep references to objects that must stay alive for the ConPTY
         self._attr_buf = None
         self._hpc_ref = None
@@ -260,10 +265,12 @@ class ConPtyProcess:
 
         log.debug(f"ConPTY hpc=0x{hpc.value or 0:X}")
 
-        # Close the pipe ends that the pseudo-console now owns.
-        # ConPTY internally duplicates these handles.
-        kernel32.CloseHandle(pipe_in_read)
-        kernel32.CloseHandle(pipe_out_write)
+        # IMPORTANT: Do NOT close pipe_in_read / pipe_out_write here.
+        # On Windows 11 24H2 (build 26100+), CreatePseudoConsole does NOT
+        # reliably duplicate these handles internally.  Closing them before
+        # ClosePseudoConsole severs the I/O path and results in 0 bytes ever
+        # appearing in the output pipe.  Keep them alive on self and close
+        # them only in close() alongside the pseudo-console itself.
 
         # ── 3. Process thread attribute list ─────────────────────────
         attr_size = ctypes.c_size_t(0)
@@ -274,8 +281,8 @@ class ConPtyProcess:
             attr_buf, 1, 0, ctypes.byref(attr_size)
         ):
             kernel32.ClosePseudoConsole(hpc)
-            kernel32.CloseHandle(pipe_in_write)
-            kernel32.CloseHandle(pipe_out_read)
+            for h in (pipe_in_read, pipe_in_write, pipe_out_read, pipe_out_write):
+                kernel32.CloseHandle(h)
             raise ctypes.WinError()
 
         # Store HPCON in a ctypes handle so we can pass its address.
@@ -294,8 +301,8 @@ class ConPtyProcess:
         ):
             kernel32.DeleteProcThreadAttributeList(attr_buf)
             kernel32.ClosePseudoConsole(hpc)
-            kernel32.CloseHandle(pipe_in_write)
-            kernel32.CloseHandle(pipe_out_read)
+            for h in (pipe_in_read, pipe_in_write, pipe_out_read, pipe_out_write):
+                kernel32.CloseHandle(h)
             raise ctypes.WinError()
 
         # ── 4. Create process ────────────────────────────────────────
@@ -326,8 +333,8 @@ class ConPtyProcess:
         if not success:
             err = ctypes.WinError()
             kernel32.ClosePseudoConsole(hpc)
-            kernel32.CloseHandle(pipe_in_write)
-            kernel32.CloseHandle(pipe_out_read)
+            for h in (pipe_in_read, pipe_in_write, pipe_out_read, pipe_out_write):
+                kernel32.CloseHandle(h)
             raise err
 
         kernel32.CloseHandle(pi.hThread)
@@ -336,6 +343,9 @@ class ConPtyProcess:
         self._process_handle = wt.HANDLE(pi.hProcess)
         self._input_write = wt.HANDLE(pipe_in_write.value)
         self._output_read = wt.HANDLE(pipe_out_read.value)
+        # Keep ConPTY-side pipe ends alive (see note above about Win 11 24H2)
+        self._pty_input_read = wt.HANDLE(pipe_in_read.value)
+        self._pty_output_write = wt.HANDLE(pipe_out_write.value)
         self.pid = pi.dwProcessId
         # Prevent GC of objects that the attribute list pointed to
         self._attr_buf = attr_buf
@@ -418,6 +428,13 @@ class ConPtyProcess:
         if self._hpc:
             kernel32.ClosePseudoConsole(self._hpc)
             self._hpc = None
+        # Close ConPTY-side pipe ends AFTER ClosePseudoConsole
+        if self._pty_input_read:
+            kernel32.CloseHandle(self._pty_input_read)
+            self._pty_input_read = None
+        if self._pty_output_write:
+            kernel32.CloseHandle(self._pty_output_write)
+            self._pty_output_write = None
         if self._input_write:
             kernel32.CloseHandle(self._input_write)
             self._input_write = None

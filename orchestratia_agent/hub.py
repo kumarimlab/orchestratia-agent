@@ -332,6 +332,17 @@ async def ws_receive_loop(ws, state: DaemonState):
                     log.info(f"Force kill requested for session {session_id[:8]}")
                     session.kill_force()
 
+            elif msg_type == "session_recovered_ack":
+                # Hub tells us the real UUID for an orphaned tmux session.
+                # Re-key active_sessions so hub→daemon messages (session_input etc.) work.
+                tmux_name = msg.get("tmux_name", "")
+                real_id = msg.get("session_id", "")
+                if tmux_name and real_id and tmux_name in state.active_sessions:
+                    session = state.active_sessions.pop(tmux_name)
+                    session.session_id = real_id
+                    state.active_sessions[real_id] = session
+                    log.info(f"Re-keyed orphaned session {tmux_name} → {real_id[:8]}")
+
             elif msg_type == "capture_scrollback":
                 session_id = msg.get("session_id")
                 session = state.active_sessions.get(session_id)
@@ -563,6 +574,7 @@ async def report_alive_sessions(state: DaemonState):
         log.info(f"Cleaned up dead session {sid[:8]}")
 
     # 2. Discover orphaned tmux sessions not tracked by us
+    orphaned: set[str] = set()  # track keys reported via session_recovered
     tracked_tmux = {s.tmux_name for s in state.active_sessions.values() if s.tmux_name}
     for tmux_name in existing_tmux:
         if tmux_name not in tracked_tmux:
@@ -580,9 +592,10 @@ async def report_alive_sessions(state: DaemonState):
                     "tmux_name": tmux_name,
                     "pid": handle.pid,
                 })
+                orphaned.add(tmux_name)
 
-    # 3. Report alive sessions
-    alive = list(state.active_sessions.keys())
+    # 3. Report alive sessions (skip orphans — already reported via session_recovered)
+    alive = [sid for sid in state.active_sessions if sid not in orphaned]
     if alive:
         log.info(f"Reporting {len(alive)} alive session(s) to hub")
         for sid in alive:
@@ -594,11 +607,12 @@ async def report_alive_sessions(state: DaemonState):
                 "recovered": True,
                 "tmux_name": session.tmux_name or "",
             })
-            if session.reader_task is None or session.reader_task.done():
-                log.info(f"Restarting reader for session {sid[:8]}")
-                await session.start_reader()
-            # Send SIGWINCH to trigger prompt redraw
-            session.send_sigwinch()
+    # Ensure readers are running and trigger redraw for all recovered sessions
+    for sid, session in state.active_sessions.items():
+        if session.reader_task is None or session.reader_task.done():
+            log.info(f"Restarting reader for session {sid[:8]}")
+            await session.start_reader()
+        session.send_sigwinch()
 
 
 async def ws_connection_loop(state: DaemonState):

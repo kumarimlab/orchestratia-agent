@@ -342,6 +342,12 @@ async def ws_receive_loop(ws, state: DaemonState):
                     session.session_id = real_id
                     state.active_sessions[real_id] = session
                     log.info(f"Re-keyed orphaned session {tmux_name} → {real_id[:8]}")
+                    # Now that the session has a real UUID, start the reader
+                    # so output is tagged with the correct session_id.
+                    if session.reader_task is None or session.reader_task.done():
+                        await session.start_reader()
+                        session.send_sigwinch()
+                        log.info(f"Started reader for recovered session {real_id[:8]}")
 
             elif msg_type == "capture_scrollback":
                 session_id = msg.get("session_id")
@@ -586,7 +592,10 @@ async def report_alive_sessions(state: DaemonState):
                     on_close=_on_session_close,
                 )
                 state.active_sessions[tmux_name] = new_session
-                await new_session.start_reader()
+                # Don't start reader yet — it would send output with tmux_name
+                # as session_id, which isn't a valid UUID.  The reader will be
+                # started in the session_recovered_ack handler after the hub
+                # tells us the real UUID.
                 await ws_send(state, {
                     "type": "session_recovered",
                     "tmux_name": tmux_name,
@@ -607,8 +616,12 @@ async def report_alive_sessions(state: DaemonState):
                 "recovered": True,
                 "tmux_name": session.tmux_name or "",
             })
-    # Ensure readers are running and trigger redraw for all recovered sessions
+    # Ensure readers are running and trigger redraw for all recovered sessions.
+    # Skip orphans — their reader will start when session_recovered_ack arrives
+    # with the real UUID, so we don't send output tagged with a tmux name.
     for sid, session in state.active_sessions.items():
+        if sid in orphaned:
+            continue
         if session.reader_task is None or session.reader_task.done():
             log.info(f"Restarting reader for session {sid[:8]}")
             await session.start_reader()

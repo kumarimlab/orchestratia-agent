@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 
 if sys.platform != "win32":
     raise ImportError("conpty is only available on Windows")
@@ -38,6 +39,18 @@ STILL_ACTIVE = 259
 INFINITE = 0xFFFFFFFF
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x00000102
+
+# Named pipe constants (matching node-pty's approach)
+PIPE_ACCESS_INBOUND = 0x00000001
+PIPE_ACCESS_OUTBOUND = 0x00000002
+FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000
+PIPE_TYPE_BYTE = 0x00000000
+PIPE_READMODE_BYTE = 0x00000000
+PIPE_WAIT = 0x00000000
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+OPEN_EXISTING = 3
+INVALID_HANDLE_VALUE = -1
 
 
 # ── Structures ───────────────────────────────────────────────────────
@@ -261,6 +274,61 @@ kernel32.CloseHandle.argtypes = [wt.HANDLE]
 kernel32.GetLastError.restype = wt.DWORD
 kernel32.GetLastError.argtypes = []
 
+# Named pipe APIs (used when bundled conpty.dll is active)
+kernel32.CreateNamedPipeW.restype = wt.HANDLE
+kernel32.CreateNamedPipeW.argtypes = [
+    wt.LPCWSTR, wt.DWORD, wt.DWORD, wt.DWORD,
+    wt.DWORD, wt.DWORD, wt.DWORD,
+    ctypes.POINTER(SECURITY_ATTRIBUTES),
+]
+
+kernel32.ConnectNamedPipe.restype = wt.BOOL
+kernel32.ConnectNamedPipe.argtypes = [wt.HANDLE, ctypes.c_void_p]
+
+kernel32.CreateFileW.restype = wt.HANDLE
+kernel32.CreateFileW.argtypes = [
+    wt.LPCWSTR, wt.DWORD, wt.DWORD,
+    ctypes.POINTER(SECURITY_ATTRIBUTES),
+    wt.DWORD, wt.DWORD, wt.HANDLE,
+]
+
+
+def _create_named_pipe_pair(kind: str) -> tuple[wt.HANDLE, str]:
+    """Create a named pipe server handle (bidirectional, like node-pty).
+
+    Returns (server_handle, pipe_name).
+    The server handle is passed to ConptyCreatePseudoConsole.
+    After CreatePseudoConsole, call ConnectNamedPipe to synchronize.
+    """
+    pipe_id = uuid.uuid4().hex[:16]
+    pipe_name = f"\\\\.\\pipe\\orchestratia-pty-{pipe_id}-{kind}"
+
+    sa = SECURITY_ATTRIBUTES()
+    sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
+    sa.lpSecurityDescriptor = None
+    sa.bInheritHandle = False  # node-pty uses non-inheritable
+
+    open_mode = (
+        PIPE_ACCESS_INBOUND | PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE
+    )
+    pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
+
+    handle = kernel32.CreateNamedPipeW(
+        pipe_name,
+        open_mode,
+        pipe_mode,
+        1,             # nMaxInstances
+        128 * 1024,    # nOutBufferSize (128KB, matches node-pty)
+        128 * 1024,    # nInBufferSize
+        30000,         # nDefaultTimeOut (30s)
+        ctypes.byref(sa),
+    )
+
+    if handle is None or handle == wt.HANDLE(INVALID_HANDLE_VALUE).value:
+        raise ctypes.WinError()
+
+    return wt.HANDLE(handle), pipe_name
+
 
 def _pack_coord(cols: int, rows: int) -> int:
     """Pack (cols, rows) into COORD DWORD: X in low word, Y in high word."""
@@ -317,11 +385,144 @@ class ConPtyProcess:
         """Spawn a child process inside a new ConPTY pseudo-console."""
         self = cls()
 
-        # ── 1. Create pipes ──────────────────────────────────────────
-        # Use SECURITY_ATTRIBUTES with bInheritHandle=TRUE.
-        # While the Microsoft sample passes NULL, some Windows 11 builds
-        # require inheritable handles for the ConPTY to properly duplicate
-        # and use the pipe ends internally.
+        if _use_bundled:
+            return cls._spawn_named_pipes(self, command, cwd, cols, rows)
+        else:
+            return cls._spawn_anon_pipes(self, command, cwd, cols, rows)
+
+    @staticmethod
+    def _spawn_named_pipes(
+        self: "ConPtyProcess",
+        command: str,
+        cwd: str | None,
+        cols: int,
+        rows: int,
+    ) -> "ConPtyProcess":
+        """Spawn using named pipes — matches node-pty/VS Code approach.
+
+        The bundled conpty.dll + OpenConsole.exe requires bidirectional named
+        pipes with ConnectNamedPipe synchronization. Anonymous pipes from
+        CreatePipe are unidirectional and don't work with the bundled DLL's
+        internal I/O routing.
+        """
+        # ── 1. Create named pipe servers (bidirectional) ─────────────
+        pipe_in, in_name = _create_named_pipe_pair("in")
+        try:
+            pipe_out, out_name = _create_named_pipe_pair("out")
+        except Exception:
+            kernel32.CloseHandle(pipe_in)
+            raise
+
+        log.debug(
+            f"ConPTY named pipes (bundled DLL): "
+            f"in={in_name} (0x{pipe_in.value or 0:X}) "
+            f"out={out_name} (0x{pipe_out.value or 0:X})"
+        )
+
+        # ── 2. Create pseudo-console with named pipe server handles ──
+        hpc = wt.HANDLE()
+        coord = _pack_coord(cols, rows)
+        hr = _CreatePseudoConsole(
+            coord,
+            pipe_in,
+            pipe_out,
+            0,
+            ctypes.byref(hpc),
+        )
+        if hr != 0:
+            kernel32.CloseHandle(pipe_in)
+            kernel32.CloseHandle(pipe_out)
+            raise OSError(f"ConptyCreatePseudoConsole failed: HRESULT 0x{hr:08X}")
+
+        log.debug(f"ConPTY hpc=0x{hpc.value or 0:X} (bundled DLL)")
+
+        # ── 3. Wait for ConPTY to connect to the named pipes ────────
+        # ConnectNamedPipe blocks until the ConPTY (OpenConsole.exe)
+        # connects as a client. This synchronization is critical.
+        kernel32.ConnectNamedPipe(pipe_in, None)
+        kernel32.ConnectNamedPipe(pipe_out, None)
+        log.debug("ConPTY connected to named pipes")
+
+        # ── 4. Process thread attribute list ─────────────────────────
+        attr_size = ctypes.c_size_t(0)
+        kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_size))
+
+        attr_buf = (ctypes.c_byte * attr_size.value)()
+        if not kernel32.InitializeProcThreadAttributeList(
+            attr_buf, 1, 0, ctypes.byref(attr_size)
+        ):
+            _ClosePseudoConsole(hpc)
+            kernel32.CloseHandle(pipe_in)
+            kernel32.CloseHandle(pipe_out)
+            raise ctypes.WinError()
+
+        hpc_ref = wt.HANDLE(hpc.value)
+        if not kernel32.UpdateProcThreadAttribute(
+            attr_buf, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            ctypes.byref(hpc_ref), ctypes.sizeof(wt.HANDLE), None, None,
+        ):
+            kernel32.DeleteProcThreadAttributeList(attr_buf)
+            _ClosePseudoConsole(hpc)
+            kernel32.CloseHandle(pipe_in)
+            kernel32.CloseHandle(pipe_out)
+            raise ctypes.WinError()
+
+        # ── 5. Create child process ──────────────────────────────────
+        si = STARTUPINFOEX()
+        si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEX)
+        si.lpAttributeList = ctypes.addressof(attr_buf)
+
+        pi = PROCESS_INFORMATION()
+        cmd_buf = ctypes.create_unicode_buffer(command)
+
+        success = kernel32.CreateProcessW(
+            None, cmd_buf, None, None,
+            False, EXTENDED_STARTUPINFO_PRESENT,
+            None, cwd, ctypes.byref(si), ctypes.byref(pi),
+        )
+        kernel32.DeleteProcThreadAttributeList(attr_buf)
+
+        if not success:
+            err = ctypes.WinError()
+            _ClosePseudoConsole(hpc)
+            kernel32.CloseHandle(pipe_in)
+            kernel32.CloseHandle(pipe_out)
+            raise err
+
+        kernel32.CloseHandle(pi.hThread)
+
+        # With named pipes, both handles are bidirectional:
+        # pipe_in = we write to this (input to ConPTY → child stdin)
+        # pipe_out = we read from this (child stdout → ConPTY → us)
+        self._hpc = wt.HANDLE(hpc.value)
+        self._process_handle = wt.HANDLE(pi.hProcess)
+        self._input_write = wt.HANDLE(pipe_in.value)
+        self._output_read = wt.HANDLE(pipe_out.value)
+        self._pty_input_read = None   # Not used with named pipes
+        self._pty_output_write = None  # Not used with named pipes
+        self.pid = pi.dwProcessId
+        self._attr_buf = attr_buf
+        self._hpc_ref = hpc_ref
+
+        log.debug(
+            f"ConPTY process pid={self.pid} "
+            f"proc=0x{pi.hProcess or 0:X} "
+            f"in=0x{pipe_in.value or 0:X} "
+            f"out=0x{pipe_out.value or 0:X} "
+            f"(named pipes, bundled DLL)"
+        )
+        return self
+
+    @staticmethod
+    def _spawn_anon_pipes(
+        self: "ConPtyProcess",
+        command: str,
+        cwd: str | None,
+        cols: int,
+        rows: int,
+    ) -> "ConPtyProcess":
+        """Spawn using anonymous pipes — fallback for kernel32 path."""
+        # ── 1. Create anonymous pipes ────────────────────────────────
         sa = SECURITY_ATTRIBUTES()
         sa.nLength = ctypes.sizeof(SECURITY_ATTRIBUTES)
         sa.lpSecurityDescriptor = None
@@ -346,9 +547,8 @@ class ConPtyProcess:
             kernel32.CloseHandle(pipe_in_write)
             raise ctypes.WinError()
 
-        conpty_mode = "bundled conpty.dll" if _use_bundled else "kernel32 (system conhost)"
         log.debug(
-            f"ConPTY pipes ({conpty_mode}): "
+            f"ConPTY anon pipes (kernel32): "
             f"in_r=0x{pipe_in_read.value or 0:X} "
             f"in_w=0x{pipe_in_write.value or 0:X} "
             f"out_r=0x{pipe_out_read.value or 0:X} "
@@ -359,25 +559,14 @@ class ConPtyProcess:
         hpc = wt.HANDLE()
         coord = _pack_coord(cols, rows)
         hr = _CreatePseudoConsole(
-            coord,
-            pipe_in_read,
-            pipe_out_write,
-            0,
-            ctypes.byref(hpc),
+            coord, pipe_in_read, pipe_out_write, 0, ctypes.byref(hpc),
         )
         if hr != 0:
             for h in (pipe_in_read, pipe_in_write, pipe_out_read, pipe_out_write):
                 kernel32.CloseHandle(h)
             raise OSError(f"CreatePseudoConsole failed: HRESULT 0x{hr:08X}")
 
-        log.debug(f"ConPTY hpc=0x{hpc.value or 0:X} (via {'bundled DLL' if _use_bundled else 'kernel32'})")
-
-        # IMPORTANT: Do NOT close pipe_in_read / pipe_out_write here.
-        # On Windows 11 24H2 (build 26100+), CreatePseudoConsole does NOT
-        # reliably duplicate these handles internally.  Closing them before
-        # ClosePseudoConsole severs the I/O path and results in 0 bytes ever
-        # appearing in the output pipe.  Keep them alive on self and close
-        # them only in close() alongside the pseudo-console itself.
+        log.debug(f"ConPTY hpc=0x{hpc.value or 0:X} (kernel32)")
 
         # ── 3. Process thread attribute list ─────────────────────────
         attr_size = ctypes.c_size_t(0)
@@ -392,19 +581,10 @@ class ConPtyProcess:
                 kernel32.CloseHandle(h)
             raise ctypes.WinError()
 
-        # Store HPCON in a ctypes handle so we can pass its address.
-        # CRITICAL: keep a reference to both attr_buf and hpc_ref on self
-        # so they are NOT garbage collected while the process is running.
-        # UpdateProcThreadAttribute stores a POINTER to hpc_ref, not a copy.
         hpc_ref = wt.HANDLE(hpc.value)
         if not kernel32.UpdateProcThreadAttribute(
-            attr_buf,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            ctypes.byref(hpc_ref),
-            ctypes.sizeof(wt.HANDLE),
-            None,
-            None,
+            attr_buf, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            ctypes.byref(hpc_ref), ctypes.sizeof(wt.HANDLE), None, None,
         ):
             kernel32.DeleteProcThreadAttributeList(attr_buf)
             _ClosePseudoConsole(hpc)
@@ -412,29 +592,19 @@ class ConPtyProcess:
                 kernel32.CloseHandle(h)
             raise ctypes.WinError()
 
-        # ── 4. Create process ────────────────────────────────────────
+        # ── 4. Create child process ──────────────────────────────────
         si = STARTUPINFOEX()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEX)
         si.lpAttributeList = ctypes.addressof(attr_buf)
 
         pi = PROCESS_INFORMATION()
-
         cmd_buf = ctypes.create_unicode_buffer(command)
 
         success = kernel32.CreateProcessW(
-            None,                          # lpApplicationName
-            cmd_buf,                       # lpCommandLine
-            None,                          # lpProcessAttributes
-            None,                          # lpThreadAttributes
-            False,                         # bInheritHandles
-            EXTENDED_STARTUPINFO_PRESENT,  # dwCreationFlags
-            None,                          # lpEnvironment (inherit)
-            cwd,                           # lpCurrentDirectory
-            ctypes.byref(si),              # lpStartupInfo
-            ctypes.byref(pi),              # lpProcessInformation
+            None, cmd_buf, None, None,
+            False, EXTENDED_STARTUPINFO_PRESENT,
+            None, cwd, ctypes.byref(si), ctypes.byref(pi),
         )
-
-        # Clean up attribute list AFTER CreateProcessW
         kernel32.DeleteProcThreadAttributeList(attr_buf)
 
         if not success:
@@ -450,11 +620,9 @@ class ConPtyProcess:
         self._process_handle = wt.HANDLE(pi.hProcess)
         self._input_write = wt.HANDLE(pipe_in_write.value)
         self._output_read = wt.HANDLE(pipe_out_read.value)
-        # Keep ConPTY-side pipe ends alive (see note above about Win 11 24H2)
         self._pty_input_read = wt.HANDLE(pipe_in_read.value)
         self._pty_output_write = wt.HANDLE(pipe_out_write.value)
         self.pid = pi.dwProcessId
-        # Prevent GC of objects that the attribute list pointed to
         self._attr_buf = attr_buf
         self._hpc_ref = hpc_ref
 
@@ -462,9 +630,9 @@ class ConPtyProcess:
             f"ConPTY process pid={self.pid} "
             f"proc=0x{pi.hProcess or 0:X} "
             f"in=0x{pipe_in_write.value or 0:X} "
-            f"out=0x{pipe_out_read.value or 0:X}"
+            f"out=0x{pipe_out_read.value or 0:X} "
+            f"(anon pipes, kernel32)"
         )
-
         return self
 
     def peek(self) -> int:

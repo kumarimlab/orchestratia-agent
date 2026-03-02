@@ -463,112 +463,170 @@ def _test_pty():
         traceback.print_exc()
     print()
 
-    # Test 8: FreeConsole + ConPTY (eliminate parent console interference)
+    # Test 8: Raw ctypes ConPTY (no argtypes, pass integers directly)
     print("=" * 60)
-    print("TEST 8: FreeConsole() before ConPTY creation")
+    print("TEST 8: Raw ctypes ConPTY (no argtypes, integer handles)")
     print("=" * 60)
     try:
         import ctypes
         import ctypes.wintypes as wt
-        _k32 = ctypes.windll.kernel32
-        _k32.FreeConsole.restype = wt.BOOL
-        _k32.FreeConsole.argtypes = []
-        _k32.AllocConsole.restype = wt.BOOL
-        _k32.AllocConsole.argtypes = []
+        _k = ctypes.WinDLL("kernel32", use_last_error=True)
 
-        results = []
-        results.append("  Detaching from parent console with FreeConsole()...")
-        freed = _k32.FreeConsole()
-        results.append(f"  FreeConsole returned: {freed}")
+        # Print what wt.HANDLE actually is
+        print(f"  wt.HANDLE type: {wt.HANDLE}")
+        print(f"  sizeof(wt.HANDLE): {ctypes.sizeof(wt.HANDLE)}")
 
-        from orchestratia_agent.conpty import ConPtyProcess
-        proc = ConPtyProcess.spawn("cmd.exe /c echo ConPTY_WORKS", cols=80, rows=25)
-        results.append(f"  PID: {proc.pid}")
+        # Create pipes — use raw calls, no argtypes
+        hInR = wt.HANDLE()
+        hInW = wt.HANDLE()
+        hOutR = wt.HANDLE()
+        hOutW = wt.HANDLE()
 
-        for i in range(20):
-            if not proc.isalive():
-                break
-            time.sleep(0.25)
+        sa = ctypes.c_byte * 24  # SECURITY_ATTRIBUTES = 24 bytes on x64
+        sa_buf = sa()
+        ctypes.memmove(sa_buf, ctypes.byref(wt.DWORD(24)), 4)  # nLength
+        ctypes.memmove(ctypes.addressof(sa_buf) + 16, ctypes.byref(wt.BOOL(1)), 4)  # bInheritHandle
 
-        avail = proc.peek()
-        results.append(f"  Alive: {proc.isalive()}, exit: {proc.exitstatus}, pipe bytes: {avail}")
+        r = _k.CreatePipe(ctypes.byref(hInR), ctypes.byref(hInW), ctypes.byref(sa_buf), 0)
+        if not r:
+            raise ctypes.WinError(ctypes.get_last_error())
+        r = _k.CreatePipe(ctypes.byref(hOutR), ctypes.byref(hOutW), ctypes.byref(sa_buf), 0)
+        if not r:
+            raise ctypes.WinError(ctypes.get_last_error())
 
-        if avail > 0:
-            data = proc.read(avail)
-            results.append(f"  Output: {data[:200]!r}")
+        print(f"  Pipe handles (raw int): in_r={hInR.value} in_w={hInW.value} out_r={hOutR.value} out_w={hOutW.value}")
+
+        # Create pseudo console — pass integer handle values directly
+        hpc = wt.HANDLE()
+        coord_val = (25 << 16) | 80  # rows=25, cols=80
+
+        # Set specific argtypes for THIS call
+        _k.CreatePseudoConsole.restype = ctypes.c_long
+        _k.CreatePseudoConsole.argtypes = [
+            ctypes.c_uint32,       # COORD as uint32
+            ctypes.c_void_p,       # hInput as raw pointer
+            ctypes.c_void_p,       # hOutput as raw pointer
+            ctypes.c_uint32,       # dwFlags
+            ctypes.POINTER(wt.HANDLE),  # phPC
+        ]
+
+        hr = _k.CreatePseudoConsole(
+            coord_val,
+            hInR.value,      # Pass raw integer, not HANDLE object
+            hOutW.value,     # Pass raw integer, not HANDLE object
+            0,
+            ctypes.byref(hpc),
+        )
+        print(f"  CreatePseudoConsole HR=0x{hr & 0xFFFFFFFF:08X}, hpc={hpc.value}")
+        if hr != 0:
+            raise OSError(f"CreatePseudoConsole failed: 0x{hr & 0xFFFFFFFF:08X}")
+
+        # Attribute list
+        sz = ctypes.c_size_t(0)
+        _k.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(sz))
+        attr_buf = (ctypes.c_byte * sz.value)()
+        _k.InitializeProcThreadAttributeList(attr_buf, 1, 0, ctypes.byref(sz))
+
+        hpc_store = wt.HANDLE(hpc.value)
+        _k.UpdateProcThreadAttribute.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        _k.UpdateProcThreadAttribute(
+            attr_buf, 0, 0x00020016,
+            ctypes.byref(hpc_store), ctypes.sizeof(wt.HANDLE),
+            None, None,
+        )
+
+        # STARTUPINFOEX as raw bytes (112 bytes on x64)
+        si_buf = (ctypes.c_byte * 112)()
+        # cb at offset 0
+        ctypes.memmove(si_buf, ctypes.byref(wt.DWORD(112)), 4)
+        # lpAttributeList at offset 104
+        attr_ptr = ctypes.c_void_p(ctypes.addressof(attr_buf))
+        ctypes.memmove(ctypes.addressof(si_buf) + 104, ctypes.byref(attr_ptr), 8)
+
+        pi_buf = (ctypes.c_byte * 24)()  # PROCESS_INFORMATION = 24 bytes x64
+        cmd = ctypes.create_unicode_buffer("cmd.exe /c echo ConPTY_WORKS")
+
+        ok = _k.CreateProcessW(
+            None, cmd, None, None,
+            False, 0x00080000,  # EXTENDED_STARTUPINFO_PRESENT
+            None, None,
+            ctypes.byref(si_buf), ctypes.byref(pi_buf),
+        )
+        _k.DeleteProcThreadAttributeList(attr_buf)
+
+        if not ok:
+            err = ctypes.get_last_error()
+            raise OSError(f"CreateProcessW failed: {err}")
+
+        # Extract PID from PROCESS_INFORMATION (offset 16 = dwProcessId)
+        pid = int.from_bytes(bytes(pi_buf[16:20]), 'little')
+        print(f"  Process PID={pid}")
+
+        # Extract and close thread handle (offset 8)
+        hThread = int.from_bytes(bytes(pi_buf[8:16]), 'little')
+        _k.CloseHandle(ctypes.c_void_p(hThread))
+
+        # Wait for exit
+        hProc = int.from_bytes(bytes(pi_buf[0:8]), 'little')
+        _k.WaitForSingleObject(ctypes.c_void_p(hProc), 5000)
+
+        # Check pipe
+        avail = wt.DWORD(0)
+        _k.PeekNamedPipe(hOutR, None, 0, None, ctypes.byref(avail), None)
+        print(f"  PeekNamedPipe: {avail.value} bytes")
+
+        if avail.value > 0:
+            buf = ctypes.create_string_buffer(4096)
+            nread = wt.DWORD(0)
+            _k.ReadFile(hOutR, buf, 4096, ctypes.byref(nread), None)
+            data = buf.raw[:nread.value].decode('utf-8', errors='replace')
+            print(f"  Output: {data[:200]!r}")
             if "ConPTY_WORKS" in data:
-                results.append("  PASS: FreeConsole + ConPTY works!")
+                print("  PASS: Raw ctypes ConPTY works!")
             else:
-                results.append("  PARTIAL: Got output but not expected string")
+                print("  PARTIAL: Got output but not expected string")
         else:
-            results.append("  FAIL: Still 0 bytes even after FreeConsole")
+            print("  FAIL: Still 0 bytes with raw integer handles")
 
-        proc.close()
+        # Cleanup
+        _k.ClosePseudoConsole(hpc)
+        for h in [hInR, hInW, hOutR, hOutW]:
+            _k.CloseHandle(h)
+        _k.CloseHandle(ctypes.c_void_p(hProc))
 
-        # Restore console so we can print
-        _k32.AllocConsole()
-        # Re-open stdout to the new console
-        import msvcrt, os as _os
-        new_stdout = _os.open("CONOUT$", _os.O_WRONLY)
-        _os.dup2(new_stdout, 1)
-        _os.close(new_stdout)
-        sys.stdout = open(1, "w", encoding="utf-8", closefd=False)
-
-        for line in results:
-            print(line)
     except Exception as e:
-        # Try to restore console before printing
-        try:
-            _k32.AllocConsole()
-            import msvcrt, os as _os
-            new_stdout = _os.open("CONOUT$", _os.O_WRONLY)
-            _os.dup2(new_stdout, 1)
-            _os.close(new_stdout)
-            sys.stdout = open(1, "w", encoding="utf-8", closefd=False)
-        except Exception:
-            pass
-        print(f"  FAIL: {e}")
         import traceback
+        print(f"  FAIL: {e}")
         traceback.print_exc()
     print()
 
-    # Test 9: C# P/Invoke ConPTY (bypasses ctypes entirely)
+    # Test 9: C# P/Invoke ConPTY (bypasses Python entirely)
     print("=" * 60)
-    print("TEST 9: C# ConPTY via PowerShell (no ctypes)")
+    print("TEST 9: C# ConPTY via PowerShell (no Python, no ctypes)")
     print("=" * 60)
     try:
         import tempfile
-        cs_test = r'''
+        # Use IntPtr for ALL pointer/string fields to avoid C# marshaling issues
+        cs_test = '''
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 
-public class ConPTYTest {
+public class CPTest {
     [StructLayout(LayoutKind.Sequential)]
-    public struct COORD {
-        public short X;
-        public short Y;
-    }
+    public struct COORD { public short X; public short Y; }
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct SECURITY_ATTRIBUTES {
-        public int nLength;
-        public IntPtr lpSecurityDescriptor;
-        public bool bInheritHandle;
-    }
+    public struct SA { public int nLength; public IntPtr lpSD; public int bInherit; }
 
+    // Use IntPtr for ALL non-primitive fields to avoid marshaling issues
     [StructLayout(LayoutKind.Sequential)]
-    public struct STARTUPINFOEX {
-        public STARTUPINFO StartupInfo;
-        public IntPtr lpAttributeList;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    public struct STARTUPINFO {
+    public struct SI {
         public int cb;
-        public string lpReserved;
-        public string lpDesktop;
-        public string lpTitle;
+        public IntPtr lpReserved, lpDesktop, lpTitle;
         public int dwX, dwY, dwXSize, dwYSize;
         public int dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
         public short wShowWindow, cbReserved2;
@@ -576,183 +634,145 @@ public class ConPTYTest {
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct PROCESS_INFORMATION {
-        public IntPtr hProcess;
-        public IntPtr hThread;
-        public int dwProcessId;
-        public int dwThreadId;
-    }
+    public struct SIEX { public SI si; public IntPtr lpAttrList; }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern int CreatePseudoConsole(COORD size, IntPtr hInput, IntPtr hOutput, uint dwFlags, out IntPtr phPC);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PI { public IntPtr hProc, hThread; public int pid, tid; }
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool CreatePipe(out IntPtr hReadPipe, out IntPtr hWritePipe, ref SECURITY_ATTRIBUTES lpPipeAttributes, uint nSize);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern int CreatePseudoConsole(COORD sz, IntPtr hIn, IntPtr hOut, uint fl, out IntPtr hPC);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CreatePipe(out IntPtr hR, out IntPtr hW, ref SA sa, uint sz);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute, IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool InitializeProcThreadAttributeList(IntPtr p, int n, int fl, ref IntPtr sz);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);
-
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    public static extern bool CreateProcessW(string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFOEX lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool PeekNamedPipe(IntPtr hNamedPipe, IntPtr lpBuffer, uint nBufferSize, IntPtr lpBytesRead, out uint lpTotalBytesAvail, IntPtr lpBytesLeftThisMessage);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool CloseHandle(IntPtr hObject);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern void ClosePseudoConsole(IntPtr hPC);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool UpdateProcThreadAttribute(IntPtr p, uint fl, IntPtr attr, IntPtr val, IntPtr sz, IntPtr prev, IntPtr ret);
 
     [DllImport("kernel32.dll")]
-    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+    public static extern void DeleteProcThreadAttributeList(IntPtr p);
 
-    public static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = (IntPtr)0x00020016;
-    public const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool CreateProcessW(IntPtr app, string cmd, IntPtr pa, IntPtr ta, bool inh, uint fl, IntPtr env, IntPtr dir, ref SIEX si, out PI pi);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool PeekNamedPipe(IntPtr h, IntPtr buf, uint sz, IntPtr read, out uint avail, IntPtr left);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool ReadFile(IntPtr h, byte[] buf, uint sz, out uint read, IntPtr ovl);
+
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] public static extern void ClosePseudoConsole(IntPtr h);
+    [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr h, out uint c);
 
     public static string Run() {
-        var result = new System.Text.StringBuilder();
+        var r = new System.Text.StringBuilder();
         try {
-            // 1. Create pipes
-            var sa = new SECURITY_ATTRIBUTES();
-            sa.nLength = Marshal.SizeOf(sa);
-            sa.bInheritHandle = true;
+            var sa = new SA(); sa.nLength = Marshal.SizeOf(sa); sa.bInherit = 1;
+            IntPtr iR, iW, oR, oW;
+            if (!CreatePipe(out iR, out iW, ref sa, 0)) { return "FAIL:CreatePipe1:" + Marshal.GetLastWin32Error(); }
+            if (!CreatePipe(out oR, out oW, ref sa, 0)) { return "FAIL:CreatePipe2:" + Marshal.GetLastWin32Error(); }
+            r.AppendLine("Pipes OK: iR=0x" + iR.ToString("X") + " iW=0x" + iW.ToString("X") + " oR=0x" + oR.ToString("X") + " oW=0x" + oW.ToString("X"));
 
-            IntPtr pipeInRead, pipeInWrite, pipeOutRead, pipeOutWrite;
-            if (!CreatePipe(out pipeInRead, out pipeInWrite, ref sa, 0)) {
-                return "FAIL: CreatePipe (input) failed: " + Marshal.GetLastWin32Error();
-            }
-            if (!CreatePipe(out pipeOutRead, out pipeOutWrite, ref sa, 0)) {
-                CloseHandle(pipeInRead); CloseHandle(pipeInWrite);
-                return "FAIL: CreatePipe (output) failed: " + Marshal.GetLastWin32Error();
-            }
-            result.AppendLine("Pipes created OK");
-            result.AppendLine("  in_r=0x" + pipeInRead.ToString("X") + " in_w=0x" + pipeInWrite.ToString("X"));
-            result.AppendLine("  out_r=0x" + pipeOutRead.ToString("X") + " out_w=0x" + pipeOutWrite.ToString("X"));
-
-            // 2. Create pseudo console
-            COORD size;
-            size.X = 80;
-            size.Y = 25;
+            COORD sz; sz.X = 80; sz.Y = 25;
             IntPtr hPC;
-            int hr = CreatePseudoConsole(size, pipeInRead, pipeOutWrite, 0, out hPC);
-            if (hr != 0) {
-                return "FAIL: CreatePseudoConsole HRESULT=0x" + hr.ToString("X8");
+            int hr = CreatePseudoConsole(sz, iR, oW, 0, out hPC);
+            if (hr != 0) { return "FAIL:CreatePseudoConsole:0x" + hr.ToString("X8"); }
+            r.AppendLine("ConPTY OK: hPC=0x" + hPC.ToString("X"));
+
+            IntPtr asz = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref asz);
+            IntPtr al = Marshal.AllocHGlobal((int)(long)asz);
+            if (!InitializeProcThreadAttributeList(al, 1, 0, ref asz)) { return "FAIL:InitAttr:" + Marshal.GetLastWin32Error(); }
+
+            IntPtr hpcH = Marshal.AllocHGlobal(IntPtr.Size);
+            Marshal.WriteIntPtr(hpcH, hPC);
+            if (!UpdateProcThreadAttribute(al, 0, (IntPtr)0x00020016, hpcH, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) {
+                return "FAIL:UpdateAttr:" + Marshal.GetLastWin32Error();
             }
-            result.AppendLine("CreatePseudoConsole OK, hPC=0x" + hPC.ToString("X"));
+            r.AppendLine("AttrList OK");
 
-            // 3. Attribute list
-            IntPtr attrSize = IntPtr.Zero;
-            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attrSize);
-            IntPtr attrList = Marshal.AllocHGlobal((int)(long)attrSize);
-            if (!InitializeProcThreadAttributeList(attrList, 1, 0, ref attrSize)) {
-                return "FAIL: InitializeProcThreadAttributeList: " + Marshal.GetLastWin32Error();
-            }
+            var si = new SIEX();
+            si.si.cb = Marshal.SizeOf(si);
+            si.lpAttrList = al;
+            r.AppendLine("SIEX size=" + Marshal.SizeOf(si) + " SI size=" + Marshal.SizeOf(typeof(SI)));
 
-            IntPtr hpcHolder = Marshal.AllocHGlobal(IntPtr.Size);
-            Marshal.WriteIntPtr(hpcHolder, hPC);
-            if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, hpcHolder, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) {
-                return "FAIL: UpdateProcThreadAttribute: " + Marshal.GetLastWin32Error();
-            }
-            result.AppendLine("Attribute list OK");
-
-            // 4. Create process
-            var si = new STARTUPINFOEX();
-            si.StartupInfo.cb = Marshal.SizeOf(si);
-            si.lpAttributeList = attrList;
-
-            PROCESS_INFORMATION pi;
-            bool created = CreateProcessW(null, "cmd.exe /c echo ConPTY_WORKS", IntPtr.Zero, IntPtr.Zero, false, EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null, ref si, out pi);
-            DeleteProcThreadAttributeList(attrList);
-            Marshal.FreeHGlobal(hpcHolder);
-
-            if (!created) {
-                return "FAIL: CreateProcessW: " + Marshal.GetLastWin32Error();
-            }
-            result.AppendLine("Process created, PID=" + pi.dwProcessId);
+            PI pi;
+            bool ok = CreateProcessW(IntPtr.Zero, "cmd.exe /c echo ConPTY_WORKS_FROM_CSHARP", IntPtr.Zero, IntPtr.Zero, false, 0x00080000, IntPtr.Zero, IntPtr.Zero, ref si, out pi);
+            DeleteProcThreadAttributeList(al);
+            Marshal.FreeHGlobal(hpcH);
+            if (!ok) { return "FAIL:CreateProcess:" + Marshal.GetLastWin32Error(); }
+            r.AppendLine("Process PID=" + pi.pid);
             CloseHandle(pi.hThread);
 
-            // 5. Wait for process to exit (max 5s)
-            WaitForSingleObject(pi.hProcess, 5000);
-            uint exitCode;
-            GetExitCodeProcess(pi.hProcess, out exitCode);
-            result.AppendLine("Process exit code: " + exitCode);
+            WaitForSingleObject(pi.hProc, 5000);
+            uint ec; GetExitCodeProcess(pi.hProc, out ec);
+            r.AppendLine("ExitCode=" + ec);
 
-            // 6. Check pipe for output
-            uint totalAvail;
-            PeekNamedPipe(pipeOutRead, IntPtr.Zero, 0, IntPtr.Zero, out totalAvail, IntPtr.Zero);
-            result.AppendLine("PeekNamedPipe: " + totalAvail + " bytes available");
+            // Check pipe multiple times over 3 seconds
+            uint avail = 0;
+            for (int i = 0; i < 6; i++) {
+                PeekNamedPipe(oR, IntPtr.Zero, 0, IntPtr.Zero, out avail, IntPtr.Zero);
+                if (avail > 0) break;
+                System.Threading.Thread.Sleep(500);
+            }
+            r.AppendLine("PeekNamedPipe: " + avail + " bytes");
 
-            if (totalAvail > 0) {
-                byte[] buf = new byte[4096];
-                uint bytesRead;
-                ReadFile(pipeOutRead, buf, (uint)buf.Length, out bytesRead, IntPtr.Zero);
-                string output = System.Text.Encoding.UTF8.GetString(buf, 0, (int)bytesRead);
-                result.AppendLine("Output: " + output.Replace("\r", "\\r").Replace("\n", "\\n").Substring(0, Math.Min(200, output.Length)));
-                if (output.Contains("ConPTY_WORKS")) {
-                    result.AppendLine("RESULT: PASS");
-                } else {
-                    result.AppendLine("RESULT: PARTIAL (got output but not expected string)");
-                }
+            if (avail > 0) {
+                byte[] buf = new byte[4096]; uint rd;
+                ReadFile(oR, buf, 4096, out rd, IntPtr.Zero);
+                string o = System.Text.Encoding.UTF8.GetString(buf, 0, (int)rd);
+                r.AppendLine("Output(" + rd + "): " + o.Substring(0, Math.Min(200, o.Length)).Replace("\\r","\\\\r").Replace("\\n","\\\\n"));
+                r.AppendLine(o.Contains("ConPTY_WORKS") ? "RESULT: PASS" : "RESULT: PARTIAL");
             } else {
-                result.AppendLine("RESULT: FAIL (0 bytes in pipe)");
+                r.AppendLine("RESULT: FAIL (0 bytes)");
             }
 
-            // Cleanup
             ClosePseudoConsole(hPC);
-            CloseHandle(pipeInRead); CloseHandle(pipeInWrite);
-            CloseHandle(pipeOutRead); CloseHandle(pipeOutWrite);
-            CloseHandle(pi.hProcess);
-            Marshal.FreeHGlobal(attrList);
-
-        } catch (Exception ex) {
-            result.AppendLine("EXCEPTION: " + ex.ToString());
-        }
-        return result.ToString();
+            CloseHandle(iR); CloseHandle(iW); CloseHandle(oR); CloseHandle(oW);
+            CloseHandle(pi.hProc); Marshal.FreeHGlobal(al);
+        } catch (Exception ex) { r.AppendLine("EXCEPTION: " + ex.Message); }
+        return r.ToString();
     }
 }
 "@
 
-Write-Host ([ConPTYTest]::Run())
+try { Write-Host ([CPTest]::Run()) } catch { Write-Host "PS_ERROR: $_" }
 '''
-        # Write to temp file and execute
         with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False, encoding='utf-8') as f:
             f.write(cs_test)
             ps1_path = f.name
 
         result = subprocess.run(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", ps1_path],
-            capture_output=True, text=True, timeout=30,
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1_path],
+            capture_output=True, text=True, timeout=60,
         )
-        os.unlink(ps1_path)
+        try:
+            os.unlink(ps1_path)
+        except OSError:
+            pass
 
         print(f"  Exit code: {result.returncode}")
         if result.stdout.strip():
             for line in result.stdout.strip().split('\n'):
-                print(f"  {line}")
+                print(f"  {line.rstrip()}")
         if result.stderr.strip():
-            print(f"  stderr: {result.stderr.strip()[:300]}")
+            for line in result.stderr.strip().split('\n')[:5]:
+                print(f"  ERR: {line.rstrip()}")
 
-        if "RESULT: PASS" in result.stdout:
-            print("  PASS: C# ConPTY works! Issue is ctypes-specific.")
-        elif "RESULT: FAIL" in result.stdout:
-            print("  FAIL: C# also gets 0 bytes — Windows 26200 issue.")
-        elif "RESULT: PARTIAL" in result.stdout:
-            print("  PARTIAL: C# got output but different from expected.")
+        if "RESULT: PASS" in (result.stdout or ""):
+            print("  >>> C# ConPTY WORKS! Issue is ctypes-specific. <<<")
+        elif "RESULT: FAIL" in (result.stdout or ""):
+            print("  >>> C# also gets 0 bytes — Windows 26200 OS issue. <<<")
+        elif "RESULT: PARTIAL" in (result.stdout or ""):
+            print("  >>> C# got output — ConPTY works at OS level! <<<")
         else:
             print("  INCONCLUSIVE: Check output above.")
+    except subprocess.TimeoutExpired:
+        print("  FAIL: PowerShell timed out after 60s")
     except Exception as e:
         import traceback
         print(f"  FAIL: {e}")

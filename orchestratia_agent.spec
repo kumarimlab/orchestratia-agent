@@ -3,11 +3,38 @@
 #
 # Build: pyinstaller orchestratia_agent.spec
 # Output: dist/orchestratia-agent.exe (~25-30MB)
+#
+# The conpty/ directory must exist in the build root with:
+#   conpty/conpty.dll      - ConPTY library from Windows Terminal (MIT)
+#   conpty/OpenConsole.exe - Console host from Windows Terminal (MIT)
+# These are downloaded by the CI workflow before building.
+
+import os
+
+# Detect if bundled ConPTY files are available (CI downloads them)
+conpty_binaries = []
+conpty_dir = os.path.join(os.getcwd(), 'conpty')
+if os.path.isdir(conpty_dir):
+    dll_path = os.path.join(conpty_dir, 'conpty.dll')
+    exe_path = os.path.join(conpty_dir, 'OpenConsole.exe')
+    if os.path.isfile(dll_path) and os.path.isfile(exe_path):
+        # Place both files in conpty/ subdirectory inside the bundle.
+        # conpty.dll uses GetModuleFileName to find OpenConsole.exe
+        # in its own directory, so they MUST be in the same folder.
+        conpty_binaries = [
+            (dll_path, 'conpty'),
+            (exe_path, 'conpty'),
+        ]
+        print(f"Including bundled ConPTY: {dll_path}, {exe_path}")
+    else:
+        print("WARNING: conpty/ dir exists but missing conpty.dll or OpenConsole.exe")
+else:
+    print("NOTE: conpty/ dir not found — building without bundled ConPTY (will use system conhost)")
 
 a = Analysis(
     ['orchestratia_agent/main.py'],
     pathex=[],
-    binaries=[],
+    binaries=conpty_binaries,
     datas=[],
     hiddenimports=[
         # All orchestratia_agent modules
@@ -50,8 +77,6 @@ a = Analysis(
         'pyte',
         'pyte.screens',
         'pyte.streams',
-        # pywinpty (Windows ConPTY)
-        'winpty',
         # yaml
         'yaml',
     ],
@@ -70,6 +95,8 @@ a = Analysis(
         'pydoc',
         'doctest',
         'test',
+        # No longer needed — using bundled conpty.dll instead
+        'winpty',
     ],
     noarchive=False,
 )

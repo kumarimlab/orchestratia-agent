@@ -15,6 +15,11 @@ Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
 
+# Only kill the daemon process, not child tmux sessions.
+# tmux sessions must survive daemon restarts so they can be
+# recovered via report_alive_sessions() on next startup.
+KillMode=process
+
 # Logging
 StandardOutput=journal
 StandardError=journal

@@ -332,6 +332,25 @@ async def ws_receive_loop(ws, state: DaemonState):
                     log.info(f"Force kill requested for session {session_id[:8]}")
                     session.kill_force()
 
+            elif msg_type == "capture_scrollback":
+                session_id = msg.get("session_id")
+                session = state.active_sessions.get(session_id)
+                if session and not session.closed:
+                    lines = session.capture_scrollback()
+                    if lines is not None:
+                        await ws_send(state, {
+                            "type": "scrollback_captured",
+                            "session_id": session_id,
+                            "lines": lines,
+                        })
+                    else:
+                        await ws_send(state, {
+                            "type": "scrollback_captured",
+                            "session_id": session_id,
+                            "lines": [],
+                            "error": "Could not capture scrollback",
+                        })
+
             elif msg_type == "task_assigned":
                 target_session_id = msg.get("session_id")
                 task_id = msg.get("task_id", "")

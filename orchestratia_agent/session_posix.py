@@ -272,6 +272,24 @@ class PosixSessionBackend:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
+    def capture_scrollback(self, handle: SessionHandle) -> list[str] | None:
+        """Capture full tmux scrollback history (from start to current cursor)."""
+        if not handle.tmux_name:
+            return None
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", handle.tmux_name, "-p", "-S", "-"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            lines = result.stdout.split("\n")
+            while lines and not lines[-1].strip():
+                lines.pop()
+            return lines
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
     def send_sigwinch(self, handle: SessionHandle) -> None:
         try:
             os.killpg(os.getpgid(handle.pid), signal.SIGWINCH)

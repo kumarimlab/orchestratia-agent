@@ -92,7 +92,7 @@ def ensure_pty_host_running() -> bool:
     2. If not running, launch it and wait up to 5s for TCP availability
     3. Return True if pty-host is available, False to fall back
     """
-    # Step 1: Check if already running
+    # Step 1: Check if already running via PID file
     pid = _read_pid_file()
     if pid and _process_alive(pid):
         if _tcp_probe():
@@ -107,6 +107,12 @@ def ensure_pty_host_running() -> bool:
                 return True
         log.warning(f"pty-host process alive but TCP unreachable after 5s")
         # Stale process — try to launch a new one anyway (may fail on port)
+
+    # Step 1b: No PID file (or stale), but pty-host might still be running
+    # (e.g. survived a reinstall, PID file was cleaned up)
+    if _tcp_probe():
+        log.info("pty-host already running (detected via TCP, no PID file)")
+        return True
 
     # Step 2: Clean up stale PID file
     if pid and not _process_alive(pid):

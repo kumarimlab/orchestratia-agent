@@ -73,15 +73,6 @@ async def main():
 
     setup_logging(debug=args.debug, verbose=args.verbose)
 
-    # --pty-host: start the PTY host server (Windows only)
-    if args.pty_host:
-        if sys.platform != "win32":
-            log.error("--pty-host is only available on Windows")
-            sys.exit(1)
-        from orchestratia_agent.pty_host import main as pty_host_main
-        pty_host_main()
-        return
-
     state = DaemonState()
     state.config_path = args.config
     state.backend = get_session_backend()
@@ -328,6 +319,14 @@ def _test_pty():
 
 def entry_point():
     """Entry point for console_scripts and legacy shims."""
+    if "--pty-host" in sys.argv:
+        # Must run BEFORE asyncio.run() — pty_host.main() calls asyncio.run() itself
+        if sys.platform != "win32":
+            print("--pty-host is only available on Windows")
+            sys.exit(1)
+        from orchestratia_agent.pty_host import main as pty_host_main
+        pty_host_main()
+        return
     if "--test-pty" in sys.argv:
         _test_pty()
         return

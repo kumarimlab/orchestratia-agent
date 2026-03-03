@@ -195,39 +195,49 @@ class PtyHost:
         log.info(f"Client connected from {addr}")
         self._last_activity = time.monotonic()
 
-        # Replace previous client
-        old_writer = self._writer
+        # Atomically: set new writer + drain ring buffers.
+        # Holding the lock prevents _send_or_buffer from sneaking in
+        # between the writer swap and the drain (which would cause it
+        # to send live output to the new client while we think the
+        # ring buffer still has the data).
         async with self._writer_lock:
+            old_writer = self._writer
             self._writer = writer
+
+            for hs in self.sessions.values():
+                if hs.alive or hs.ring._readable > 0:
+                    data, dropped = hs.ring.drain()
+                    if data:
+                        log.info(f"Draining {len(data)} buffered bytes for session {hs.session_id[:8]} (dropped={dropped})")
+                        msg = json.dumps({
+                            "type": "buffered_output",
+                            "session_id": hs.session_id,
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "bytes_dropped": dropped,
+                        }, separators=(",", ":")) + "\n"
+                        writer.write(msg.encode("utf-8"))
+                    else:
+                        log.debug(f"Session {hs.session_id[:8]}: ring buffer empty (0 bytes to drain)")
+                if not hs.alive and hs.exit_code is not None:
+                    msg = json.dumps({
+                        "type": "exited",
+                        "session_id": hs.session_id,
+                        "exit_code": hs.exit_code,
+                    }, separators=(",", ":")) + "\n"
+                    writer.write(msg.encode("utf-8"))
+
+        # Flush all buffered_output messages outside the lock
+        try:
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+
         if old_writer:
             try:
                 old_writer.close()
                 await old_writer.wait_closed()
             except Exception:
                 pass
-
-        # Send buffered output for all alive sessions
-        for hs in self.sessions.values():
-            buffered = hs.ring._readable
-            if hs.alive or buffered > 0:
-                data, dropped = hs.ring.drain()
-                if data:
-                    log.info(f"Draining {len(data)} buffered bytes for session {hs.session_id[:8]} (dropped={dropped})")
-                    await self._send({
-                        "type": "buffered_output",
-                        "session_id": hs.session_id,
-                        "data": base64.b64encode(data).decode("ascii"),
-                        "bytes_dropped": dropped,
-                    })
-                else:
-                    log.debug(f"Session {hs.session_id[:8]}: ring buffer empty (0 bytes to drain)")
-            # Also report exited sessions
-            if not hs.alive and hs.exit_code is not None:
-                await self._send({
-                    "type": "exited",
-                    "session_id": hs.session_id,
-                    "exit_code": hs.exit_code,
-                })
 
         # Read loop
         try:
@@ -455,12 +465,17 @@ class PtyHost:
             log.info(f"Removed dead session {hs.session_id[:8]} from sessions dict")
 
     async def _send_or_buffer(self, hs: HostedSession, raw: bytes) -> None:
-        """Atomically send session output to client, or buffer in ring.
+        """Send session output to client AND always buffer in ring.
 
-        Holds the writer lock for the entire operation so there's no
-        window where data can be dropped between checking the client
-        and sending.
+        Always writes to the ring buffer first (survives disconnect
+        races where drain() succeeds on a dead TCP writer), then also
+        sends live to the connected client for low-latency streaming.
         """
+        # Always buffer — ensures data survives disconnect races.
+        # On reconnect, _handle_client drains the ring and sends
+        # buffered_output.  Duplicate data is harmless for terminals.
+        hs.ring.write(raw)
+
         b64 = base64.b64encode(raw).decode("ascii")
         line = json.dumps({
             "type": "output",
@@ -471,30 +486,27 @@ class PtyHost:
 
         async with self._writer_lock:
             writer = self._writer
-            if writer:
+            if writer and not writer.is_closing():
                 try:
                     writer.write(encoded)
                     await writer.drain()
-                    return
                 except (ConnectionError, OSError):
-                    log.debug(f"Send failed for {hs.session_id[:8]}, buffering {len(raw)} bytes")
-            else:
-                log.debug(f"No client, buffering {len(raw)} bytes for {hs.session_id[:8]}")
-            # No client or send failed — buffer
-            hs.ring.write(raw)
+                    log.debug(f"Send failed for {hs.session_id[:8]}, marking disconnected")
+                    self._writer = None
 
     async def _send(self, msg: dict):
         """Send a JSON-lines message to the connected client (best-effort)."""
+        line = json.dumps(msg, separators=(",", ":")) + "\n"
+        encoded = line.encode("utf-8")
         async with self._writer_lock:
             writer = self._writer
-        if not writer:
-            return
-        try:
-            line = json.dumps(msg, separators=(",", ":")) + "\n"
-            writer.write(line.encode("utf-8"))
-            await writer.drain()
-        except (ConnectionError, OSError):
-            pass
+            if not writer:
+                return
+            try:
+                writer.write(encoded)
+                await writer.drain()
+            except (ConnectionError, OSError):
+                self._writer = None
 
 
 # ── Entry point ──────────────────────────────────────────────────────

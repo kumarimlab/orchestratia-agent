@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orchestratia-agent"
-version = "0.7.0"
+version = "0.7.1"
 description = "Agent daemon and CLI for Orchestratia - AI agent orchestration platform"
 readme = "README.md"
 license = "MIT"
@@ -34,7 +34,7 @@ dependencies = [
     "pyyaml>=6.0",
     "psutil>=6.0",
     "pyte>=0.8.2",
-    # pywinpty no longer needed — using bundled conpty.dll + OpenConsole.exe
+    # pywinpty replaced by native ConPTY via ctypes (conpty.py)
     # "pywinpty>=2.0.10; sys_platform == 'win32'",
 ]
 

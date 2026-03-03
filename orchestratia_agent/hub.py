@@ -542,7 +542,14 @@ async def ws_receive_loop(ws, state: DaemonState):
 
 
 async def report_alive_sessions(state: DaemonState):
-    """After WS reconnect, report alive sessions and discover orphaned tmux sessions."""
+    """After WS reconnect, report alive sessions and discover orphaned sessions.
+
+    Handles both tmux (Linux) and pty-host (Windows) session persistence.
+    For tmux: orphaned sessions use tmux names (not UUIDs), so they go through
+    session_recovered -> session_recovered_ack flow to get real UUIDs.
+    For pty-host: session IDs are already UUIDs, so they can be reattached
+    and reported directly.
+    """
     backend = state.backend
 
     def _make_ws_sender(st: DaemonState):
@@ -555,12 +562,14 @@ async def report_alive_sessions(state: DaemonState):
 
     sender = _make_ws_sender(state)
 
-    # 1. Check existing tracked sessions — try to reattach dead ones via tmux
+    # 1. Check existing tracked sessions — try to reattach dead ones
     dead = []
-    existing_tmux = backend.discover_surviving_sessions()
+    surviving_ids = backend.discover_surviving_sessions()
+    is_pty_host = hasattr(backend, "_connected")  # PtyHostSessionBackend
+
     for sid, s in list(state.active_sessions.items()):
         if not s.is_alive():
-            if s.tmux_name and s.tmux_name in existing_tmux:
+            if s.tmux_name and s.tmux_name in surviving_ids:
                 handle = backend.reattach(sid, s.tmux_name, 120, 40)
                 if handle:
                     new_session = ManagedSession(
@@ -571,6 +580,17 @@ async def report_alive_sessions(state: DaemonState):
                     await new_session.start_reader()
                     log.info(f"Reattached to surviving tmux session {s.tmux_name} for {sid[:8]}")
                     continue
+            elif is_pty_host and sid in surviving_ids:
+                handle = backend.reattach(sid, sid, 120, 40)
+                if handle:
+                    new_session = ManagedSession(
+                        sid, handle, backend, sender,
+                        on_close=_on_session_close,
+                    )
+                    state.active_sessions[sid] = new_session
+                    await new_session.start_reader()
+                    log.info(f"Reattached to surviving pty-host session {sid[:8]}")
+                    continue
             dead.append(sid)
 
     for sid in dead:
@@ -579,31 +599,56 @@ async def report_alive_sessions(state: DaemonState):
         backend.close_handle(session.handle)
         log.info(f"Cleaned up dead session {sid[:8]}")
 
-    # 2. Discover orphaned tmux sessions not tracked by us
+    # 2. Discover orphaned sessions not tracked by us
     orphaned: set[str] = set()  # track keys reported via session_recovered
+    tracked_ids = set(state.active_sessions.keys())
     tracked_tmux = {s.tmux_name for s in state.active_sessions.values() if s.tmux_name}
-    for tmux_name in existing_tmux:
-        if tmux_name not in tracked_tmux:
-            log.info(f"Found orphaned tmux session: {tmux_name}")
-            handle = backend.reattach(tmux_name, tmux_name, 120, 40)
-            if handle:
-                new_session = ManagedSession(
-                    tmux_name, handle, backend, sender,
-                    on_close=_on_session_close,
-                )
-                state.active_sessions[tmux_name] = new_session
-                # Don't start reader yet — it would send output with tmux_name
-                # as session_id, which isn't a valid UUID.  The reader will be
-                # started in the session_recovered_ack handler after the hub
-                # tells us the real UUID.
-                await ws_send(state, {
-                    "type": "session_recovered",
-                    "tmux_name": tmux_name,
-                    "pid": handle.pid,
-                })
-                orphaned.add(tmux_name)
 
-    # 3. Report alive sessions (skip orphans — already reported via session_recovered)
+    for surviving_id in surviving_ids:
+        if is_pty_host:
+            # pty-host: session IDs are UUIDs — can reattach and report directly
+            if surviving_id not in tracked_ids:
+                log.info(f"Found orphaned pty-host session: {surviving_id[:8]}")
+                handle = backend.reattach(surviving_id, surviving_id, 120, 40)
+                if handle:
+                    new_session = ManagedSession(
+                        surviving_id, handle, backend, sender,
+                        on_close=_on_session_close,
+                    )
+                    state.active_sessions[surviving_id] = new_session
+                    # pty-host sessions already have UUID IDs — start reader immediately
+                    await new_session.start_reader()
+                    await ws_send(state, {
+                        "type": "session_started",
+                        "session_id": surviving_id,
+                        "pid": handle.pid,
+                        "recovered": True,
+                        "tmux_name": "",
+                    })
+                    orphaned.add(surviving_id)
+        else:
+            # tmux: surviving_id is a tmux session name, not a UUID
+            if surviving_id not in tracked_tmux:
+                log.info(f"Found orphaned tmux session: {surviving_id}")
+                handle = backend.reattach(surviving_id, surviving_id, 120, 40)
+                if handle:
+                    new_session = ManagedSession(
+                        surviving_id, handle, backend, sender,
+                        on_close=_on_session_close,
+                    )
+                    state.active_sessions[surviving_id] = new_session
+                    # Don't start reader yet — it would send output with tmux_name
+                    # as session_id, which isn't a valid UUID.  The reader will be
+                    # started in the session_recovered_ack handler after the hub
+                    # tells us the real UUID.
+                    await ws_send(state, {
+                        "type": "session_recovered",
+                        "tmux_name": surviving_id,
+                        "pid": handle.pid,
+                    })
+                    orphaned.add(surviving_id)
+
+    # 3. Report alive sessions (skip orphans — already reported above)
     alive = [sid for sid in state.active_sessions if sid not in orphaned]
     if alive:
         log.info(f"Reporting {len(alive)} alive session(s) to hub")
@@ -617,10 +662,10 @@ async def report_alive_sessions(state: DaemonState):
                 "tmux_name": session.tmux_name or "",
             })
     # Ensure readers are running and trigger redraw for all recovered sessions.
-    # Skip orphans — their reader will start when session_recovered_ack arrives
-    # with the real UUID, so we don't send output tagged with a tmux name.
+    # Skip tmux orphans — their reader will start when session_recovered_ack
+    # arrives with the real UUID.  pty-host orphans already have readers started.
     for sid, session in state.active_sessions.items():
-        if sid in orphaned:
+        if sid in orphaned and not is_pty_host:
             continue
         if session.reader_task is None or session.reader_task.done():
             log.info(f"Restarting reader for session {sid[:8]}")
@@ -654,12 +699,14 @@ async def ws_connection_loop(state: DaemonState):
 async def cleanup_sessions(state: DaemonState):
     """Cleanup on daemon shutdown.
 
-    tmux sessions are intentionally LEFT ALIVE so they survive daemon
-    restarts.  On next startup, report_alive_sessions() will discover
-    and reattach to them.  Only non-tmux (plain PTY) sessions are
+    Persistent sessions (tmux on Linux, pty-host on Windows) are
+    intentionally LEFT ALIVE so they survive daemon restarts.  On next
+    startup, report_alive_sessions() will discover and reattach to them.
+    Only non-persistent (plain PTY / direct ConPTY) sessions are
     terminated, since they cannot outlive the daemon anyway.
     """
     backend = state.backend
+    persistent = backend.supports_persistence()
     for session_id, session in list(state.active_sessions.items()):
         if session.reader_task:
             session.reader_task.cancel()
@@ -667,6 +714,10 @@ async def cleanup_sessions(state: DaemonState):
             log.info(f"Detaching from tmux session {session.tmux_name} ({session_id[:8]})")
             backend.close_handle(session.handle)
             # Do NOT kill the tmux session — let it survive for recovery
+        elif persistent and session.handle.extra.get("pty_host"):
+            log.info(f"Detaching from pty-host session ({session_id[:8]})")
+            backend.close_handle(session.handle)
+            # Do NOT kill the pty-host session — let it survive for recovery
         else:
             log.info(f"Closing plain session {session_id[:8]}")
             session.close_graceful()

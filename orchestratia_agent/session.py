@@ -274,6 +274,11 @@ class ManagedSession:
 def get_session_backend() -> SessionBackend:
     """Factory: return the appropriate session backend for this platform."""
     if sys.platform == "win32":
+        from orchestratia_agent.pty_host_launcher import ensure_pty_host_running
+        if ensure_pty_host_running():
+            from orchestratia_agent.session_pty_host import PtyHostSessionBackend
+            return PtyHostSessionBackend()
+        log.warning("pty-host unavailable, using direct ConPTY (no persistence)")
         from orchestratia_agent.session_windows import WindowsSessionBackend
         return WindowsSessionBackend()
     else:

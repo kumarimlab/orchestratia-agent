@@ -68,13 +68,30 @@ async def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--version", action="version", version=f"orchestratia-agent {__version__}")
+    parser.add_argument("--pty-host", action="store_true", help="Start the PTY host server (Windows only)")
     args = parser.parse_args()
 
     setup_logging(debug=args.debug, verbose=args.verbose)
 
+    # --pty-host: start the PTY host server (Windows only)
+    if args.pty_host:
+        if sys.platform != "win32":
+            log.error("--pty-host is only available on Windows")
+            sys.exit(1)
+        from orchestratia_agent.pty_host import main as pty_host_main
+        pty_host_main()
+        return
+
     state = DaemonState()
     state.config_path = args.config
     state.backend = get_session_backend()
+
+    # Async connect for pty-host backend (TCP handshake)
+    if hasattr(state.backend, "connect"):
+        if not await state.backend.connect():
+            log.warning("pty-host connect failed, falling back to direct ConPTY")
+            from orchestratia_agent.session_windows import WindowsSessionBackend
+            state.backend = WindowsSessionBackend()
 
     if args.register:
         state.config = ensure_config_for_register(state.config_path, args.register)
@@ -116,7 +133,15 @@ async def main():
     log.info(f"Server name: {state.config.get('server_name', platform.node())}")
     log.info(f"Platform: {platform.system()} {platform.release()}")
     log.info(f"Session backend: {type(state.backend).__name__}")
-    log.info(f"Persistence: {'yes (tmux)' if state.backend.supports_persistence() else 'no'}")
+    if state.backend.supports_persistence():
+        backend_name = type(state.backend).__name__
+        if "PtyHost" in backend_name:
+            persist_label = "yes (pty-host)"
+        else:
+            persist_label = "yes (tmux)"
+    else:
+        persist_label = "no"
+    log.info(f"Persistence: {persist_label}")
     async with httpx.AsyncClient(timeout=30) as client:
         key = await register_with_hub(client, state)
         if not key:

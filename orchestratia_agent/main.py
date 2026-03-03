@@ -117,13 +117,6 @@ async def main():
     log.info(f"Platform: {platform.system()} {platform.release()}")
     log.info(f"Session backend: {type(state.backend).__name__}")
     log.info(f"Persistence: {'yes (tmux)' if state.backend.supports_persistence() else 'no'}")
-    if sys.platform == "win32":
-        try:
-            from orchestratia_agent.conpty import _use_bundled
-            log.info(f"ConPTY: {'bundled conpty.dll + OpenConsole.exe' if _use_bundled else 'kernel32 (system conhost.exe)'}")
-        except ImportError:
-            pass
-
     async with httpx.AsyncClient(timeout=30) as client:
         key = await register_with_hub(client, state)
         if not key:
@@ -203,59 +196,12 @@ def _test_pty():
     print(f"Python: {sys.version}")
     print(f"Executable: {sys.executable}")
     print(f"Frozen: {getattr(sys, 'frozen', False)}")
-    meipass = getattr(sys, '_MEIPASS', None)
-    if meipass:
-        print(f"_MEIPASS: {meipass}")
     print(f"CWD: {os.getcwd()}")
     print()
 
     if sys.platform != "win32":
         print("This test is Windows-only.")
         return
-
-    # ── Test 0: Bundled ConPTY DLL detection ──────────────────────────
-    print("=" * 60)
-    print("TEST 0: Bundled ConPTY DLL detection")
-    print("=" * 60)
-    try:
-        from orchestratia_agent.conpty import (
-            _use_bundled, _conpty_dll, _find_bundled_conpty_dll,
-            _CreatePseudoConsole, _ResizePseudoConsole, _ClosePseudoConsole,
-        )
-        dll_path = _find_bundled_conpty_dll()
-        print(f"  Bundled conpty.dll path: {dll_path or 'NOT FOUND'}")
-        print(f"  Using bundled DLL: {_use_bundled}")
-        if _use_bundled:
-            dll_dir = os.path.dirname(dll_path)
-            openconsole = os.path.join(dll_dir, "OpenConsole.exe")
-            print(f"  OpenConsole.exe: {openconsole}")
-            print(f"  OpenConsole.exe exists: {os.path.isfile(openconsole)}")
-            if os.path.isfile(openconsole):
-                oc_size = os.path.getsize(openconsole)
-                print(f"  OpenConsole.exe size: {oc_size} bytes")
-            # Verify the DLL actually exports the Conpty-prefixed functions
-            import ctypes
-            try:
-                fn = ctypes.cast(
-                    ctypes.windll.kernel32.GetProcAddress(
-                        ctypes.c_void_p(_conpty_dll._handle),
-                        b"ConptyCreatePseudoConsole"
-                    ),
-                    ctypes.c_void_p
-                )
-                print(f"  ConptyCreatePseudoConsole export: {'FOUND' if fn.value else 'NOT FOUND'} (0x{fn.value or 0:X})")
-            except Exception as e:
-                print(f"  Export check: {e}")
-            print(f"  _CreatePseudoConsole points to: {_CreatePseudoConsole}")
-            print(f"  PASS: Bundled ConPTY loaded")
-        else:
-            print(f"  INFO: Will use kernel32 (system conhost.exe)")
-            print(f"  NOTE: Bundle conpty.dll + OpenConsole.exe to fix Win 11 24H2/25H2")
-    except Exception as e:
-        import traceback
-        print(f"  ERROR: {e}")
-        traceback.print_exc()
-    print()
 
     # ── Test 1: Basic subprocess (sanity check) ──────────────────────
     print("=" * 60)
@@ -273,70 +219,24 @@ def _test_pty():
         print(f"  FAIL: {e}")
     print()
 
-    # ── Test 2: ConPTY via ConPtyProcess + process monitoring ────────
-    # THIS IS THE KEY TEST. It uses ConPtyProcess.spawn() which routes
-    # through the bundled conpty.dll. We monitor which console host
-    # process spawns (OpenConsole.exe vs conhost.exe) to verify the
-    # bundled DLL is actually used.
+    # ── Test 2: ConPTY — short command ───────────────────────────────
     print("=" * 60)
-    print("TEST 2: ConPTY via ConPtyProcess (bundled DLL path)")
-    print("       + process monitoring (OpenConsole vs conhost)")
+    print("TEST 2: ConPTY via ConPtyProcess (cmd /c echo)")
     print("=" * 60)
     try:
-        import psutil
         from orchestratia_agent.conpty import ConPtyProcess
 
-        # Snapshot console host processes BEFORE creating ConPTY
-        def get_console_hosts():
-            hosts = {"conhost.exe": set(), "OpenConsole.exe": set()}
-            for proc in psutil.process_iter(['pid', 'name']):
-                try:
-                    name = proc.info['name']
-                    if name in hosts:
-                        hosts[name].add(proc.info['pid'])
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            return hosts
-
-        before = get_console_hosts()
-        print(f"  BEFORE: conhost.exe PIDs={before['conhost.exe'] or 'none'}")
-        print(f"  BEFORE: OpenConsole.exe PIDs={before['OpenConsole.exe'] or 'none'}")
-
-        # Spawn via ConPtyProcess (uses bundled DLL if available)
-        print(f"  Using bundled DLL: {_use_bundled}")
         print(f"  Spawning: cmd.exe /c echo ConPTY_WORKS")
         proc = ConPtyProcess.spawn("cmd.exe /c echo ConPTY_WORKS", cols=80, rows=25)
         print(f"  Child PID: {proc.pid}")
 
-        # Brief pause then snapshot AFTER
-        time.sleep(1)
-        after = get_console_hosts()
-        new_conhost = after["conhost.exe"] - before["conhost.exe"]
-        new_openconsole = after["OpenConsole.exe"] - before["OpenConsole.exe"]
-        print(f"  AFTER:  new conhost.exe PIDs={new_conhost or 'none'}")
-        print(f"  AFTER:  new OpenConsole.exe PIDs={new_openconsole or 'none'}")
-
-        if new_openconsole:
-            print(f"  >>> OpenConsole.exe SPAWNED — bundled DLL is working! <<<")
-        elif new_conhost:
-            print(f"  >>> conhost.exe spawned — bundled DLL fell back to system conhost! <<<")
-            print(f"  >>> This means conpty.dll couldn't find OpenConsole.exe next to it <<<")
-        else:
-            print(f"  >>> No new console host found — ConPTY may have failed silently <<<")
-
-        # Wait for process and check output
         for i in range(20):
             if not proc.isalive():
                 break
             time.sleep(0.25)
 
         exit_code = proc.exitstatus
-        alive = proc.isalive()
-        print(f"  Child alive: {alive}, exit_code: {exit_code}", end="")
-        if exit_code is not None and exit_code != 0:
-            print(f" (0x{exit_code & 0xFFFFFFFF:08X})")
-        else:
-            print()
+        print(f"  Exit code: {exit_code}")
 
         avail = proc.peek()
         print(f"  Bytes in output pipe: {avail}")
@@ -345,18 +245,11 @@ def _test_pty():
             data = proc.read(avail)
             print(f"  Output: {data[:200]!r}")
             if "ConPTY_WORKS" in data:
-                print(f"  PASS: ConPTY I/O works with bundled DLL!")
+                print(f"  PASS: ConPTY I/O works!")
             else:
                 print(f"  PARTIAL: Got output but not expected string")
         else:
-            if exit_code is not None and (exit_code & 0xFFFFFFFF) == 0xC0000142:
-                print(f"  FAIL: Child crashed with STATUS_DLL_INIT_FAILED (0xC0000142)")
-                print(f"  >>> Bundled OpenConsole.exe did NOT fix the issue <<<")
-                if new_conhost and not new_openconsole:
-                    print(f"  >>> REASON: conpty.dll fell back to system conhost.exe <<<")
-                    print(f"  >>> Check that OpenConsole.exe is in same dir as conpty.dll <<<")
-            else:
-                print(f"  FAIL: No output in pipe")
+            print(f"  FAIL: No output in pipe")
 
         proc.close()
     except Exception as e:
@@ -370,24 +263,11 @@ def _test_pty():
     print("TEST 3: Interactive shell via ConPtyProcess")
     print("=" * 60)
     try:
-        import psutil
         from orchestratia_agent.conpty import ConPtyProcess
 
-        before = get_console_hosts()
         proc = ConPtyProcess.spawn("cmd.exe", cols=80, rows=25)
         print(f"  PID: {proc.pid}")
-        print(f"  Using bundled: {proc.using_bundled_conpty}")
 
-        time.sleep(1)
-        after = get_console_hosts()
-        new_oc = after["OpenConsole.exe"] - before["OpenConsole.exe"]
-        new_ch = after["conhost.exe"] - before["conhost.exe"]
-        if new_oc:
-            print(f"  Console host: OpenConsole.exe (PID {new_oc})")
-        elif new_ch:
-            print(f"  Console host: conhost.exe (PID {new_ch}) — SYSTEM FALLBACK!")
-
-        # Wait for shell output
         print(f"  Waiting for shell output...")
         avail = 0
         for i in range(16):
@@ -416,41 +296,6 @@ def _test_pty():
         import traceback
         print(f"  FAIL: {e}")
         traceback.print_exc()
-    print()
-
-    # ── Test 4: Verify DLL file paths in _MEIPASS ────────────────────
-    print("=" * 60)
-    print("TEST 4: File layout verification")
-    print("=" * 60)
-    try:
-        from orchestratia_agent.conpty import _find_bundled_conpty_dll
-        dll_path = _find_bundled_conpty_dll()
-        if dll_path:
-            dll_dir = os.path.dirname(dll_path)
-            print(f"  conpty.dll dir: {dll_dir}")
-            print(f"  Contents:")
-            for f in os.listdir(dll_dir):
-                fpath = os.path.join(dll_dir, f)
-                size = os.path.getsize(fpath) if os.path.isfile(fpath) else 0
-                print(f"    {f} ({size} bytes)")
-        else:
-            print(f"  No bundled conpty.dll found")
-
-        # Also check _MEIPASS root
-        meipass = getattr(sys, '_MEIPASS', None)
-        if meipass:
-            print(f"\n  _MEIPASS root: {meipass}")
-            conpty_dir = os.path.join(meipass, "conpty")
-            if os.path.isdir(conpty_dir):
-                print(f"  conpty/ subdir exists: YES")
-                for f in os.listdir(conpty_dir):
-                    fpath = os.path.join(conpty_dir, f)
-                    size = os.path.getsize(fpath) if os.path.isfile(fpath) else 0
-                    print(f"    {f} ({size} bytes)")
-            else:
-                print(f"  conpty/ subdir exists: NO — files may not be bundled!")
-    except Exception as e:
-        print(f"  ERROR: {e}")
     print()
 
     print("Diagnostic complete.")

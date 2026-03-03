@@ -22,35 +22,8 @@ jobs:
           pip install pyinstaller
           pip install .
 
-      - name: Download bundled ConPTY (OpenConsole.exe + conpty.dll)
-        run: |
-          # Download conpty.dll and OpenConsole.exe from node-pty (MIT-licensed)
-          # These bypass the broken system conhost.exe on Win 11 24H2/25H2
-          # where child processes crash with STATUS_DLL_INIT_FAILED (0xC0000142)
-          New-Item -ItemType Directory -Force -Path "conpty"
-          $base = "https://raw.githubusercontent.com/microsoft/node-pty/main/third_party/conpty/1.23.251008001/win10-x64"
-          Invoke-WebRequest -Uri "$base/conpty.dll" -OutFile "conpty/conpty.dll"
-          Invoke-WebRequest -Uri "$base/OpenConsole.exe" -OutFile "conpty/OpenConsole.exe"
-          Write-Host "Downloaded conpty.dll: $((Get-Item conpty/conpty.dll).Length) bytes"
-          Write-Host "Downloaded OpenConsole.exe: $((Get-Item conpty/OpenConsole.exe).Length) bytes"
-
       - name: Build exe
         run: pyinstaller orchestratia_agent.spec
-
-      - name: Verify ConPTY embedded in exe
-        run: |
-          # With one-file PyInstaller build, conpty files are embedded inside the exe.
-          # They get extracted to sys._MEIPASS/conpty/ at runtime.
-          # Verify by checking the spec included them (build log shows "Including bundled ConPTY")
-          $size = (Get-Item dist\orchestratia-agent.exe).Length
-          $sizeMB = [math]::Round($size / 1MB, 1)
-          Write-Host "orchestratia-agent.exe: $sizeMB MB ($size bytes)"
-          # The exe should be larger than before (~25MB -> ~26MB with conpty files)
-          if ($size -lt 20MB) {
-            Write-Host "WARNING: Exe seems too small — ConPTY files may not be bundled"
-          } else {
-            Write-Host "Size looks good (conpty.dll ~110KB + OpenConsole.exe ~1.1MB embedded)"
-          }
 
       - name: Test exe runs
         run: |

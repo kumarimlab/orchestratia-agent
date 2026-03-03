@@ -122,13 +122,35 @@ Write-Step 1 $TotalSteps "Removing existing installation (if any)"
 
 $existing = $false
 
-# 1a. Kill any running orchestratia-agent processes
+# 1a. Kill running orchestratia-agent processes (but NOT the pty-host)
+# The pty-host owns live ConPTY sessions — killing it destroys all terminal
+# sessions. We only kill agent daemon processes and leave pty-host running
+# so sessions survive reinstalls.
 $runningProcs = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
 if ($runningProcs) {
     $existing = $true
-    $runningProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+    $killed = 0
+    $preserved = 0
+    foreach ($p in $runningProcs) {
+        try {
+            $wmiProc = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)" -ErrorAction SilentlyContinue
+            $cmdLine = if ($wmiProc) { $wmiProc.CommandLine } else { "" }
+            if ($cmdLine -match "--pty-host") {
+                $preserved++
+                Write-Info "Preserving pty-host process (PID $($p.Id)) — sessions stay alive"
+            } else {
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                $killed++
+            }
+        } catch {
+            # If we can't check the command line, kill it (safe default)
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $killed++
+        }
+    }
     Start-Sleep -Seconds 1
-    Write-Ok "Killed running agent process(es)"
+    if ($killed -gt 0) { Write-Ok "Killed $killed agent process(es)" }
+    if ($preserved -gt 0) { Write-Ok "Preserved $preserved pty-host process(es) (sessions intact)" }
 }
 
 # 1b. Also kill any python-based agent (pip install runs as python.exe)
@@ -236,11 +258,25 @@ if ($build -ge 17763) {
 
 Write-Info "Downloading from: $ReleaseUrl"
 try {
+    # If pty-host is running, the exe file is locked. Rename it first.
+    if (Test-Path $AgentExePath) {
+        $oldExe = "$AgentExePath.old"
+        Remove-Item $oldExe -Force -ErrorAction SilentlyContinue
+        try {
+            Rename-Item $AgentExePath $oldExe -Force -ErrorAction Stop
+            Write-Ok "Renamed old exe (pty-host keeps running with in-memory copy)"
+        } catch {
+            # Can't rename — try direct overwrite (works if no pty-host running)
+            Remove-Item $AgentExePath -Force -ErrorAction SilentlyContinue
+        }
+    }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -Uri $ReleaseUrl -OutFile $AgentExePath -UseBasicParsing -TimeoutSec 120
     $size = (Get-Item $AgentExePath).Length
     $sizeMB = [math]::Round($size / 1MB, 1)
     Write-Ok "Downloaded orchestratia-agent.exe ($sizeMB MB)"
+    # Clean up old exe (may fail if still in use — that's fine)
+    Remove-Item "$AgentExePath.old" -Force -ErrorAction SilentlyContinue
 } catch {
     Write-Fatal "Download failed: $_`n  URL: $ReleaseUrl"
 }
@@ -378,7 +414,39 @@ try {
         }
     }
 } catch {
-    Write-Fail "Could not create scheduled task: $_"
+    Write-Warn "Register-ScheduledTask failed: $_"
+    Write-Info "Trying schtasks.exe fallback (works without admin)..."
+
+    # schtasks.exe fallback — creates a logon trigger task as the current user
+    try {
+        $schtasksArgs = @(
+            "/Create"
+            "/TN", $TaskName
+            "/TR", "`"$AgentExePath`""
+            "/SC", "ONLOGON"
+            "/RL", "LIMITED"
+            "/F"  # force overwrite if exists
+        )
+        $result = & schtasks.exe @schtasksArgs 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Scheduled task created via schtasks.exe"
+            $ServiceInstalled = $true
+
+            # Start it now
+            schtasks.exe /Run /TN $TaskName 2>$null
+            Start-Sleep -Seconds 3
+            $proc = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
+            if ($proc) {
+                Write-Ok "Agent is running (PID: $($proc.Id))"
+            } else {
+                Write-Warn "Agent may not be running — check logs"
+            }
+        } else {
+            Write-Fail "schtasks.exe also failed: $result"
+        }
+    } catch {
+        Write-Fail "schtasks.exe fallback failed: $_"
+    }
 }
 
 if (-not $ServiceInstalled) {
@@ -397,6 +465,9 @@ if ($Errors -eq 0) {
 }
 Write-Host ""
 Write-Host "  Installed to: $AgentExePath" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Sessions persist across agent restarts and reinstalls." -ForegroundColor DarkGray
+Write-Host "  The pty-host process owns sessions independently." -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Useful commands:" -ForegroundColor DarkGray
 Write-Host "    Version:  orchestratia-agent --version"

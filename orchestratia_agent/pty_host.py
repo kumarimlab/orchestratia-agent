@@ -402,17 +402,8 @@ class PtyHost:
                         log.debug(f"Reader error for {hs.session_id[:8]}: {e}")
                     break
 
-                # Send to client or buffer
-                async with self._writer_lock:
-                    has_client = self._writer is not None
-                if has_client:
-                    await self._send({
-                        "type": "output",
-                        "session_id": hs.session_id,
-                        "data": base64.b64encode(raw).decode("ascii"),
-                    })
-                else:
-                    hs.ring.write(raw)
+                # Atomically send to client or buffer in ring
+                await self._send_or_buffer(hs, raw)
         finally:
             # Session exited
             hs.exit_code = hs.proc.exitstatus
@@ -422,10 +413,40 @@ class PtyHost:
                 "session_id": hs.session_id,
                 "exit_code": hs.exit_code,
             })
-            # Clean up dead sessions after a while (keep for list_sessions)
+            # Remove dead session after a short delay (lets client see exit_code via list_sessions)
+            await asyncio.sleep(5)
+            self.sessions.pop(hs.session_id, None)
+            log.debug(f"Removed dead session {hs.session_id[:8]} from sessions dict")
+
+    async def _send_or_buffer(self, hs: HostedSession, raw: bytes) -> None:
+        """Atomically send session output to client, or buffer in ring.
+
+        Holds the writer lock for the entire operation so there's no
+        window where data can be dropped between checking the client
+        and sending.
+        """
+        b64 = base64.b64encode(raw).decode("ascii")
+        line = json.dumps({
+            "type": "output",
+            "session_id": hs.session_id,
+            "data": b64,
+        }, separators=(",", ":")) + "\n"
+        encoded = line.encode("utf-8")
+
+        async with self._writer_lock:
+            writer = self._writer
+            if writer:
+                try:
+                    writer.write(encoded)
+                    await writer.drain()
+                    return
+                except (ConnectionError, OSError):
+                    pass
+            # No client or send failed — buffer
+            hs.ring.write(raw)
 
     async def _send(self, msg: dict):
-        """Send a JSON-lines message to the connected client."""
+        """Send a JSON-lines message to the connected client (best-effort)."""
         async with self._writer_lock:
             writer = self._writer
         if not writer:

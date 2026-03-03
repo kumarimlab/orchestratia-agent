@@ -125,29 +125,41 @@ class PtyHostSessionBackend:
                     pass
             log.info("pty-host recv loop exited")
 
+    def _get_or_create_queue(self, session_id: str) -> queue.Queue:
+        """Get or auto-create an output queue for a session.
+
+        Auto-creation is essential for reconnect: when the agent connects
+        to a running pty-host, buffered_output messages arrive immediately
+        — before discover_surviving_sessions() / reattach() set up queues.
+        Without auto-creation, that buffered data would be silently dropped.
+        """
+        q = self._output_queues.get(session_id)
+        if q is None:
+            q = queue.Queue(maxsize=4096)
+            self._output_queues[session_id] = q
+        return q
+
     def _handle_message(self, msg: dict):
         msg_type = msg.get("type", "")
 
         if msg_type == "output":
             sid = msg.get("session_id", "")
-            q = self._output_queues.get(sid)
-            if q:
-                raw = base64.b64decode(msg.get("data", ""))
-                try:
-                    q.put_nowait(raw)
-                except queue.Full:
-                    pass  # drop if queue full (shouldn't happen)
+            q = self._get_or_create_queue(sid)
+            raw = base64.b64decode(msg.get("data", ""))
+            try:
+                q.put_nowait(raw)
+            except queue.Full:
+                pass
 
         elif msg_type == "buffered_output":
             sid = msg.get("session_id", "")
-            q = self._output_queues.get(sid)
-            if q:
-                raw = base64.b64decode(msg.get("data", ""))
-                if raw:
-                    try:
-                        q.put_nowait(raw)
-                    except queue.Full:
-                        pass
+            q = self._get_or_create_queue(sid)
+            raw = base64.b64decode(msg.get("data", ""))
+            if raw:
+                try:
+                    q.put_nowait(raw)
+                except queue.Full:
+                    pass
 
         elif msg_type == "exited":
             sid = msg.get("session_id", "")

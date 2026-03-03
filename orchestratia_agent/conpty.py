@@ -3,14 +3,9 @@
 Replaces pywinpty, which fails in PyInstaller-bundled executables on
 Windows 11 24H2+ due to handle lifecycle issues in the .pyd extension.
 
-**Primary path**: Loads a bundled `conpty.dll` + `OpenConsole.exe` from the
-Windows Terminal project (MIT-licensed). This bypasses the system conhost.exe,
-which has a bug on Win 11 24H2/25H2 where child processes crash with
-STATUS_DLL_INIT_FAILED (0xC0000142) when launched via ConPTY.
-
-**Fallback path**: If the bundled DLL is not found, falls back to
-kernel32.CreatePseudoConsole (system conhost.exe). This works on older
-Windows 10/11 builds that don't have the conhost bug.
+Supports two modes:
+  1. Bundled conpty.dll + OpenConsole.exe (named pipes, preferred)
+  2. Kernel32 CreatePseudoConsole fallback (anonymous pipes)
 
 Requires Windows 10 build 17763+ (version 1809).
 """
@@ -39,6 +34,7 @@ STILL_ACTIVE = 259
 INFINITE = 0xFFFFFFFF
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x00000102
+STARTF_USESTDHANDLES = 0x00000100
 
 # Named pipe constants (matching node-pty's approach)
 PIPE_ACCESS_INBOUND = 0x00000001
@@ -356,9 +352,8 @@ class ConPtyProcess:
         # these handles; closing them severs the ConPTY→pipe I/O path.
         self._pty_input_read: wt.HANDLE | None = None
         self._pty_output_write: wt.HANDLE | None = None
-        # Keep references to objects that must stay alive for the ConPTY
+        # Keep reference to attr_buf so it's not garbage collected
         self._attr_buf = None
-        self._hpc_ref = None
         self.pid: int = 0
         self._exit_code: int | None = None
         self.using_bundled_conpty: bool = _use_bundled
@@ -456,10 +451,11 @@ class ConPtyProcess:
             kernel32.CloseHandle(pipe_out)
             raise ctypes.WinError()
 
-        hpc_ref = wt.HANDLE(hpc.value)
+        # Bug fix: HPCON is already a void* — pass its value directly.
+        # ctypes.byref(hpc_ref) would pass void** (pointer to pointer), wrong.
         if not kernel32.UpdateProcThreadAttribute(
             attr_buf, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            ctypes.byref(hpc_ref), ctypes.sizeof(wt.HANDLE), None, None,
+            hpc.value, ctypes.sizeof(wt.HANDLE), None, None,
         ):
             kernel32.DeleteProcThreadAttributeList(attr_buf)
             _ClosePseudoConsole(hpc)
@@ -470,6 +466,7 @@ class ConPtyProcess:
         # ── 5. Create child process ──────────────────────────────────
         si = STARTUPINFOEX()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEX)
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
         si.lpAttributeList = ctypes.addressof(attr_buf)
 
         pi = PROCESS_INFORMATION()
@@ -502,7 +499,6 @@ class ConPtyProcess:
         self._pty_output_write = None  # Not used with named pipes
         self.pid = pi.dwProcessId
         self._attr_buf = attr_buf
-        self._hpc_ref = hpc_ref
 
         log.debug(
             f"ConPTY process pid={self.pid} "
@@ -581,10 +577,10 @@ class ConPtyProcess:
                 kernel32.CloseHandle(h)
             raise ctypes.WinError()
 
-        hpc_ref = wt.HANDLE(hpc.value)
+        # Bug fix: HPCON is already a void* — pass its value directly.
         if not kernel32.UpdateProcThreadAttribute(
             attr_buf, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            ctypes.byref(hpc_ref), ctypes.sizeof(wt.HANDLE), None, None,
+            hpc.value, ctypes.sizeof(wt.HANDLE), None, None,
         ):
             kernel32.DeleteProcThreadAttributeList(attr_buf)
             _ClosePseudoConsole(hpc)
@@ -595,6 +591,7 @@ class ConPtyProcess:
         # ── 4. Create child process ──────────────────────────────────
         si = STARTUPINFOEX()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEX)
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
         si.lpAttributeList = ctypes.addressof(attr_buf)
 
         pi = PROCESS_INFORMATION()
@@ -624,7 +621,6 @@ class ConPtyProcess:
         self._pty_output_write = wt.HANDLE(pipe_out_write.value)
         self.pid = pi.dwProcessId
         self._attr_buf = attr_buf
-        self._hpc_ref = hpc_ref
 
         log.debug(
             f"ConPTY process pid={self.pid} "
@@ -720,7 +716,6 @@ class ConPtyProcess:
             kernel32.CloseHandle(self._process_handle)
             self._process_handle = None
         self._attr_buf = None
-        self._hpc_ref = None
 
     def __del__(self) -> None:
         self.close()

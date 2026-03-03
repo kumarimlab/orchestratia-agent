@@ -208,15 +208,19 @@ class PtyHost:
 
         # Send buffered output for all alive sessions
         for hs in self.sessions.values():
-            if hs.alive or hs.ring._readable > 0:
+            buffered = hs.ring._readable
+            if hs.alive or buffered > 0:
                 data, dropped = hs.ring.drain()
                 if data:
+                    log.info(f"Draining {len(data)} buffered bytes for session {hs.session_id[:8]} (dropped={dropped})")
                     await self._send({
                         "type": "buffered_output",
                         "session_id": hs.session_id,
                         "data": base64.b64encode(data).decode("ascii"),
                         "bytes_dropped": dropped,
                     })
+                else:
+                    log.debug(f"Session {hs.session_id[:8]}: ring buffer empty (0 bytes to drain)")
             # Also report exited sessions
             if not hs.alive and hs.exit_code is not None:
                 await self._send({
@@ -363,6 +367,11 @@ class PtyHost:
                 hs.proc.terminate(force=True)
             except Exception:
                 pass
+            # Close ConPTY handles to unblock the reader's peek/read
+            try:
+                hs.proc.close()
+            except Exception:
+                pass
 
     async def _cmd_list_sessions(self, msg: dict):
         req_id = msg.get("req_id", "")
@@ -383,30 +392,57 @@ class PtyHost:
             "sessions": result,
         })
 
+    @staticmethod
+    def _poll_read(proc: ConPtyProcess) -> str | None:
+        """Read from ConPTY with polling to detect process death.
+
+        Returns output str, empty str on timeout (retry), or None on EOF.
+        Uses peek + read instead of blocking ReadFile, so the thread
+        never blocks forever — critical for detecting kill_force.
+        """
+        for _ in range(20):  # 2s total (20 * 100ms)
+            avail = proc.peek()
+            if avail > 0:
+                return proc.read(min(avail, 4096))
+            if avail < 0 or not proc.isalive():
+                # Drain any remaining bytes before reporting EOF
+                try:
+                    final_avail = proc.peek()
+                    if final_avail and final_avail > 0:
+                        return proc.read(min(final_avail, 4096))
+                except Exception:
+                    pass
+                return None  # EOF — pipe closed or process dead
+            time.sleep(0.1)
+        return ""  # timeout, process still alive but no data
+
     async def _session_reader(self, hs: HostedSession):
         """Read ConPTY output in a thread and relay to client or ring buffer."""
         loop = asyncio.get_event_loop()
         try:
-            while self._running and hs.alive:
+            while self._running:
                 try:
                     data_str = await loop.run_in_executor(
-                        self._executor, hs.proc.read, 4096,
+                        self._executor, self._poll_read, hs.proc,
                     )
+                    if data_str is None:
+                        break  # EOF
                     if not data_str:
-                        break
+                        continue  # timeout, no data — retry
                     raw = data_str.encode("utf-8", errors="replace")
                 except EOFError:
                     break
                 except Exception as e:
-                    if hs.alive:
+                    if hs.proc.isalive():
                         log.debug(f"Reader error for {hs.session_id[:8]}: {e}")
                     break
 
                 # Atomically send to client or buffer in ring
                 await self._send_or_buffer(hs, raw)
         finally:
-            # Session exited
+            # Session exited — cache exit code before closing handles
             hs.exit_code = hs.proc.exitstatus
+            hs.proc.close()
             log.info(f"Session {hs.session_id[:8]} exited (code={hs.exit_code})")
             await self._send({
                 "type": "exited",
@@ -414,9 +450,9 @@ class PtyHost:
                 "exit_code": hs.exit_code,
             })
             # Remove dead session after a short delay (lets client see exit_code via list_sessions)
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
             self.sessions.pop(hs.session_id, None)
-            log.debug(f"Removed dead session {hs.session_id[:8]} from sessions dict")
+            log.info(f"Removed dead session {hs.session_id[:8]} from sessions dict")
 
     async def _send_or_buffer(self, hs: HostedSession, raw: bytes) -> None:
         """Atomically send session output to client, or buffer in ring.
@@ -441,7 +477,9 @@ class PtyHost:
                     await writer.drain()
                     return
                 except (ConnectionError, OSError):
-                    pass
+                    log.debug(f"Send failed for {hs.session_id[:8]}, buffering {len(raw)} bytes")
+            else:
+                log.debug(f"No client, buffering {len(raw)} bytes for {hs.session_id[:8]}")
             # No client or send failed — buffer
             hs.ring.write(raw)
 

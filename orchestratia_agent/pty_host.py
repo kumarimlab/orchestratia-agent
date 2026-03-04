@@ -512,10 +512,17 @@ class PtyHost:
 # ── Entry point ──────────────────────────────────────────────────────
 
 def main():
+    log_dir = os.path.join(_DATA_DIR, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "pty-host.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(),  # also to console if not detached
+        ],
     )
 
     host = PtyHost()

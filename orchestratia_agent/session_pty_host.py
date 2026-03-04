@@ -11,13 +11,13 @@ unreachable.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import logging
 import os
 import queue
 import shutil
+import socket as socket_mod
 import sys
 import threading
 import time
@@ -48,8 +48,6 @@ class PtyHostSessionBackend:
     """SessionBackend that delegates ConPTY ownership to pty-host."""
 
     def __init__(self):
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
         self._connected = False
         self._recv_thread: threading.Thread | None = None
         self._recv_running = False
@@ -57,24 +55,27 @@ class PtyHostSessionBackend:
         # Per-session output queues (fed by the recv loop)
         self._output_queues: dict[str, queue.Queue[bytes | None]] = {}
 
-        # req_id -> (asyncio.Event, result_dict)  for request-reply commands
+        # req_id -> (threading.Event, result_dict) for request-reply commands
         self._pending_requests: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
 
-        # Lock for _writer access from any thread
+        # Lock for socket send access from any thread
         self._send_lock = threading.Lock()
-        # Raw socket for synchronous send from non-async contexts
-        self._raw_sock: Any = None
+        # Plain blocking socket — NOT asyncio.  asyncio.open_connection()
+        # creates a transport that starts IOCP reads on the socket,
+        # competing with our recv thread's sock.recv().  On Windows this
+        # causes the recv thread to miss responses, making every spawn
+        # time out.
+        self._raw_sock: socket_mod.socket | None = None
 
     async def connect(self) -> bool:
         """Connect to the pty-host TCP server. Returns True on success."""
         try:
-            self._reader, self._writer = await asyncio.open_connection(
-                PTY_HOST_ADDR, PTY_HOST_PORT,
+            sock = socket_mod.create_connection(
+                (PTY_HOST_ADDR, PTY_HOST_PORT), timeout=5,
             )
+            sock.setblocking(True)
+            self._raw_sock = sock
             self._connected = True
-            # Extract raw socket for synchronous sends
-            transport = self._writer.transport
-            self._raw_sock = transport.get_extra_info("socket")
             # Start background recv thread
             self._recv_running = True
             self._recv_thread = threading.Thread(
@@ -89,7 +90,6 @@ class PtyHostSessionBackend:
 
     def _recv_loop(self):
         """Background thread: read JSON-lines from pty-host and dispatch."""
-        import socket
         sock = self._raw_sock
         if not sock:
             return
@@ -98,7 +98,7 @@ class PtyHostSessionBackend:
             while self._recv_running:
                 try:
                     chunk = sock.recv(65536)
-                except (socket.timeout, BlockingIOError):
+                except (socket_mod.timeout, BlockingIOError):
                     continue
                 except OSError:
                     break

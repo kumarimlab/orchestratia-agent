@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import logging
+import os
 import sys
 
 if sys.platform != "win32":
@@ -207,6 +208,7 @@ class ConPtyProcess:
         cwd: str | None = None,
         cols: int = 120,
         rows: int = 40,
+        env: dict[str, str] | None = None,
     ) -> "ConPtyProcess":
         """Spawn a child process inside a new ConPTY pseudo-console."""
         self = cls()
@@ -281,7 +283,19 @@ class ConPtyProcess:
                 kernel32.CloseHandle(h)
             raise ctypes.WinError()
 
-        # ── 4. Create child process ──────────────────────────────────
+        # ── 4. Build environment block (if custom env vars provided) ──
+        env_block = None
+        creation_flags = EXTENDED_STARTUPINFO_PRESENT
+        if env is not None:
+            merged = os.environ.copy()
+            merged.update(env)
+            # Windows env block: "KEY=VALUE\0KEY=VALUE\0\0" in UTF-16-LE
+            parts = [f"{k}={v}" for k, v in sorted(merged.items())]
+            block_str = "\0".join(parts) + "\0\0"
+            env_block = ctypes.create_unicode_buffer(block_str)
+            creation_flags |= 0x00000400  # CREATE_UNICODE_ENVIRONMENT
+
+        # ── 5. Create child process ──────────────────────────────────
         si = STARTUPINFOEX()
         si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEX)
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
@@ -292,8 +306,8 @@ class ConPtyProcess:
 
         success = kernel32.CreateProcessW(
             None, cmd_buf, None, None,
-            False, EXTENDED_STARTUPINFO_PRESENT,
-            None, cwd, ctypes.byref(si), ctypes.byref(pi),
+            False, creation_flags,
+            env_block, cwd, ctypes.byref(si), ctypes.byref(pi),
         )
         kernel32.DeleteProcThreadAttributeList(attr_buf)
 

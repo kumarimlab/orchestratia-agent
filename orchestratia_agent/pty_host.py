@@ -291,13 +291,13 @@ class PtyHost:
         rows = msg.get("rows", 40)
         env_vars = msg.get("env")
 
-        # Set env vars in parent so child inherits
+        # Pass env vars to spawn() — never modify parent os.environ
+        spawn_env = None
         if env_vars and isinstance(env_vars, dict):
-            for k, v in env_vars.items():
-                os.environ[k] = str(v)
+            spawn_env = {k: str(v) for k, v in env_vars.items()}
 
         try:
-            proc = ConPtyProcess.spawn(command, cwd=cwd, cols=cols, rows=rows)
+            proc = ConPtyProcess.spawn(command, cwd=cwd, cols=cols, rows=rows, env=spawn_env)
             # Brief check that it didn't die immediately
             await asyncio.sleep(0.3)
             if not proc.isalive():

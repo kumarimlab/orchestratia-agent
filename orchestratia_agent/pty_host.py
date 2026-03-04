@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import time
@@ -285,11 +286,24 @@ class PtyHost:
     async def _cmd_spawn(self, msg: dict):
         req_id = msg.get("req_id", "")
         session_id = msg.get("session_id", "")
-        command = msg.get("command", "pwsh.exe")
+        command = msg.get("command", "")
         cwd = msg.get("cwd")
         cols = msg.get("cols", 120)
         rows = msg.get("rows", 40)
         env_vars = msg.get("env")
+
+        # Resolve shell — fall back if requested shell isn't installed
+        if not command or not shutil.which(command):
+            original = command
+            command = ""
+            for shell in ("pwsh.exe", "powershell.exe", "cmd.exe"):
+                if shutil.which(shell):
+                    command = shell
+                    break
+            if not command:
+                command = os.environ.get("COMSPEC", "cmd.exe")
+            if original:
+                log.info(f"Shell '{original}' not found, using '{command}'")
 
         # Pass env vars to spawn() — never modify parent os.environ
         spawn_env = None

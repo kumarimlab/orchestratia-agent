@@ -196,42 +196,13 @@ class PtyHost:
         log.info(f"Client connected from {addr}")
         self._last_activity = time.monotonic()
 
-        # Atomically: set new writer + drain ring buffers.
-        # Holding the lock prevents _send_or_buffer from sneaking in
-        # between the writer swap and the drain (which would cause it
-        # to send live output to the new client while we think the
-        # ring buffer still has the data).
+        # Set the new writer.  Ring buffer drain is NOT automatic —
+        # the agent must send {"cmd":"drain"} explicitly after connecting.
+        # This prevents health-check throwaway connections from consuming
+        # buffered session data.
         async with self._writer_lock:
             old_writer = self._writer
             self._writer = writer
-
-            for hs in self.sessions.values():
-                if hs.alive or hs.ring._readable > 0:
-                    data, dropped = hs.ring.drain()
-                    if data:
-                        log.info(f"Draining {len(data)} buffered bytes for session {hs.session_id[:8]} (dropped={dropped})")
-                        msg = json.dumps({
-                            "type": "buffered_output",
-                            "session_id": hs.session_id,
-                            "data": base64.b64encode(data).decode("ascii"),
-                            "bytes_dropped": dropped,
-                        }, separators=(",", ":")) + "\n"
-                        writer.write(msg.encode("utf-8"))
-                    else:
-                        log.debug(f"Session {hs.session_id[:8]}: ring buffer empty (0 bytes to drain)")
-                if not hs.alive and hs.exit_code is not None:
-                    msg = json.dumps({
-                        "type": "exited",
-                        "session_id": hs.session_id,
-                        "exit_code": hs.exit_code,
-                    }, separators=(",", ":")) + "\n"
-                    writer.write(msg.encode("utf-8"))
-
-        # Flush all buffered_output messages outside the lock
-        try:
-            await writer.drain()
-        except (ConnectionError, OSError):
-            pass
 
         if old_writer:
             try:
@@ -280,6 +251,8 @@ class PtyHost:
             self._cmd_kill_force(msg)
         elif cmd == "list_sessions":
             await self._cmd_list_sessions(msg)
+        elif cmd == "drain":
+            await self._cmd_drain(msg)
         elif cmd == "ping":
             await self._send({"type": "pong"})
 
@@ -415,6 +388,40 @@ class PtyHost:
             "req_id": req_id,
             "sessions": result,
         })
+
+    async def _cmd_drain(self, msg: dict):
+        """Drain ring buffers for all sessions to the connected client.
+
+        The agent sends this explicitly after connecting, so health-check
+        connections (ping/pong only) never consume buffered output.
+        """
+        async with self._writer_lock:
+            writer = self._writer
+            if not writer:
+                return
+            for hs in self.sessions.values():
+                if hs.alive or hs.ring._readable > 0:
+                    data, dropped = hs.ring.drain()
+                    if data:
+                        log.info(f"Draining {len(data)} buffered bytes for session {hs.session_id[:8]} (dropped={dropped})")
+                        line = json.dumps({
+                            "type": "buffered_output",
+                            "session_id": hs.session_id,
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "bytes_dropped": dropped,
+                        }, separators=(",", ":")) + "\n"
+                        writer.write(line.encode("utf-8"))
+                if not hs.alive and hs.exit_code is not None:
+                    line = json.dumps({
+                        "type": "exited",
+                        "session_id": hs.session_id,
+                        "exit_code": hs.exit_code,
+                    }, separators=(",", ":")) + "\n"
+                    writer.write(line.encode("utf-8"))
+        try:
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
 
     @staticmethod
     def _poll_read(proc: ConPtyProcess) -> str | None:

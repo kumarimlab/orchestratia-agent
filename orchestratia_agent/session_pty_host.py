@@ -98,6 +98,8 @@ class PtyHostSessionBackend:
             )
             self._recv_thread.start()
             log.info(f"Connected to pty-host at {PTY_HOST_ADDR}:{PTY_HOST_PORT}")
+            # Request buffered output — pty-host no longer auto-drains on connect
+            self._send_sync({"cmd": "drain"})
             return True
         except (OSError, ConnectionRefusedError) as e:
             log.warning(f"Cannot connect to pty-host: {e}")
@@ -140,13 +142,11 @@ class PtyHostSessionBackend:
         finally:
             self._connected = False
             self._recv_running = False
-            # Signal EOF to all output queues
-            for q in self._output_queues.values():
-                try:
-                    q.put_nowait(None)
-                except queue.Full:
-                    pass
-            log.info("pty-host recv loop exited")
+            # Do NOT signal EOF to output queues here.  The TCP connection
+            # dropping does NOT mean sessions are dead — they live in
+            # pty-host.  read_blocking() will detect _connected=False and
+            # trigger a reconnect instead of returning None (EOF).
+            log.info("pty-host recv loop exited (sessions preserved in pty-host)")
 
     def _get_or_create_queue(self, session_id: str) -> queue.Queue:
         """Get or auto-create an output queue for a session.
@@ -322,19 +322,32 @@ class PtyHostSessionBackend:
         )
 
     def read_blocking(self, handle: SessionHandle) -> bytes | None:
-        """Block until output is available. Returns None on EOF."""
+        """Block until output is available. Returns None on EOF.
+
+        When the TCP connection to pty-host drops, this tries to reconnect
+        (up to 3 attempts) instead of immediately returning None.  Sessions
+        live in pty-host and survive agent TCP disconnects.
+        """
         sid = handle.extra.get("session_id", "")
         q = self._output_queues.get(sid)
         if not q:
             return None
         try:
-            # Block with a timeout so we can detect disconnection
             data = q.get(timeout=2.0)
-            return data  # None means EOF/exited
+            return data  # None means the session actually exited (from "exited" message)
         except queue.Empty:
-            if not self._connected:
-                return None
-            return b""  # No data yet, but still connected
+            if self._connected:
+                return b""  # No data yet, still connected
+            # TCP connection lost — try to reconnect to pty-host.
+            # Sessions are still alive in pty-host, so don't return None.
+            for attempt in range(3):
+                log.info(f"read_blocking: reconnecting to pty-host (attempt {attempt + 1}/3)")
+                if self._connect_sync():
+                    # _connect_sync already sends drain command
+                    return b""  # Reconnected — caller will retry read
+                time.sleep(1)
+            log.error("read_blocking: failed to reconnect to pty-host after 3 attempts")
+            return None
 
     def write(self, handle: SessionHandle, data: bytes) -> None:
         sid = handle.extra.get("session_id", "")

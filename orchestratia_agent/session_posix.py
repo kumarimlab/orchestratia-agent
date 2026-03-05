@@ -166,7 +166,10 @@ class PosixSessionBackend:
                 )
 
                 # Update env vars in recovered session (API key may have
-                # changed after re-registration / reinstall)
+                # changed after re-registration / reinstall).
+                # tmux setenv updates the session-level env (affects new panes).
+                # The CLI itself always reads config.yaml for the fresh key,
+                # so stale env vars in the running shell are harmless.
                 if env_vars:
                     for k, v in env_vars.items():
                         subprocess.run(

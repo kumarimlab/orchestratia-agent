@@ -287,20 +287,38 @@ if [ "$OS_TYPE" = "darwin" ]; then
     # xcode-select -p can return a path even when the tools are broken
     # (e.g. after a macOS upgrade). Test that xcrun actually works.
     if ! xcode-select -p >/dev/null 2>&1 || ! xcrun --version >/dev/null 2>&1; then
-        info "Xcode Command Line Tools missing or broken. Installing..."
-        # Reset the path first so xcode-select --install doesn't think they exist
+        info "Xcode Command Line Tools not found — required for git and python3"
+        # Reset stale path so the installer dialog shows up
         sudo xcode-select --reset 2>/dev/null || true
+        info "Launching installer (a dialog will appear)..."
         xcode-select --install 2>/dev/null || true
-        fatal "Xcode Command Line Tools installation started. Please re-run this script after the installation completes."
+        # Wait for the GUI installer to finish (polls every 5s)
+        info "Waiting for installation to complete..."
+        while ! xcrun --version >/dev/null 2>&1; do
+            sleep 5
+        done
+        ok "Xcode Command Line Tools installed"
+    else
+        ok "Xcode Command Line Tools"
     fi
-    ok "Xcode Command Line Tools"
 
     # Check for Homebrew (needed for tmux/pip installs)
     if check_command brew; then
         ok "Homebrew $(brew --version 2>/dev/null | head -1 | awk '{print $2}')"
     else
-        warn "Homebrew not found — auto-install of missing packages won't work"
-        info "Install: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        info "Homebrew not found — installing (needed for tmux)..."
+        if sudo -u "$RUN_USER" /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null >/dev/null 2>&1; then
+            # Add Homebrew to PATH for the rest of this script
+            if [ -x /opt/homebrew/bin/brew ]; then
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+            elif [ -x /usr/local/bin/brew ]; then
+                eval "$(/usr/local/bin/brew shellenv)"
+            fi
+            ok "Homebrew installed"
+        else
+            warn "Could not auto-install Homebrew"
+            info "Install manually: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        fi
     fi
 fi
 
@@ -330,10 +348,21 @@ if check_command pip3; then
     ok "pip3 available"
 else
     info "pip3 not found, installing..."
-    if pkg_install python3-pip; then
-        ok "pip3 installed"
+    if [ "$OS_TYPE" = "darwin" ]; then
+        # macOS: try ensurepip first (built into Apple python), then brew
+        if sudo -u "$RUN_USER" python3 -m ensurepip --upgrade >/dev/null 2>&1 && check_command pip3; then
+            ok "pip3 installed (ensurepip)"
+        elif pkg_install python3; then
+            ok "pip3 installed (brew python3)"
+        else
+            fail "Could not install pip3. Try: python3 -m ensurepip --upgrade"
+        fi
     else
-        fail "Could not install pip3. Install manually: $(pkg_install_hint python3-pip)"
+        if pkg_install python3-pip; then
+            ok "pip3 installed"
+        else
+            fail "Could not install pip3. Install manually: $(pkg_install_hint python3-pip)"
+        fi
     fi
 fi
 

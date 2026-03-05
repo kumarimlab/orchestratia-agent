@@ -75,14 +75,6 @@ async def main():
 
     state = DaemonState()
     state.config_path = args.config
-    state.backend = get_session_backend()
-
-    # Async connect for pty-host backend (TCP handshake)
-    if hasattr(state.backend, "connect"):
-        if not await state.backend.connect():
-            log.warning("pty-host connect failed, falling back to direct ConPTY")
-            from orchestratia_agent.session_windows import WindowsSessionBackend
-            state.backend = WindowsSessionBackend()
 
     if args.register:
         state.config = ensure_config_for_register(state.config_path, args.register)
@@ -118,6 +110,14 @@ async def main():
     if not state.hub_url:
         log.error("hub_url not set in config")
         sys.exit(1)
+
+    # Set up session backend (pty-host on Windows, tmux on Linux)
+    state.backend = get_session_backend()
+    if hasattr(state.backend, "connect"):
+        if not await state.backend.connect():
+            log.warning("pty-host connect failed, falling back to direct ConPTY")
+            from orchestratia_agent.session_windows import WindowsSessionBackend
+            state.backend = WindowsSessionBackend()
 
     log.info(f"Orchestratia Agent Daemon v{__version__} starting...")
     log.info(f"Hub URL: {state.hub_url}")

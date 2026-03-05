@@ -1,6 +1,8 @@
-"""Logging configuration with color support and debug/verbose modes."""
+"""Logging configuration with color support, debug modes, and file logging."""
 
 import logging
+import logging.handlers
+import os
 import sys
 
 
@@ -28,12 +30,29 @@ class ColorFormatter(logging.Formatter):
         return msg
 
 
+def _get_log_dir() -> str | None:
+    """Get platform-appropriate log directory."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA", "")
+        if base:
+            return os.path.join(base, "Orchestratia", "logs")
+    else:
+        # Linux/macOS: use /var/log for root, ~/.local/state for user
+        if os.getuid() == 0:
+            return "/var/log/orchestratia"
+        return os.path.expanduser("~/.local/state/orchestratia/logs")
+    return None
+
+
 def setup_logging(debug: bool = False, verbose: bool = False) -> None:
     """Configure logging based on CLI flags.
 
     --debug:   DEBUG level, includes function:line in format
     --verbose: INFO level, but noisy libraries stay at INFO
     (default):  INFO level, noisy libraries quieted to WARNING
+
+    On Windows, always adds a file handler (agent.log) since the exe
+    runs with console=False and stderr goes to devnull.
     """
     if debug:
         level = logging.DEBUG
@@ -43,15 +62,30 @@ def setup_logging(debug: bool = False, verbose: bool = False) -> None:
         fmt = "%(asctime)s [%(levelname)s] %(message)s"
 
     datefmt = "%Y-%m-%d %H:%M:%S"
-    use_color = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
-
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(ColorFormatter(fmt, datefmt, use_color=use_color))
 
     root = logging.getLogger()
     root.handlers.clear()
-    root.addHandler(handler)
     root.setLevel(level)
+
+    # Console handler (useful when running interactively)
+    use_color = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(ColorFormatter(fmt, datefmt, use_color=use_color))
+    root.addHandler(console_handler)
+
+    # File handler — essential on Windows where console=False
+    log_dir = _get_log_dir()
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "agent.log")
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=5 * 1024 * 1024, backupCount=3,
+            )
+            file_handler.setFormatter(logging.Formatter(fmt, datefmt))
+            root.addHandler(file_handler)
+        except OSError:
+            pass  # Can't create log dir — continue with console only
 
     # Quiet noisy libraries unless --debug
     if not debug:

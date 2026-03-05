@@ -361,7 +361,26 @@ def entry_point():
     if "--test-pty" in sys.argv:
         _test_pty()
         return
-    asyncio.run(main())
+
+    try:
+        asyncio.run(main())
+    except Exception:
+        # Write crash info to file — essential with console=False on Windows
+        # where stderr goes to devnull and crashes are invisible.
+        import traceback
+        try:
+            if sys.platform == "win32":
+                crash_dir = os.path.join(
+                    os.environ.get("LOCALAPPDATA", "."), "Orchestratia", "logs",
+                )
+            else:
+                crash_dir = os.path.expanduser("~/.local/state/orchestratia/logs")
+            os.makedirs(crash_dir, exist_ok=True)
+            with open(os.path.join(crash_dir, "crash.log"), "a") as f:
+                traceback.print_exc(file=f)
+        except OSError:
+            pass
+        raise
 
 
 if __name__ == "__main__":

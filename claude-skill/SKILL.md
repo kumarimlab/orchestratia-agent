@@ -113,26 +113,26 @@ orchestratia task fail <task-id> --error "Cannot proceed: database migration con
 
 ```bash
 orchestratia task create --title "Build auth API" --spec "Implement JWT authentication..." \
-  --priority high --type feature --repo pinaka-gateway
+  --priority high --type feature --repo cloud-gateway
 ```
 
 ### Create and assign in one step
 
 ```bash
 orchestratia task create --title "Build auth API" --spec "..." \
-  --assign claude-pinaka-gateway --require-plan
+  --assign claude-cloud-gateway --require-plan
 ```
 
 ### Assign existing tasks
 
 ```bash
-orchestratia task assign <task-id> --session claude-pinaka-web
+orchestratia task assign <task-id> --session claude-web-dashboard
 ```
 
 With plan mode (agent must submit plan for approval before executing):
 
 ```bash
-orchestratia task assign <task-id> --session claude-pinaka-web --require-plan
+orchestratia task assign <task-id> --session claude-web-dashboard --require-plan
 ```
 
 ### Monitor all tasks
@@ -165,9 +165,9 @@ Pipeline JSON format:
 ```json
 {
   "tasks": [
-    {"id": "setup", "title": "Setup DB schema", "spec": "...", "assign": "claude-pinaka-master"},
-    {"id": "api", "title": "Build API", "spec": "...", "depends_on": ["setup"], "assign": "claude-pinaka-gateway"},
-    {"id": "web", "title": "Build UI", "spec": "...", "depends_on": ["api"], "assign": "claude-pinaka-web"}
+    {"id": "setup", "title": "Setup DB schema", "spec": "...", "assign": "claude-core-api"},
+    {"id": "api", "title": "Build API", "spec": "...", "depends_on": ["setup"], "assign": "claude-cloud-gateway"},
+    {"id": "web", "title": "Build UI", "spec": "...", "depends_on": ["api"], "assign": "claude-web-dashboard"}
   ]
 }
 ```

@@ -12,12 +12,12 @@ api_key: ""
 server_name: "dev-linux-staging"
 
 repos:
-  pinaka-gateway:
-    path: /home/ubuntu/pinaka-edge-v2-rust
-    branch: staging
-  pinakaedgecom:
-    path: /home/ubuntu/pinakaedgecom
-    branch: staging
+  my-backend-api:
+    path: /home/ubuntu/my-backend-api
+    branch: main
+  my-frontend:
+    path: /home/ubuntu/my-frontend
+    branch: main
 
 claude:
   binary: claude

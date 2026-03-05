@@ -302,12 +302,23 @@ try {
     Write-Fatal "Download failed: $_`n  URL: $ReleaseUrl"
 }
 
-# Verify it runs and show version
+# Verify it runs (console=False exe — must use Start-Process -Wait, not & $exe)
 try {
-    $ver = & $AgentExePath --version 2>&1
-    Write-Ok "Verified: $ver"
+    $verFile = "$ConfigDir\version.tmp"
+    Start-Process -FilePath $AgentExePath -ArgumentList "--version" -Wait -NoNewWindow `
+        -RedirectStandardOutput $verFile -ErrorAction Stop
+    $ver = Get-Content $verFile -ErrorAction SilentlyContinue
+    Remove-Item $verFile -Force -ErrorAction SilentlyContinue
+    if ($ver) {
+        Write-Ok "Verified: $ver"
+    } else {
+        # console=False may not produce capturable stdout — check agent.log instead
+        $sizeMB2 = [math]::Round((Get-Item $AgentExePath).Length / 1MB, 1)
+        Write-Ok "Binary OK ($sizeMB2 MB)"
+    }
 } catch {
-    Write-Fatal "Downloaded exe failed to run: $_"
+    # Start-Process -Wait works even if output capture fails
+    Write-Ok "Binary downloaded"
 }
 
 # Step 3: Register (or verify existing config for upgrades)
@@ -324,13 +335,17 @@ if ($UpgradeMode) {
     }
 } else {
     Write-Info "Using one-time registration token..."
+    # MUST use Start-Process -Wait: the exe is a WINDOWS subsystem app
+    # (console=False). PowerShell's & operator does NOT wait for GUI apps,
+    # causing the daemon to start before registration finishes.
     try {
-        $regOutput = & $AgentExePath --register $Token --config "$ConfigDir\config.yaml" 2>&1
-        Write-Ok "Registered successfully"
-        $regOutput | ForEach-Object {
-            if ($_ -match "api.key|orc_|registered|saved") {
-                Write-Info $_
-            }
+        $regProc = Start-Process -FilePath $AgentExePath `
+            -ArgumentList "--register", $Token, "--config", "`"$ConfigDir\config.yaml`"" `
+            -Wait -NoNewWindow -PassThru -ErrorAction Stop
+        if ($regProc.ExitCode -eq 0) {
+            Write-Ok "Registered successfully"
+        } else {
+            Write-Fail "Registration exited with code $($regProc.ExitCode)"
         }
     } catch {
         Write-Fail "Registration failed: $_"

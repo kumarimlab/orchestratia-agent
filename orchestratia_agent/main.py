@@ -317,6 +317,21 @@ def _test_pty():
     print("Diagnostic complete.")
 
 
+def _hide_console_window():
+    """Hide the console window on Windows for daemon/background mode.
+
+    Keeps console=True in PyInstaller spec so --version, --test-pty,
+    --register still show output normally.  Only hides when running
+    as a daemon (no interactive CLI flags).
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if hwnd:
+        ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+
+
 def entry_point():
     """Entry point for console_scripts and legacy shims."""
     if "--pty-host" in sys.argv:
@@ -324,12 +339,19 @@ def entry_point():
         if sys.platform != "win32":
             print("--pty-host is only available on Windows")
             sys.exit(1)
+        _hide_console_window()
         from orchestratia_agent.pty_host import main as pty_host_main
         pty_host_main()
         return
     if "--test-pty" in sys.argv:
         _test_pty()
         return
+
+    # Hide console when running as daemon (no interactive flags)
+    interactive_flags = {"--version", "--test-pty", "--register", "--help", "-h"}
+    if not any(flag in sys.argv for flag in interactive_flags):
+        _hide_console_window()
+
     asyncio.run(main())
 
 

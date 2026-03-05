@@ -134,6 +134,7 @@ class PosixSessionBackend:
         session_name: str,
         cols: int,
         rows: int,
+        env_vars: dict[str, str] | None = None,
     ) -> SessionHandle | None:
         try:
             master_fd, slave_fd = pty.openpty()
@@ -163,6 +164,15 @@ class PosixSessionBackend:
                     ["tmux", "set-option", "-t", session_name, "mouse", "on"],
                     capture_output=True, timeout=2,
                 )
+
+                # Update env vars in recovered session (API key may have
+                # changed after re-registration / reinstall)
+                if env_vars:
+                    for k, v in env_vars.items():
+                        subprocess.run(
+                            ["tmux", "setenv", "-t", session_name, k, v],
+                            capture_output=True, timeout=2,
+                        )
 
                 return SessionHandle(pid=pid, fd=master_fd, tmux_name=session_name, cols=cols, rows=rows)
         except Exception as e:

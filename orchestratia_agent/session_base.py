@@ -45,6 +45,7 @@ class SessionBackend(Protocol):
         session_name: str,
         cols: int,
         rows: int,
+        env_vars: dict[str, str] | None = None,
     ) -> SessionHandle | None:
         """Reattach to a surviving session (e.g., tmux). Returns None if unsupported."""
         ...

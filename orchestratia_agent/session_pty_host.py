@@ -285,6 +285,7 @@ class PtyHostSessionBackend:
         session_name: str,
         cols: int,
         rows: int,
+        env_vars: dict[str, str] | None = None,
     ) -> SessionHandle | None:
         """Reattach to a surviving pty-host session."""
         if not self._connected:

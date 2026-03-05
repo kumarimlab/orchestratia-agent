@@ -117,6 +117,12 @@ class PosixSessionBackend:
                         ["tmux", "set-option", "-t", tmux_name, "mouse", "on"],
                         capture_output=True, timeout=2,
                     )
+                    # Disable tmux's right-click context menu (split/select pane etc.)
+                    # — it interferes with browser paste in the dashboard terminal
+                    subprocess.run(
+                        ["tmux", "unbind-key", "-T", "root", "MouseDown3Pane"],
+                        capture_output=True, timeout=2,
+                    )
 
                 return SessionHandle(pid=pid, fd=master_fd, tmux_name=tmux_name, cols=cols, rows=rows)
 
@@ -162,6 +168,11 @@ class PosixSessionBackend:
                 # Ensure mouse mode is on for reattached sessions
                 subprocess.run(
                     ["tmux", "set-option", "-t", session_name, "mouse", "on"],
+                    capture_output=True, timeout=2,
+                )
+                # Disable tmux's right-click context menu
+                subprocess.run(
+                    ["tmux", "unbind-key", "-T", "root", "MouseDown3Pane"],
                     capture_output=True, timeout=2,
                 )
 

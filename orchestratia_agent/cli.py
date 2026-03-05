@@ -47,19 +47,24 @@ API_KEY = os.environ.get("ORCHESTRATIA_API_KEY", "")
 SESSION_ID = os.environ.get("ORCHESTRATIA_SESSION_ID", "")
 PROJECT_ID = os.environ.get("ORCHESTRATIA_PROJECT_ID", "")
 
-# Config file fallback: env var > config.yaml
-if not HUB_URL or not API_KEY:
-    try:
-        from orchestratia_agent.config import default_config_path, load_config
-        _cfg_path = default_config_path()
-        if os.path.exists(_cfg_path):
-            _cfg = load_config(_cfg_path)
-            if not HUB_URL:
-                HUB_URL = _cfg.get("hub_url", "")
-            if not API_KEY:
-                API_KEY = _cfg.get("api_key", "")
-    except Exception:
-        pass
+# Config file: ALWAYS read for hub_url and api_key.
+# The config file is the source of truth — env vars can become stale in
+# long-running tmux sessions after daemon reinstall/re-registration
+# (registration generates a new key, but existing shells keep the old env).
+try:
+    from orchestratia_agent.config import default_config_path, load_config
+    _cfg_path = default_config_path()
+    if os.path.exists(_cfg_path):
+        _cfg = load_config(_cfg_path)
+        # Config file always wins for hub_url and api_key
+        _cfg_hub = _cfg.get("hub_url", "")
+        _cfg_key = _cfg.get("api_key", "")
+        if _cfg_hub:
+            HUB_URL = _cfg_hub
+        if _cfg_key:
+            API_KEY = _cfg_key
+except Exception:
+    pass
 
 # JSON output mode (set in main() before command dispatch)
 JSON_MODE = False

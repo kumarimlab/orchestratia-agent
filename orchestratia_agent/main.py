@@ -317,20 +317,26 @@ def _test_pty():
     print("Diagnostic complete.")
 
 
-def _hide_console_window():
-    """Detach from the console window on Windows for daemon/background mode.
+def _attach_parent_console():
+    """Attach to the parent process's console for interactive output.
 
-    Uses FreeConsole() to completely detach — more reliable than
-    ShowWindow(SW_HIDE) which can fail depending on how the process
-    was launched (Task Scheduler, Start-Process, etc.).
-
-    Keeps console=True in PyInstaller spec so --version, --test-pty,
-    --register still show output normally when run interactively.
+    The exe is built with console=False (WINDOWS subsystem) so no
+    console window is ever created — essential for daemon mode.
+    For interactive commands (--version, --test-pty, --register),
+    we attach to the parent's console (cmd.exe / PowerShell) so
+    print() output is visible.
     """
     if sys.platform != "win32":
         return
     import ctypes
-    ctypes.windll.kernel32.FreeConsole()
+    ATTACH_PARENT_PROCESS = 0xFFFFFFFF
+    if ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
+        # Reopen stdout/stderr to the attached console
+        try:
+            sys.stdout = open("CONOUT$", "w")
+            sys.stderr = open("CONOUT$", "w")
+        except OSError:
+            pass
 
 
 def entry_point():
@@ -340,19 +346,21 @@ def entry_point():
         if sys.platform != "win32":
             print("--pty-host is only available on Windows")
             sys.exit(1)
-        _hide_console_window()
         from orchestratia_agent.pty_host import main as pty_host_main
         pty_host_main()
         return
+
+    # For interactive commands, attach to parent's console so output is visible.
+    # The exe is built with console=False (WINDOWS subsystem) so no console
+    # window is ever created — perfect for daemon mode but print() goes
+    # nowhere without AttachConsole.
+    interactive_flags = {"--version", "--test-pty", "--register", "--help", "-h"}
+    if any(flag in sys.argv for flag in interactive_flags):
+        _attach_parent_console()
+
     if "--test-pty" in sys.argv:
         _test_pty()
         return
-
-    # Hide console when running as daemon (no interactive flags)
-    interactive_flags = {"--version", "--test-pty", "--register", "--help", "-h"}
-    if not any(flag in sys.argv for flag in interactive_flags):
-        _hide_console_window()
-
     asyncio.run(main())
 
 

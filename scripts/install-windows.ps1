@@ -4,40 +4,55 @@
 # Downloads the standalone orchestratia-agent.exe from GitHub Releases.
 # No Python, pip, or git required.
 #
-# Usage — one-liner (paste into PowerShell as Administrator):
-#   $env:ORC_TOKEN='orcreg_...'; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex
+# Two modes:
+#   FRESH INSTALL (with token):
+#     $env:ORC_TOKEN='orcreg_...'; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex
 #
-# Or download and run directly:
-#   powershell -ExecutionPolicy Bypass -File install-windows.ps1 <TOKEN>
+#   UPGRADE (no token — uses existing config, preserves sessions):
+#     irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex
 #
 # What this does:
-#   1. Removes any existing installation (pip, exe, services, scheduled tasks)
+#   1. Kills agent daemon (preserves pty-host so sessions stay alive)
 #   2. Downloads orchestratia-agent.exe from latest GitHub Release
-#   3. Registers with the hub using the one-time token
+#   3. Registers with hub (fresh) or verifies existing config (upgrade)
 #   4. Adds exe to user PATH
 #   5. Creates a scheduled task (runs as current user at logon)
 # ──────────────────────────────────────────────────────────────────────
 
 $Token = if ($args.Count -gt 0) { $args[0] } elseif ($env:ORC_TOKEN) { $env:ORC_TOKEN } else { $null }
 
+# Determine mode: fresh install (with token) or upgrade (no token, existing config)
+$ConfigDir = "$env:LOCALAPPDATA\Orchestratia"
+$ExistingConfig = Test-Path "$ConfigDir\config.yaml"
+$UpgradeMode = $false
+
 if (-not $Token) {
-    Write-Host ""
-    Write-Host "  Usage:" -ForegroundColor White
-    Write-Host ""
-    Write-Host '  One-liner (paste into PowerShell as Administrator):' -ForegroundColor DarkGray
-    Write-Host '    $env:ORC_TOKEN=''orcreg_...''; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex' -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host '  Or download and run:' -ForegroundColor DarkGray
-    Write-Host '    .\install-windows.ps1 orcreg_...' -ForegroundColor Cyan
-    Write-Host ""
-    exit 1
+    if ($ExistingConfig) {
+        $configContent = Get-Content "$ConfigDir\config.yaml" -Raw -ErrorAction SilentlyContinue
+        if ($configContent -match "api_key:\s*orc_") {
+            $UpgradeMode = $true
+        }
+    }
+    if (-not $UpgradeMode) {
+        Write-Host ""
+        Write-Host "  Usage:" -ForegroundColor White
+        Write-Host ""
+        Write-Host '  Fresh install (one-liner):' -ForegroundColor DarkGray
+        Write-Host '    $env:ORC_TOKEN=''orcreg_...''; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex' -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host '  Upgrade (no token needed — uses existing config):' -ForegroundColor DarkGray
+        Write-Host '    irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex' -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host '  No existing config found. Provide a registration token for fresh install.' -ForegroundColor Yellow
+        Write-Host ""
+        exit 1
+    }
 }
 
 $ErrorActionPreference = "Continue"
 
 # ── Logging ──────────────────────────────────────────────────────────
-$ConfigDir = "$env:LOCALAPPDATA\Orchestratia"
-$LogDir = "$env:LOCALAPPDATA\Orchestratia\logs"
+$LogDir = "$ConfigDir\logs"
 $InstallLog = "$ConfigDir\install.log"
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -109,13 +124,19 @@ function Write-Fatal($Msg) {
 
 # ── Validate ─────────────────────────────────────────────────────────
 
-if (-not $Token.StartsWith("orcreg_")) {
+if ($Token -and -not $Token.StartsWith("orcreg_")) {
     Write-Fatal "Invalid token format (must start with orcreg_)"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────
 
 Write-Header
+if ($UpgradeMode) {
+    Write-Host "  Mode: UPGRADE (existing config found, preserving sessions)" -ForegroundColor Cyan
+} else {
+    Write-Host "  Mode: FRESH INSTALL" -ForegroundColor Cyan
+}
+Write-Host ""
 
 # Step 1: Cleanup — remove ALL existing installations
 Write-Step 1 $TotalSteps "Removing existing installation (if any)"
@@ -289,32 +310,43 @@ try {
     Write-Fatal "Downloaded exe failed to run: $_"
 }
 
-# Step 3: Register
+# Step 3: Register (or verify existing config for upgrades)
 Write-Step 3 $TotalSteps "Registering with Orchestratia hub"
 
-Write-Info "Using one-time registration token..."
-try {
-    $regOutput = & $AgentExePath --register $Token --config "$ConfigDir\config.yaml" 2>&1
-    Write-Ok "Registered successfully"
-    $regOutput | ForEach-Object {
-        if ($_ -match "api.key|orc_|registered|saved") {
-            Write-Info $_
-        }
-    }
-} catch {
-    Write-Fail "Registration failed: $_"
-}
-
-if (Test-Path "$ConfigDir\config.yaml") {
+if ($UpgradeMode) {
+    Write-Ok "Upgrade mode — using existing config.yaml"
     Write-Ok "Config: $ConfigDir\config.yaml"
     $configContent = Get-Content "$ConfigDir\config.yaml" -Raw -ErrorAction SilentlyContinue
     if ($configContent -match "api_key:\s*orc_") {
         Write-Ok "API key verified in config"
     } else {
-        Write-Warn "Config written but api_key not found — check manually"
+        Write-Warn "Config exists but api_key not found — check manually"
     }
 } else {
-    Write-Fatal "Registration did not create config. Cannot start service."
+    Write-Info "Using one-time registration token..."
+    try {
+        $regOutput = & $AgentExePath --register $Token --config "$ConfigDir\config.yaml" 2>&1
+        Write-Ok "Registered successfully"
+        $regOutput | ForEach-Object {
+            if ($_ -match "api.key|orc_|registered|saved") {
+                Write-Info $_
+            }
+        }
+    } catch {
+        Write-Fail "Registration failed: $_"
+    }
+
+    if (Test-Path "$ConfigDir\config.yaml") {
+        Write-Ok "Config: $ConfigDir\config.yaml"
+        $configContent = Get-Content "$ConfigDir\config.yaml" -Raw -ErrorAction SilentlyContinue
+        if ($configContent -match "api_key:\s*orc_") {
+            Write-Ok "API key verified in config"
+        } else {
+            Write-Warn "Config written but api_key not found — check manually"
+        }
+    } else {
+        Write-Fatal "Registration did not create config. Cannot start service."
+    }
 }
 
 # Step 4: Add to user PATH

@@ -8,13 +8,15 @@
 # Usage:
 #   bash install.sh <REGISTRATION_TOKEN>
 #
+# Supports: Linux (systemd), macOS (launchd)
+#
 # What this does:
 #   0. Uninstalls any existing agent (clean slate)
 #   1. Checks prerequisites (python3, git, claude)
 #   2. Clones the agent daemon to /opt/orchestratia-agent
 #   3. Installs Python dependencies
 #   4. Registers with the hub using your one-time token
-#   5. Installs a systemd service for persistent operation
+#   5. Installs a persistent service (systemd on Linux, launchd on macOS)
 #
 # Always safe to re-run — uninstalls first, then installs fresh.
 # ──────────────────────────────────────────────────────────────────────
@@ -44,6 +46,17 @@ REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 SERVICE_NAME="orchestratia-agent"
 TOTAL_STEPS=8
 ERRORS=0
+
+# ── OS detection ──────────────────────────────────────────────────
+OS_TYPE="$(uname -s)"
+case "$OS_TYPE" in
+    Linux)  OS_TYPE="linux" ;;
+    Darwin) OS_TYPE="darwin" ;;
+    *)      echo "Unsupported OS: $OS_TYPE"; exit 1 ;;
+esac
+
+LAUNCHD_LABEL="com.orchestratia.agent"
+LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
 
 # ── Helper functions ────────────────────────────────────────────────
 
@@ -94,6 +107,29 @@ check_command() {
         return 0
     else
         return 1
+    fi
+}
+
+# Package install helper (macOS: brew, Linux: apt)
+pkg_install() {
+    local pkg="$1"
+    if [ "$OS_TYPE" = "darwin" ]; then
+        if check_command brew; then
+            brew install "$pkg" 2>/dev/null
+        else
+            return 1
+        fi
+    else
+        sudo apt-get install -y "$pkg" >/dev/null 2>&1
+    fi
+}
+
+pkg_install_hint() {
+    local pkg="$1"
+    if [ "$OS_TYPE" = "darwin" ]; then
+        echo "brew install $pkg"
+    else
+        echo "sudo apt install $pkg"
     fi
 }
 
@@ -150,31 +186,47 @@ else
 fi
 
 RUN_HOME=$(eval echo "~${RUN_USER}")
+RUN_GROUP=$(id -gn "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
 
 # ── Main installer ──────────────────────────────────────────────────
 
 print_header
 
 info "Service will run as user: ${BOLD}${RUN_USER}${NC} (home: ${RUN_HOME})"
+info "Platform: ${BOLD}${OS_TYPE}${NC}"
 
 # Step 1: Clean up existing installation
 step 1 "Removing existing installation (if any)"
 
 EXISTING=false
-if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    EXISTING=true
-    sudo systemctl stop "$SERVICE_NAME" 2>/dev/null && ok "Stopped running service" || warn "Could not stop service"
-fi
 
-if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-    EXISTING=true
-    sudo systemctl disable "$SERVICE_NAME" 2>/dev/null && ok "Disabled service" || warn "Could not disable service"
-fi
+# Service cleanup: systemd (Linux) or launchd (macOS)
+if [ "$OS_TYPE" = "linux" ]; then
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        EXISTING=true
+        sudo systemctl stop "$SERVICE_NAME" 2>/dev/null && ok "Stopped running service" || warn "Could not stop service"
+    fi
 
-if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
-    EXISTING=true
-    sudo rm -f "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null && ok "Removed service file" || warn "Could not remove service file"
-    sudo systemctl daemon-reload 2>/dev/null || true
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        EXISTING=true
+        sudo systemctl disable "$SERVICE_NAME" 2>/dev/null && ok "Disabled service" || warn "Could not disable service"
+    fi
+
+    if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        EXISTING=true
+        sudo rm -f "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null && ok "Removed service file" || warn "Could not remove service file"
+        sudo systemctl daemon-reload 2>/dev/null || true
+    fi
+elif [ "$OS_TYPE" = "darwin" ]; then
+    if sudo launchctl list "$LAUNCHD_LABEL" 2>/dev/null | grep -q "$LAUNCHD_LABEL"; then
+        EXISTING=true
+        sudo launchctl bootout system/"$LAUNCHD_LABEL" 2>/dev/null && ok "Stopped running service" || warn "Could not stop service"
+    fi
+
+    if [ -f "$LAUNCHD_PLIST" ]; then
+        EXISTING=true
+        sudo rm -f "$LAUNCHD_PLIST" 2>/dev/null && ok "Removed plist" || warn "Could not remove plist"
+    fi
 fi
 
 if [ -d "$INSTALL_DIR" ]; then
@@ -199,15 +251,19 @@ fi
 # Clean stale Orchestratia env vars from shell startup files.
 # Older versions or manual setup may have added exports to .bashrc/.profile
 # that override the env vars injected by tmux -e (v0.3.3+).
-BASHRC="${RUN_HOME}/.bashrc"
-if [ -f "$BASHRC" ] && grep -q 'ORCHESTRATIA' "$BASHRC" 2>/dev/null; then
-    EXISTING=true
-    # Remove the Orchestratia block: comment header + export/alias lines
-    sudo -u "$RUN_USER" sed -i '/^# Orchestratia/d;/^# All .* agents run/d;/^# Project scoping/d;/^# Per-session override/d;/^# Example: ORCHESTRATIA/d;/^export ORCHESTRATIA_/d;/^alias orc-/d' "$BASHRC"
-    # Clean up any leftover blank lines from the removal (collapse 3+ blank lines to 2)
-    sudo -u "$RUN_USER" sed -i '/^$/N;/^\n$/N;/^\n\n$/d' "$BASHRC"
-    ok "Cleaned stale ORCHESTRATIA vars from ${BASHRC}"
-fi
+# Check both .bashrc (Linux default) and .zshrc (macOS default)
+for RCFILE in "${RUN_HOME}/.bashrc" "${RUN_HOME}/.zshrc" "${RUN_HOME}/.bash_profile"; do
+    if [ -f "$RCFILE" ] && grep -q 'ORCHESTRATIA' "$RCFILE" 2>/dev/null; then
+        EXISTING=true
+        # Remove the Orchestratia block: comment header + export/alias lines
+        if [ "$OS_TYPE" = "darwin" ]; then
+            sudo -u "$RUN_USER" sed -i '' '/^# Orchestratia/d;/^# All .* agents run/d;/^# Project scoping/d;/^# Per-session override/d;/^# Example: ORCHESTRATIA/d;/^export ORCHESTRATIA_/d;/^alias orc-/d' "$RCFILE"
+        else
+            sudo -u "$RUN_USER" sed -i '/^# Orchestratia/d;/^# All .* agents run/d;/^# Project scoping/d;/^# Per-session override/d;/^# Example: ORCHESTRATIA/d;/^export ORCHESTRATIA_/d;/^alias orc-/d' "$RCFILE"
+        fi
+        ok "Cleaned stale ORCHESTRATIA vars from ${RCFILE}"
+    fi
+done
 
 if [ -d "$LOG_DIR" ]; then
     EXISTING=true
@@ -226,6 +282,24 @@ fi
 # Step 2: Prerequisites
 step 2 "Checking prerequisites"
 
+# macOS: check Xcode Command Line Tools first (git and python3 depend on it)
+if [ "$OS_TYPE" = "darwin" ]; then
+    if ! xcode-select -p >/dev/null 2>&1; then
+        info "Xcode Command Line Tools required. Installing..."
+        xcode-select --install 2>/dev/null || true
+        fatal "Xcode Command Line Tools installation started. Please re-run this script after the installation completes."
+    fi
+    ok "Xcode Command Line Tools"
+
+    # Check for Homebrew (needed for tmux/pip installs)
+    if check_command brew; then
+        ok "Homebrew $(brew --version 2>/dev/null | head -1 | awk '{print $2}')"
+    else
+        warn "Homebrew not found — auto-install of missing packages won't work"
+        info "Install: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+    fi
+fi
+
 # Python 3
 if check_command python3; then
     PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
@@ -237,14 +311,14 @@ if check_command python3; then
         fatal "Python 3.10+ required, found ${PYTHON_VER}. Please upgrade."
     fi
 else
-    fatal "python3 not found. Install it: sudo apt install python3"
+    fatal "python3 not found. Install it: $(pkg_install_hint python3)"
 fi
 
 # Git
 if check_command git; then
     ok "git $(git --version | awk '{print $3}')"
 else
-    fatal "git not found. Install it: sudo apt install git"
+    fatal "git not found. Install it: $(pkg_install_hint git)"
 fi
 
 # pip3
@@ -252,10 +326,10 @@ if check_command pip3; then
     ok "pip3 available"
 else
     info "pip3 not found, installing..."
-    if sudo apt-get install -y python3-pip >/dev/null 2>&1; then
+    if pkg_install python3-pip; then
         ok "pip3 installed"
     else
-        fail "Could not install pip3. Install manually: sudo apt install python3-pip"
+        fail "Could not install pip3. Install manually: $(pkg_install_hint python3-pip)"
     fi
 fi
 
@@ -264,10 +338,10 @@ if check_command tmux; then
     ok "tmux $(tmux -V | awk '{print $2}')"
 else
     info "tmux not found, installing..."
-    if sudo apt-get install -y tmux >/dev/null 2>&1; then
+    if pkg_install tmux; then
         ok "tmux installed"
     else
-        fatal "Could not install tmux. Install manually: sudo apt install tmux"
+        fatal "Could not install tmux. Install manually: $(pkg_install_hint tmux)"
     fi
 fi
 
@@ -300,7 +374,7 @@ for dir in "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"; do
 done
 
 # Ensure ownership (use the real user, not root)
-sudo chown "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || {
+sudo chown "${RUN_USER}:${RUN_GROUP}" "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" 2>/dev/null || {
     fail "Could not set directory ownership"
 }
 
@@ -325,8 +399,8 @@ step 5 "Installing Python dependencies"
 info "Removing stale package versions..."
 sudo -u "$RUN_USER" HOME="$RUN_HOME" pip3 uninstall -y orchestratia-agent 2>/dev/null || true
 pip3 uninstall -y orchestratia-agent 2>/dev/null || true
-find /home/"$RUN_USER"/.local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
-find /home/"$RUN_USER"/.local/lib -path "*/orchestratia*agent*" -exec rm -rf {} + 2>/dev/null || true
+find "$RUN_HOME"/.local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
+find "$RUN_HOME"/.local/lib -path "*/orchestratia*agent*" -exec rm -rf {} + 2>/dev/null || true
 find /usr/local/lib -path "*/orchestratia_agent*" -exec rm -rf {} + 2>/dev/null || true
 find /usr/local/lib -path "*/orchestratia*agent*" -exec rm -rf {} + 2>/dev/null || true
 ok "Cleaned stale installs"
@@ -444,39 +518,119 @@ fi
 
 ok "Config verified: ${CONFIG_FILE}"
 
-# Step 7: Systemd service
-step 7 "Setting up systemd service"
+# Step 7: Persistent service
+step 7 "Setting up persistent service"
 
-# Update the service file with the resolved user
-if [ "$RUN_USER" != "ubuntu" ]; then
-    info "Adjusting service file for user: ${RUN_USER}"
-    sudo sed -i "s/User=ubuntu/User=${RUN_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
-    sudo sed -i "s/Group=ubuntu/Group=${RUN_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
-fi
+if [ "$OS_TYPE" = "linux" ]; then
+    # ── systemd (Linux) ──────────────────────────────────────────────
+    # Update the service file with the resolved user
+    if [ "$RUN_USER" != "ubuntu" ]; then
+        info "Adjusting service file for user: ${RUN_USER}"
+        sudo sed -i "s/User=ubuntu/User=${RUN_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
+        sudo sed -i "s/Group=ubuntu/Group=${RUN_USER}/" "$INSTALL_DIR/orchestratia-agent.service"
+    fi
 
-if sudo cp "$INSTALL_DIR/orchestratia-agent.service" /etc/systemd/system/ 2>/dev/null; then
-    ok "Service file installed"
-else
-    fail "Could not copy service file to /etc/systemd/system/"
-fi
+    if sudo cp "$INSTALL_DIR/orchestratia-agent.service" /etc/systemd/system/ 2>/dev/null; then
+        ok "Service file installed"
+    else
+        fail "Could not copy service file to /etc/systemd/system/"
+    fi
 
-if sudo systemctl daemon-reload 2>/dev/null; then
-    ok "systemd reloaded"
-else
-    fail "systemctl daemon-reload failed"
-fi
+    if sudo systemctl daemon-reload 2>/dev/null; then
+        ok "systemd reloaded"
+    else
+        fail "systemctl daemon-reload failed"
+    fi
 
-if sudo systemctl enable "$SERVICE_NAME" 2>/dev/null; then
-    ok "Service enabled (starts on boot)"
-else
-    fail "Could not enable service"
-fi
+    if sudo systemctl enable "$SERVICE_NAME" 2>/dev/null; then
+        ok "Service enabled (starts on boot)"
+    else
+        fail "Could not enable service"
+    fi
 
-if sudo systemctl start "$SERVICE_NAME" 2>/dev/null; then
-    ok "Service started"
-else
-    fail "Could not start service"
-    info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
+    if sudo systemctl start "$SERVICE_NAME" 2>/dev/null; then
+        ok "Service started"
+    else
+        fail "Could not start service"
+        info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
+    fi
+
+elif [ "$OS_TYPE" = "darwin" ]; then
+    # ── launchd (macOS) ──────────────────────────────────────────────
+    # Find the python3 path to use in the plist
+    PYTHON3_PATH=$(which python3)
+
+    info "Creating launchd plist..."
+    sudo tee "$LAUNCHD_PLIST" >/dev/null <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LAUNCHD_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${PYTHON3_PATH}</string>
+        <string>${INSTALL_DIR}/daemon.py</string>
+        <string>--config</string>
+        <string>${CONFIG_DIR}/config.yaml</string>
+    </array>
+
+    <key>UserName</key>
+    <string>${RUN_USER}</string>
+
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/agent.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/agent.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>${RUN_HOME}</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:${RUN_HOME}/.local/bin:${RUN_HOME}/.npm-global/bin</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Standard</string>
+</dict>
+</plist>
+PLIST_EOF
+
+    if [ -f "$LAUNCHD_PLIST" ]; then
+        ok "Plist created: ${LAUNCHD_PLIST}"
+    else
+        fail "Could not create ${LAUNCHD_PLIST}"
+    fi
+
+    # Load the service
+    if sudo launchctl bootstrap system "$LAUNCHD_PLIST" 2>/dev/null || \
+       sudo launchctl load -w "$LAUNCHD_PLIST" 2>/dev/null; then
+        ok "Service loaded (starts on boot)"
+    else
+        fail "Could not load service"
+        info "Try manually: sudo launchctl bootstrap system ${LAUNCHD_PLIST}"
+    fi
 fi
 
 # Install CLI tool — pip installs entry point to ~/.local/bin/ (user install).
@@ -503,12 +657,26 @@ fi
 
 # Wait a moment and check status
 sleep 2
-if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    ok "Service is ${GREEN}running${NC}"
-else
-    STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "unknown")
-    warn "Service status: ${STATUS}"
-    info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
+if [ "$OS_TYPE" = "linux" ]; then
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        ok "Service is ${GREEN}running${NC}"
+    else
+        STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "unknown")
+        warn "Service status: ${STATUS}"
+        info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
+    fi
+elif [ "$OS_TYPE" = "darwin" ]; then
+    if sudo launchctl list "$LAUNCHD_LABEL" 2>/dev/null | grep -q '"PID"'; then
+        ok "Service is ${GREEN}running${NC}"
+    else
+        # Check if it loaded at all
+        if sudo launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; then
+            warn "Service loaded but may not be running yet"
+        else
+            warn "Service status: unknown"
+        fi
+        info "Check logs: cat ${LOG_DIR}/agent.log"
+    fi
 fi
 
 # Step 8: Claude Code integration (skill + session hook)
@@ -610,10 +778,17 @@ fi
 
 echo ""
 echo -e "  ${DIM}Useful commands:${NC}"
-echo -e "    Status:   sudo systemctl status ${SERVICE_NAME}"
-echo -e "    Logs:     sudo journalctl -u ${SERVICE_NAME} -f"
-echo -e "    Restart:  sudo systemctl restart ${SERVICE_NAME}"
-echo -e "    Stop:     sudo systemctl stop ${SERVICE_NAME}"
+if [ "$OS_TYPE" = "linux" ]; then
+    echo -e "    Status:   sudo systemctl status ${SERVICE_NAME}"
+    echo -e "    Logs:     sudo journalctl -u ${SERVICE_NAME} -f"
+    echo -e "    Restart:  sudo systemctl restart ${SERVICE_NAME}"
+    echo -e "    Stop:     sudo systemctl stop ${SERVICE_NAME}"
+elif [ "$OS_TYPE" = "darwin" ]; then
+    echo -e "    Status:   sudo launchctl list ${LAUNCHD_LABEL}"
+    echo -e "    Logs:     tail -f ${LOG_DIR}/agent.log"
+    echo -e "    Restart:  sudo launchctl kickstart -k system/${LAUNCHD_LABEL}"
+    echo -e "    Stop:     sudo launchctl bootout system/${LAUNCHD_LABEL}"
+fi
 echo ""
 echo -e "${BOLD}──────────────────────────────────────────────────${NC}"
 echo ""

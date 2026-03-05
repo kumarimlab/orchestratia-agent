@@ -188,6 +188,14 @@ if [ -d "$CONFIG_DIR" ]; then
     sudo rm -rf "$CONFIG_DIR" 2>/dev/null && ok "Removed ${CONFIG_DIR}" || warn "Could not remove ${CONFIG_DIR}"
 fi
 
+# Also remove user-level config (default_config_path() checks ~/.config first,
+# so a stale config there would shadow the fresh /etc/orchestratia/config.yaml)
+USER_CONFIG_DIR="${RUN_HOME}/.config/orchestratia"
+if [ -d "$USER_CONFIG_DIR" ]; then
+    EXISTING=true
+    sudo -u "$RUN_USER" rm -rf "$USER_CONFIG_DIR" 2>/dev/null && ok "Removed ${USER_CONFIG_DIR}" || warn "Could not remove ${USER_CONFIG_DIR}"
+fi
+
 # Clean stale Orchestratia env vars from shell startup files.
 # Older versions or manual setup may have added exports to .bashrc/.profile
 # that override the env vars injected by tmux -e (v0.3.3+).

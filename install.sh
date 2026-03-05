@@ -115,7 +115,8 @@ pkg_install() {
     local pkg="$1"
     if [ "$OS_TYPE" = "darwin" ]; then
         if check_command brew; then
-            brew install "$pkg" 2>/dev/null
+            # brew refuses to run as root — use the real user
+            sudo -u "$RUN_USER" brew install "$pkg" 2>/dev/null
         else
             return 1
         fi
@@ -303,11 +304,20 @@ if [ "$OS_TYPE" = "darwin" ]; then
     fi
 
     # Check for Homebrew (needed for tmux/pip installs)
+    # Under sudo, /opt/homebrew/bin (Apple Silicon) is often not in PATH.
+    # Check the well-known locations before declaring it missing.
+    if ! check_command brew; then
+        if [ -x /opt/homebrew/bin/brew ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        elif [ -x /usr/local/bin/brew ]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+        fi
+    fi
     if check_command brew; then
         ok "Homebrew $(brew --version 2>/dev/null | head -1 | awk '{print $2}')"
     else
         info "Homebrew not found — installing (needed for tmux)..."
-        if sudo -u "$RUN_USER" /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null >/dev/null 2>&1; then
+        if sudo -u "$RUN_USER" NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" 2>&1 | tail -5; then
             # Add Homebrew to PATH for the rest of this script
             if [ -x /opt/homebrew/bin/brew ]; then
                 eval "$(/opt/homebrew/bin/brew shellenv)"

@@ -128,6 +128,7 @@ class WindowsSessionBackend:
         session_name: str,
         cols: int,
         rows: int,
+        env_vars: dict[str, str] | None = None,
     ) -> SessionHandle | None:
         # Windows has no tmux — sessions cannot be reattached
         return None

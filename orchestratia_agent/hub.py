@@ -567,10 +567,16 @@ async def report_alive_sessions(state: DaemonState):
     surviving_ids = backend.discover_surviving_sessions()
     is_pty_host = hasattr(backend, "_connected")  # PtyHostSessionBackend
 
+    # Env vars to inject into recovered sessions (API key may have changed)
+    recovery_env = {
+        "ORCHESTRATIA_HUB_URL": state.hub_url,
+        "ORCHESTRATIA_API_KEY": state.api_key,
+    }
+
     for sid, s in list(state.active_sessions.items()):
         if not s.is_alive():
             if s.tmux_name and s.tmux_name in surviving_ids:
-                handle = backend.reattach(sid, s.tmux_name, 120, 40)
+                handle = backend.reattach(sid, s.tmux_name, 120, 40, env_vars=recovery_env)
                 if handle:
                     new_session = ManagedSession(
                         sid, handle, backend, sender,
@@ -581,7 +587,7 @@ async def report_alive_sessions(state: DaemonState):
                     log.info(f"Reattached to surviving tmux session {s.tmux_name} for {sid[:8]}")
                     continue
             elif is_pty_host and sid in surviving_ids:
-                handle = backend.reattach(sid, sid, 120, 40)
+                handle = backend.reattach(sid, sid, 120, 40, env_vars=recovery_env)
                 if handle:
                     new_session = ManagedSession(
                         sid, handle, backend, sender,
@@ -609,7 +615,7 @@ async def report_alive_sessions(state: DaemonState):
             # pty-host: session IDs are UUIDs — can reattach and report directly
             if surviving_id not in tracked_ids:
                 log.info(f"Found orphaned pty-host session: {surviving_id[:8]}")
-                handle = backend.reattach(surviving_id, surviving_id, 120, 40)
+                handle = backend.reattach(surviving_id, surviving_id, 120, 40, env_vars=recovery_env)
                 if handle:
                     new_session = ManagedSession(
                         surviving_id, handle, backend, sender,
@@ -630,7 +636,7 @@ async def report_alive_sessions(state: DaemonState):
             # tmux: surviving_id is a tmux session name, not a UUID
             if surviving_id not in tracked_tmux:
                 log.info(f"Found orphaned tmux session: {surviving_id}")
-                handle = backend.reattach(surviving_id, surviving_id, 120, 40)
+                handle = backend.reattach(surviving_id, surviving_id, 120, 40, env_vars=recovery_env)
                 if handle:
                     new_session = ManagedSession(
                         surviving_id, handle, backend, sender,

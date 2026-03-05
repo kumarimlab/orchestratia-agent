@@ -11,9 +11,10 @@ Usage:
   orchestratia task complete <id> --result "..."
   orchestratia task start <id>
   orchestratia task fail <id> --error "..."
-  orchestratia task help <id> --question "..."
+  orchestratia task help <id> --question "..." [--type help|question]
   orchestratia task plan <id> --plan '{"summary": "...", "impact": "..."}'
   orchestratia task note <id> --content "..." [--urgent]
+  orchestratia task notes <id>
   orchestratia task assign <id> --server "name"
   orchestratia task update <id> [--title/--spec/--priority/...]
   orchestratia task cancel <id>
@@ -21,6 +22,8 @@ Usage:
   orchestratia task list [--status pending] [--json]
   orchestratia task deps add <id> --depends-on <dep_id> [--type blocks]
   orchestratia task deps remove <id> --depends-on <dep_id>
+  orchestratia intervention list [--task-id X] [--status pending]
+  orchestratia intervention respond <id> --response "..."
   orchestratia server list [--json]
   orchestratia session list [--json]
   orchestratia pipeline create --file pipeline.json [--json]
@@ -386,18 +389,21 @@ def cmd_fail(args):
 
 
 def cmd_help(args):
-    """Request human intervention for a task."""
+    """Request intervention for a task."""
     args.task_id = _resolve_task_id(args.task_id)
     data = {"question": args.question}
     if args.context:
         data["context"] = args.context
+    if hasattr(args, "type") and args.type:
+        data["intervention_type"] = args.type
     result = _api_request("POST", f"/{args.task_id}/help", data)
 
     if JSON_MODE:
         _json_output(result)
         return
 
-    print(f"{YELLOW}[ORCHESTRATIA]{RESET} Help requested:")
+    itype = data.get("intervention_type", "help")
+    print(f"{YELLOW}[ORCHESTRATIA]{RESET} {'Question' if itype == 'question' else 'Help'} requested:")
     print(f"  Intervention ID: {result['intervention_id']}")
     print(f"  Status: {result['status']}")
 
@@ -440,6 +446,69 @@ def cmd_note(args):
 
     urgency = f"{RED}URGENT{RESET} " if args.urgent else ""
     print(f"{GREEN}[ORCHESTRATIA]{RESET} {urgency}Note added to task #{args.task_id[:8]}")
+
+
+def cmd_notes(args):
+    """List notes for a task."""
+    args.task_id = _resolve_task_id(args.task_id)
+    notes = _api_request("GET", f"/{args.task_id}/notes")
+
+    if JSON_MODE:
+        _json_output(notes)
+        return
+
+    if not notes:
+        print(f"{DIM}[ORCHESTRATIA]{RESET} No notes for task #{args.task_id[:8]}")
+        return
+
+    print(f"{BOLD}Notes for task #{args.task_id[:8]}:{RESET}")
+    for n in notes:
+        urgency = f"{RED}[URGENT]{RESET} " if n.get("urgent") else ""
+        ts = n.get("created_at", "")[:19]
+        print(f"  {DIM}{ts}{RESET} {urgency}{n.get('author', '?')}: {n.get('content', '')}")
+
+
+def cmd_intervention_list(args):
+    """List interventions."""
+    params = []
+    if hasattr(args, "task_id") and args.task_id:
+        params.append(f"task_id={_resolve_task_id(args.task_id)}")
+    if hasattr(args, "status") and args.status:
+        params.append(f"status={args.status}")
+    qs = "?" + "&".join(params) if params else ""
+    result = _api_request("GET", f"{qs}", base="/api/v1/server/interventions")
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    if not result:
+        print(f"{DIM}[ORCHESTRATIA]{RESET} No interventions found")
+        return
+
+    print(f"{BOLD}Interventions:{RESET}")
+    for i in result:
+        status_color = GREEN if i["status"] == "responded" else YELLOW
+        itype = i.get("intervention_type", "help")
+        print(f"  {i['id'][:8]}  {status_color}{i['status']}{RESET}  [{itype}]  {i.get('question', '')[:60]}")
+
+
+def cmd_intervention_respond(args):
+    """Respond to an intervention programmatically."""
+    result = _api_request(
+        "POST",
+        f"/{args.intervention_id}/respond",
+        {"response": args.response},
+        base="/api/v1/server/interventions",
+    )
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    print(f"{GREEN}[ORCHESTRATIA]{RESET} Intervention responded:")
+    print(f"  ID: {result.get('id', args.intervention_id)[:8]}")
+    print(f"  Status: {result.get('status')}")
 
 
 def cmd_assign(args):
@@ -1118,10 +1187,12 @@ def main():
     fail_p.add_argument("--error", required=True, help="Error description")
 
     # task help
-    help_p = task_sub.add_parser("help", help="Request human intervention")
+    help_p = task_sub.add_parser("help", help="Request intervention")
     help_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
-    help_p.add_argument("--question", required=True, help="Question for human")
+    help_p.add_argument("--question", required=True, help="Question for human or orchestrator")
     help_p.add_argument("--context", help="Additional context")
+    help_p.add_argument("--type", choices=["help", "question", "approval"],
+                        default="help", help="Intervention type (help=human, question=agent-answerable)")
 
     # task plan
     plan_p = task_sub.add_parser("plan", help="Submit a plan for review")
@@ -1133,6 +1204,10 @@ def main():
     note_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
     note_p.add_argument("--content", required=True, help="Note content")
     note_p.add_argument("--urgent", action="store_true", help="Mark as urgent (interrupts agent)")
+
+    # task notes (list)
+    notes_p = task_sub.add_parser("notes", help="List notes for a task")
+    notes_p.add_argument("task_id", help="Task ID (full UUID or 4+ char prefix)")
 
     # task assign
     assign_p = task_sub.add_parser("assign", help="Assign task to a session")
@@ -1197,6 +1272,20 @@ def main():
     # session list
     session_sub.add_parser("list", help="List active sessions in this project")
 
+    # ── intervention subcommand ──
+    intervention_parser = subparsers.add_parser("intervention", help="Intervention operations")
+    intervention_sub = intervention_parser.add_subparsers(dest="action")
+
+    # intervention list
+    int_list_p = intervention_sub.add_parser("list", help="List interventions")
+    int_list_p.add_argument("--task-id", help="Filter by task ID")
+    int_list_p.add_argument("--status", help="Filter by status (pending, responded)")
+
+    # intervention respond
+    int_respond_p = intervention_sub.add_parser("respond", help="Respond to an intervention")
+    int_respond_p.add_argument("intervention_id", help="Intervention ID")
+    int_respond_p.add_argument("--response", required=True, help="Response text")
+
     # ── pipeline subcommand ──
     pipeline_parser = subparsers.add_parser("pipeline", help="Multi-task pipeline operations")
     pipeline_sub = pipeline_parser.add_subparsers(dest="action")
@@ -1250,6 +1339,7 @@ def main():
                 "help": cmd_help,
                 "plan": cmd_plan,
                 "note": cmd_note,
+                "notes": cmd_notes,
                 "assign": cmd_assign,
                 "update": cmd_update,
                 "cancel": cmd_cancel,
@@ -1277,6 +1367,17 @@ def main():
             "list": cmd_session_list,
         }
         session_actions[args.action](args)
+
+    elif args.command == "intervention":
+        if not args.action:
+            intervention_parser.print_help()
+            sys.exit(1)
+
+        intervention_actions = {
+            "list": cmd_intervention_list,
+            "respond": cmd_intervention_respond,
+        }
+        intervention_actions[args.action](args)
 
     elif args.command == "pipeline":
         if not args.action:

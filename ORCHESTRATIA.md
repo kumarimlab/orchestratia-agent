@@ -149,15 +149,17 @@ Once registered and running, the flow is:
 
 ---
 
-## Requesting Human Help (Intervention)
+## Requesting Help (Interventions)
 
 If you (as Claude Code) are executing a task and get stuck, need clarification, or need approval, the daemon supports an intervention flow. The task execution happens in a screen session managed by the daemon, which handles the intervention API calls.
 
 The intervention endpoints available to the daemon:
-- `POST /api/v1/servers/tasks/{task_id}/help` - Request human help (body: `{"question": "...", "context": "..."}`)
-- `GET /api/v1/servers/interventions/{id}` - Poll for the human's response
+- `POST /api/v1/servers/tasks/{task_id}/help` - Request help (body: `{"question": "...", "context": "...", "intervention_type": "help|question"}`)
+- `GET /api/v1/servers/interventions/{id}` - Poll for the response
+- `GET /api/v1/server/interventions?task_id=...&status=pending` - List pending interventions
+- `POST /api/v1/server/interventions/{id}/respond` - Respond to intervention programmatically
 
-The admin sees the request in the Interventions page and responds. The response is relayed back.
+With `intervention_type: "help"` (default), the admin responds from the dashboard. With `intervention_type: "question"`, an orchestrator agent can respond programmatically — enabling fully autonomous multi-agent coordination.
 
 ---
 
@@ -207,10 +209,19 @@ GET  /api/v1/servers/tasks/poll        # Get assigned tasks
 POST /api/v1/servers/tasks/{id}/start  # Mark task as running
 POST /api/v1/servers/tasks/{id}/complete  # Report success
 POST /api/v1/servers/tasks/{id}/fail   # Report failure
-POST /api/v1/servers/tasks/{id}/help   # Request human intervention
+POST /api/v1/servers/tasks/{id}/help   # Request intervention (type: help/question/approval)
+POST /api/v1/server/tasks/{id}/notes   # Add note to task
+GET  /api/v1/server/tasks/{id}/notes   # List notes for task
+POST /api/v1/server/tasks/{id}/plan    # Submit plan for review
 GET  /api/v1/servers/interventions/{id}   # Poll for intervention response
-WS   /ws/server                        # Real-time output streaming
+GET  /api/v1/server/interventions      # List interventions (filter: task_id, status)
+POST /api/v1/server/interventions/{id}/respond  # Respond to intervention
+WS   /ws/server                        # Real-time output + task event subscriptions
 ```
+
+### WebSocket Task Subscriptions
+
+After authenticating on `/ws/server`, send `{"type": "subscribe_task", "task_id": "..."}` to receive real-time `task_event` messages for that task (status changes, notes, interventions, completions). Send `{"type": "unsubscribe_task", "task_id": "..."}` to stop.
 
 ---
 

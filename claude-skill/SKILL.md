@@ -57,7 +57,11 @@ This transitions the task to "running" status. You cannot start a task with unre
 Implement the task according to its spec. If you need help:
 
 ```bash
+# Request human help (default)
 orchestratia task help <task-id> --question "What should I do about X?" --context "additional context"
+
+# Ask an agent-answerable question (orchestrator can respond programmatically)
+orchestratia task help <task-id> --question "What auth strategy?" --type question
 ```
 
 Post progress notes:
@@ -199,9 +203,12 @@ All commands support `--json` for machine-readable output. Task IDs accept short
 | `orchestratia task start <id>` | Transition task to running |
 | `orchestratia task complete <id> --result "..."` | Complete with result (string or JSON) |
 | `orchestratia task fail <id> --error "..."` | Report failure |
-| `orchestratia task help <id> --question "..."` | Request human intervention |
+| `orchestratia task help <id> --question "..." [--type help\|question]` | Request intervention (type: help=human, question=agent-answerable) |
+| `orchestratia task notes <id>` | List all notes for a task |
 | `orchestratia task plan <id> --plan '...'` | Submit plan for review |
 | `orchestratia task note <id> --content "..."` | Add a note (optional: `--urgent`) |
+| `orchestratia task subscribe <id>` | Subscribe to real-time task events via WS |
+| `orchestratia task unsubscribe <id>` | Unsubscribe from task events |
 | `orchestratia task create --title "..." --spec "..."` | Create a task |
 | `orchestratia task assign <id> --session "name"` | Assign to a session |
 | `orchestratia task update <id> [--title/--spec/...]` | Update task fields |
@@ -210,6 +217,8 @@ All commands support `--json` for machine-readable output. Task IDs accept short
 | `orchestratia task list [--status ...]` | List tasks |
 | `orchestratia task deps add <id> --depends-on <id>` | Add dependency (`--type blocks\|input\|related`) |
 | `orchestratia task deps remove <id> --depends-on <id>` | Remove dependency |
+| `orchestratia intervention list [--task-id X] [--status X]` | List interventions |
+| `orchestratia intervention respond <id> --response "..."` | Respond to intervention programmatically |
 | `orchestratia server list` | List all registered servers |
 | `orchestratia session list` | List active sessions in project |
 | `orchestratia pipeline create --file <path>` | Create multi-task pipeline |
@@ -273,9 +282,39 @@ orchestratia task note <task-id> --content "Progress update: 3/5 endpoints done"
 orchestratia task note <task-id> --content "BLOCKER: need DB credentials" --urgent
 ```
 
-Notes are visible on the dashboard, sent to Telegram, and relayed to the agent daemon.
+Notes are visible on the dashboard, sent to Telegram, and relayed to the agent daemon. Notes are also returned in `task view` responses as `recent_notes` (last 20).
 
-## 11. Documentation
+To read existing notes:
+
+```bash
+orchestratia task notes <task-id>
+```
+
+## 11. Orchestrator: Responding to Interventions
+
+Orchestrator agents can respond to worker questions programmatically:
+
+```bash
+# List pending interventions
+orchestratia intervention list --task-id <task-id> --status pending
+
+# Respond to a worker's question
+orchestratia intervention respond <intervention-id> --response "Use JWT with RS256"
+```
+
+Workers must use `--type question` when asking (via `task help`) for the orchestrator to respond. With `--type help` (default), only human admins can respond.
+
+## 12. WebSocket Task Subscriptions
+
+Subscribe to real-time task events instead of polling:
+
+```bash
+orchestratia task subscribe <task-id>
+```
+
+After subscribing, your session receives push notifications for all events on that task (status changes, notes, interventions, completions).
+
+## 13. Documentation
 
 Full documentation available at:
 

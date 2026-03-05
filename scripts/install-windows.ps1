@@ -307,6 +307,12 @@ try {
 
 if (Test-Path "$ConfigDir\config.yaml") {
     Write-Ok "Config: $ConfigDir\config.yaml"
+    $configContent = Get-Content "$ConfigDir\config.yaml" -Raw -ErrorAction SilentlyContinue
+    if ($configContent -match "api_key:\s*orc_") {
+        Write-Ok "API key verified in config"
+    } else {
+        Write-Warn "Config written but api_key not found — check manually"
+    }
 } else {
     Write-Fatal "Registration did not create config. Cannot start service."
 }
@@ -398,20 +404,27 @@ try {
 
     # Start it now
     Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-    $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($taskInfo -and $taskInfo.LastTaskResult -eq 0) {
-        Write-Ok "Agent is running"
-    } elseif ($taskInfo -and $taskInfo.LastTaskResult -eq 267009) {
-        Write-Ok "Agent is running"
+    Write-Info "Waiting for agent + pty-host to initialize..."
+    Start-Sleep -Seconds 5
+
+    # Verify agent processes are running
+    $agentProcs = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
+    if ($agentProcs -and $agentProcs.Count -ge 2) {
+        Write-Ok "Agent is running ($($agentProcs.Count) processes — agent + pty-host)"
+    } elseif ($agentProcs) {
+        Write-Ok "Agent is running (PID: $($agentProcs[0].Id))"
+        Write-Warn "Only $($agentProcs.Count) process — pty-host may not have started yet"
     } else {
-        # Check if the process is actually running
-        $proc = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
-        if ($proc) {
-            Write-Ok "Agent is running (PID: $($proc.Id))"
-        } else {
-            Write-Warn "Agent may not be running — check logs"
-        }
+        Write-Warn "Agent may not be running — check logs"
+    }
+
+    # Verify pty-host is listening on TCP
+    $ptyHostUp = Test-NetConnection -ComputerName 127.0.0.1 -Port 19199 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if ($ptyHostUp) {
+        Write-Ok "PTY host listening on port 19199 (sessions will persist)"
+    } else {
+        Write-Warn "PTY host not detected on port 19199"
+        Write-Info "Check logs: Get-Content $LogDir\pty-host.log -Tail 20"
     }
 } catch {
     Write-Warn "Register-ScheduledTask failed: $_"
@@ -434,12 +447,19 @@ try {
 
             # Start it now
             schtasks.exe /Run /TN $TaskName 2>$null
-            Start-Sleep -Seconds 3
+            Write-Info "Waiting for agent + pty-host to initialize..."
+            Start-Sleep -Seconds 5
             $proc = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
             if ($proc) {
                 Write-Ok "Agent is running (PID: $($proc.Id))"
             } else {
                 Write-Warn "Agent may not be running — check logs"
+            }
+            $ptyHostUp = Test-NetConnection -ComputerName 127.0.0.1 -Port 19199 -InformationLevel Quiet -WarningAction SilentlyContinue
+            if ($ptyHostUp) {
+                Write-Ok "PTY host listening on port 19199 (sessions will persist)"
+            } else {
+                Write-Warn "PTY host not detected on port 19199"
             }
         } else {
             Write-Fail "schtasks.exe also failed: $result"
@@ -475,7 +495,7 @@ Write-Host "    Test PTY: orchestratia-agent --test-pty"
 Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"
 Write-Host "    Start:    schtasks /Run /TN OrchestratiAgent"
 Write-Host "    Stop:     schtasks /End /TN OrchestratiAgent"
-Write-Host "    Logs:     Get-Content $LogDir\agent.log -Wait"
+Write-Host "    Logs:     Get-Content $LogDir\pty-host.log -Wait"
 Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 Write-Host ""

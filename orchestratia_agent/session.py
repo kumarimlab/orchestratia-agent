@@ -32,7 +32,7 @@ class VirtualScreen:
     """
 
     def __init__(self, cols: int = 120, rows: int = 40):
-        self._screen = pyte.Screen(cols, rows)
+        self._screen = pyte.HistoryScreen(cols, rows, history=5000)
         self._stream = pyte.ByteStream(self._screen)
         self._last_snapshot: list[str] | None = None
 
@@ -61,6 +61,23 @@ class VirtualScreen:
             return None
 
         self._last_snapshot = list(lines)
+        return lines
+
+    def scrollback(self) -> list[str]:
+        """Return all history + current screen as plain strings."""
+        lines = []
+        cols = self._screen.columns
+        for row in self._screen.history.top:
+            chars = []
+            for col in range(cols):
+                c = row[col]
+                chars.append(c.data if hasattr(c, 'data') else ' ')
+            lines.append(''.join(chars).rstrip())
+        for display_line in self._screen.display:
+            lines.append(display_line.rstrip())
+        # Strip trailing empty lines
+        while lines and not lines[-1]:
+            lines.pop()
         return lines
 
 
@@ -265,7 +282,11 @@ class ManagedSession:
         self.backend.write_notification(self.handle, text)
 
     def capture_scrollback(self) -> list[str] | None:
-        return self.backend.capture_scrollback(self.handle)
+        lines = self.backend.capture_scrollback(self.handle)
+        if lines is not None:
+            return lines
+        # Fallback for Windows/non-tmux: use pyte history
+        return self._vscreen.scrollback()
 
     def send_sigwinch(self):
         self.backend.send_sigwinch(self.handle)

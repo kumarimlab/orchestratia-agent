@@ -318,18 +318,19 @@ def _test_pty():
 
 
 def _hide_console_window():
-    """Hide the console window on Windows for daemon/background mode.
+    """Detach from the console window on Windows for daemon/background mode.
+
+    Uses FreeConsole() to completely detach — more reliable than
+    ShowWindow(SW_HIDE) which can fail depending on how the process
+    was launched (Task Scheduler, Start-Process, etc.).
 
     Keeps console=True in PyInstaller spec so --version, --test-pty,
-    --register still show output normally.  Only hides when running
-    as a daemon (no interactive CLI flags).
+    --register still show output normally when run interactively.
     """
     if sys.platform != "win32":
         return
     import ctypes
-    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    if hwnd:
-        ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    ctypes.windll.kernel32.FreeConsole()
 
 
 def entry_point():

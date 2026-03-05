@@ -69,6 +69,21 @@ class PtyHostSessionBackend:
 
     async def connect(self) -> bool:
         """Connect to the pty-host TCP server. Returns True on success."""
+        return self._connect_sync()
+
+    def _connect_sync(self) -> bool:
+        """Internal connect (can be called for initial connect or reconnect)."""
+        # Clean up old connection if any
+        if self._raw_sock:
+            try:
+                self._raw_sock.close()
+            except OSError:
+                pass
+            self._raw_sock = None
+        self._recv_running = False
+        if self._recv_thread and self._recv_thread.is_alive():
+            self._recv_thread.join(timeout=2)
+
         try:
             sock = socket_mod.create_connection(
                 (PTY_HOST_ADDR, PTY_HOST_PORT), timeout=5,
@@ -86,7 +101,15 @@ class PtyHostSessionBackend:
             return True
         except (OSError, ConnectionRefusedError) as e:
             log.warning(f"Cannot connect to pty-host: {e}")
+            self._connected = False
             return False
+
+    def _ensure_connected(self) -> bool:
+        """Reconnect to pty-host if the connection was lost."""
+        if self._connected:
+            return True
+        log.info("pty-host connection lost, attempting reconnect...")
+        return self._connect_sync()
 
     def _recv_loop(self):
         """Background thread: read JSON-lines from pty-host and dispatch."""
@@ -214,7 +237,7 @@ class PtyHostSessionBackend:
         env_vars: dict[str, str] | None,
         project_id: str | None,
     ) -> SessionHandle | None:
-        if not self._connected:
+        if not self._ensure_connected():
             return None
 
         shell = _detect_shell()
@@ -348,7 +371,7 @@ class PtyHostSessionBackend:
         })
 
     def is_alive(self, handle: SessionHandle) -> bool:
-        if not self._connected:
+        if not self._ensure_connected():
             return False
         # Check via list_sessions (lightweight — pty-host checks process)
         sid = handle.extra.get("session_id", "")
@@ -371,7 +394,7 @@ class PtyHostSessionBackend:
         self._output_queues.pop(sid, None)
 
     def discover_surviving_sessions(self) -> list[str]:
-        if not self._connected:
+        if not self._ensure_connected():
             return []
         resp = self._request_sync({"cmd": "list_sessions"}, timeout=5.0)
         if resp and resp.get("type") == "sessions":

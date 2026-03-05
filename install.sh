@@ -42,7 +42,7 @@ LOG_DIR="/var/log/orchestratia"
 RUN_DIR="/var/run/orchestratia"
 REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 SERVICE_NAME="orchestratia-agent"
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 ERRORS=0
 
 # ── Helper functions ────────────────────────────────────────────────
@@ -501,6 +501,85 @@ else
     STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "unknown")
     warn "Service status: ${STATUS}"
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
+fi
+
+# Step 8: Claude Code integration (skill + session hook)
+step 8 "Setting up Claude Code integration"
+
+# 8a. Symlink skill file to ~/.claude/skills/orchestratia/
+# Symlink (not copy) so updates to /opt/orchestratia-agent/ are reflected immediately.
+SKILL_DIR="${RUN_HOME}/.claude/skills/orchestratia"
+if sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" 2>/dev/null; then
+    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/claude-skill/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        ok "Skill symlinked: ${SKILL_DIR}/SKILL.md -> ${INSTALL_DIR}/claude-skill/SKILL.md"
+    else
+        warn "Could not symlink skill file to ${SKILL_DIR}"
+    fi
+else
+    warn "Could not create ${SKILL_DIR}"
+fi
+
+# 8b. Make hook script executable
+if [ -f "$INSTALL_DIR/claude-skill/orchestratia-context.sh" ]; then
+    chmod +x "$INSTALL_DIR/claude-skill/orchestratia-context.sh"
+    ok "Hook script: ${INSTALL_DIR}/claude-skill/orchestratia-context.sh"
+else
+    warn "Hook script not found at ${INSTALL_DIR}/claude-skill/orchestratia-context.sh"
+fi
+
+# 8c. Merge SessionStart hook into ~/.claude/settings.json
+CLAUDE_SETTINGS="${RUN_HOME}/.claude/settings.json"
+HOOK_SCRIPT="$INSTALL_DIR/claude-skill/orchestratia-context.sh"
+
+sudo -u "$RUN_USER" mkdir -p "${RUN_HOME}/.claude" 2>/dev/null || true
+
+if sudo -u "$RUN_USER" python3 -c "
+import json, os, sys
+
+path = '$CLAUDE_SETTINGS'
+hook_cmd = '$HOOK_SCRIPT'
+
+# Load existing settings or start fresh
+settings = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        settings = {}
+
+# Ensure hooks.SessionStart structure exists
+hooks = settings.setdefault('hooks', {})
+session_start = hooks.setdefault('SessionStart', [])
+
+# Check if orchestratia hook already exists (avoid duplicates)
+already_exists = False
+for entry in session_start:
+    if isinstance(entry, dict):
+        for h in entry.get('hooks', []):
+            if isinstance(h, dict) and 'orchestratia' in h.get('command', ''):
+                already_exists = True
+                break
+
+if not already_exists:
+    session_start.append({
+        'hooks': [{
+            'type': 'command',
+            'command': hook_cmd,
+            'timeout': 10000
+        }]
+    })
+
+with open(path, 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+
+print('ok')
+" 2>/dev/null; then
+    ok "SessionStart hook registered in ${CLAUDE_SETTINGS}"
+else
+    warn "Could not update ${CLAUDE_SETTINGS}"
+    info "Manual setup: add SessionStart hook pointing to ${HOOK_SCRIPT}"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────

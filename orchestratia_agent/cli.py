@@ -751,6 +751,203 @@ def cmd_pipeline_create(args):
     print(f"\n{GREEN}[ORCHESTRATIA]{RESET} Pipeline created: {len(created_tasks)} task(s)")
 
 
+# ── Agent Status Command ─────────────────────────────────────────
+
+
+def cmd_agent_status(args):
+    """Show agent connection status, session info, and assigned tasks."""
+    status = {
+        "connected": False,
+        "server_name": None,
+        "server_id": None,
+        "session_id": None,
+        "session_name": None,
+        "project_id": None,
+        "project_name": None,
+        "role": None,
+        "tasks": [],
+        "task_summary": {"pending": 0, "running": 0, "total": 0},
+    }
+
+    # Check if we're in an Orchestratia session at all
+    if not HUB_URL or not API_KEY:
+        status["error"] = "Not in an Orchestratia session"
+        if JSON_MODE:
+            _json_output(status)
+        else:
+            print(f"{DIM}[ORCHESTRATIA] Not in an Orchestratia session (no env vars){RESET}")
+        return
+
+    # Try to get server name from config as fallback
+    fallback_name = None
+    try:
+        from orchestratia_agent.config import default_config_path, load_config
+        _cfg_path = default_config_path()
+        if os.path.exists(_cfg_path):
+            _cfg = load_config(_cfg_path)
+            fallback_name = _cfg.get("server_name", _cfg.get("name"))
+    except Exception:
+        pass
+
+    # Build request URL
+    params = f"?session_id={SESSION_ID}" if SESSION_ID else ""
+    url = f"{HUB_URL}/api/v1/server/status{params}"
+    headers = {
+        "X-API-Key": API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    ctx = ssl.create_default_context()
+    if HUB_URL.startswith("https://staging.") or HUB_URL.startswith("https://localhost"):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        resp = urllib.request.urlopen(req, context=ctx, timeout=5)
+        data = json.loads(resp.read())
+        status.update(data)
+    except Exception as e:
+        status["error"] = str(e)
+        if fallback_name:
+            status["server_name"] = fallback_name
+
+    # Derive role from session name heuristic
+    sname = status.get("session_name") or ""
+    if any(k in sname.lower() for k in ("orchestrat", "platform", "coordinator")):
+        status["role"] = "orchestrator"
+    elif sname:
+        status["role"] = "worker"
+
+    if JSON_MODE:
+        _json_output(status)
+        return
+
+    # Pretty print
+    if not status.get("connected"):
+        err = status.get("error", "unknown")
+        print(f"{YELLOW}[ORCHESTRATIA]{RESET} Hub unreachable: {err}")
+        if status.get("server_name"):
+            print(f"  Server: {status['server_name']}")
+        return
+
+    role_str = f" ({status['role']})" if status.get("role") else ""
+    session_str = status.get("session_name") or "no session"
+    print(f"{BRAND}[ORCHESTRATIA]{RESET} {BOLD}{status['server_name']}{RESET} / {CYAN}{session_str}{RESET}{role_str}")
+
+    if status.get("project_name"):
+        print(f"  Project: {status['project_name']}")
+
+    summary = status.get("task_summary", {})
+    total = summary.get("total", 0)
+    if total > 0:
+        running = summary.get("running", 0)
+        pending = summary.get("pending", 0)
+        print(f"  Tasks: {running} running, {pending} pending")
+        for t in status.get("tasks", []):
+            status_color = {
+                "running": CYAN, "pending": YELLOW, "assigned": CYAN,
+                "planning": CYAN, "plan_review": YELLOW,
+            }.get(t["status"], "")
+            print(f"    {BRAND}#{t['id'][:8]}{RESET} {BOLD}{t['title']}{RESET} ({status_color}{t['status']}{RESET})")
+    else:
+        print(f"  {DIM}No assigned tasks{RESET}")
+
+
+# ── Update Command ───────────────────────────────────────────────
+
+
+def cmd_agent_update(args):
+    """Update the agent: pull latest code, reinstall package."""
+    import subprocess
+
+    install_dir = os.environ.get("ORCHESTRATIA_INSTALL_DIR", "/opt/orchestratia-agent")
+
+    if not os.path.isdir(os.path.join(install_dir, ".git")):
+        _error_exit(f"Not a git repo: {install_dir}")
+
+    if JSON_MODE:
+        results = {"install_dir": install_dir, "steps": []}
+
+    # Step 1: git fetch + reset
+    if not JSON_MODE:
+        print(f"{BRAND}[ORCHESTRATIA]{RESET} Updating agent from {install_dir}...")
+
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=install_dir, check=True,
+            capture_output=True, text=True,
+        )
+        # Detect default branch (main or master)
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=install_dir, capture_output=True, text=True,
+        )
+        branch = branch_result.stdout.strip() or "main"
+
+        old_commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=install_dir, capture_output=True, text=True,
+        ).stdout.strip()
+
+        subprocess.run(
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            cwd=install_dir, check=True,
+            capture_output=True, text=True,
+        )
+
+        new_commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=install_dir, capture_output=True, text=True,
+        ).stdout.strip()
+
+        if old_commit == new_commit:
+            step_msg = f"Already up to date ({new_commit})"
+        else:
+            step_msg = f"Updated {old_commit} -> {new_commit}"
+
+        if JSON_MODE:
+            results["steps"].append({"git": step_msg, "old": old_commit, "new": new_commit})
+        else:
+            print(f"  {GREEN}git:{RESET} {step_msg}")
+
+    except subprocess.CalledProcessError as e:
+        msg = f"git failed: {e.stderr.strip() if e.stderr else str(e)}"
+        if JSON_MODE:
+            results["steps"].append({"git": "failed", "error": msg})
+        else:
+            print(f"  {RED}git:{RESET} {msg}")
+        if JSON_MODE:
+            _json_output(results)
+        return
+
+    # Step 2: reinstall package (no-deps, just update entry points + code)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-deps", "--quiet", install_dir],
+            check=True, capture_output=True, text=True,
+        )
+        if JSON_MODE:
+            results["steps"].append({"pip": "ok"})
+        else:
+            print(f"  {GREEN}pip:{RESET} Package reinstalled")
+    except subprocess.CalledProcessError as e:
+        msg = e.stderr.strip() if e.stderr else str(e)
+        if JSON_MODE:
+            results["steps"].append({"pip": "failed", "error": msg})
+        else:
+            print(f"  {YELLOW}pip:{RESET} {msg}")
+
+    # Skill file updates automatically via symlink — no action needed
+
+    if JSON_MODE:
+        _json_output(results)
+    else:
+        print(f"\n{GREEN}[ORCHESTRATIA]{RESET} Update complete. Skill file updated via symlink.")
+        print(f"  {DIM}Restart the daemon to apply: sudo systemctl restart orchestratia-agent{RESET}")
+
+
 # ── Init Command ─────────────────────────────────────────────────────
 
 
@@ -1009,6 +1206,12 @@ def main():
     pipe_create_p.add_argument("--file", help="Path to pipeline JSON file")
     pipe_create_p.add_argument("--inline", help="Inline pipeline JSON string")
 
+    # ── status subcommand (top-level agent status) ──
+    subparsers.add_parser("status", help="Show agent status: connection, session, tasks")
+
+    # ── update subcommand ──
+    subparsers.add_parser("update", help="Update agent: pull latest code, reinstall package, refresh skill")
+
     # ── init subcommand ──
     init_parser = subparsers.add_parser("init", help="Generate ORCHESTRATIA.md for this repo")
     init_parser.add_argument("--print", dest="print_only", action="store_true",
@@ -1084,6 +1287,12 @@ def main():
             "create": cmd_pipeline_create,
         }
         pipeline_actions[args.action](args)
+
+    elif args.command == "status":
+        cmd_agent_status(args)
+
+    elif args.command == "update":
+        cmd_agent_update(args)
 
     elif args.command == "init":
         cmd_init(args)

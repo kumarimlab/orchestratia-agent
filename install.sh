@@ -284,8 +284,12 @@ step 2 "Checking prerequisites"
 
 # macOS: check Xcode Command Line Tools first (git and python3 depend on it)
 if [ "$OS_TYPE" = "darwin" ]; then
-    if ! xcode-select -p >/dev/null 2>&1; then
-        info "Xcode Command Line Tools required. Installing..."
+    # xcode-select -p can return a path even when the tools are broken
+    # (e.g. after a macOS upgrade). Test that xcrun actually works.
+    if ! xcode-select -p >/dev/null 2>&1 || ! xcrun --version >/dev/null 2>&1; then
+        info "Xcode Command Line Tools missing or broken. Installing..."
+        # Reset the path first so xcode-select --install doesn't think they exist
+        sudo xcode-select --reset 2>/dev/null || true
         xcode-select --install 2>/dev/null || true
         fatal "Xcode Command Line Tools installation started. Please re-run this script after the installation completes."
     fi

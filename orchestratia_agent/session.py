@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import sys
 import time
 from typing import TYPE_CHECKING, Callable, Awaitable
@@ -254,8 +255,15 @@ class ManagedSession:
                 self._on_close(self.session_id)
             log.info(f"Session {self.session_id[:8]} closed (exit_code={exit_code})")
 
+    # Terminal DA responses from xterm.js that leak as visible text
+    _DA_RESPONSE_RE = re.compile(rb"\x1b\[\??[\d;]*c")
+
     def write_input(self, data: bytes):
-        self.backend.write(self.handle, data)
+        # Filter out Device Attributes responses from xterm.js — they leak
+        # as visible text (e.g. "1;2c0;276;0c") when tmux queries the terminal
+        data = self._DA_RESPONSE_RE.sub(b"", data)
+        if data:
+            self.backend.write(self.handle, data)
 
     def resize(self, cols: int, rows: int):
         self.backend.resize(self.handle, cols, rows)

@@ -3,13 +3,14 @@
 # Orchestratia Agent Uninstaller
 #
 # Completely removes the agent daemon from this server.
+# Supports: Linux (systemd), macOS (launchd)
 #
 # Usage:
 #   bash uninstall.sh           # Interactive (asks for confirmation)
 #   bash uninstall.sh --force   # No prompts, just remove everything
 #
 # What this removes:
-#   1. Stops and disables the systemd service
+#   1. Stops and disables the service (systemd or launchd)
 #   2. Removes the service file
 #   3. Removes agent code (/opt/orchestratia-agent)
 #   4. Removes config (/etc/orchestratia)
@@ -44,7 +45,19 @@ INSTALL_DIR="/opt/orchestratia-agent"
 CONFIG_DIR="/etc/orchestratia"
 LOG_DIR="/var/log/orchestratia"
 RUN_DIR="/var/run/orchestratia"
+
+LAUNCHD_LABEL="com.orchestratia.agent"
+LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
+
 TOTAL_STEPS=4
+
+# ── OS detection ──────────────────────────────────────────────────
+OS_TYPE="$(uname -s)"
+case "$OS_TYPE" in
+    Linux)  OS_TYPE="linux" ;;
+    Darwin) OS_TYPE="darwin" ;;
+    *)      echo "Unsupported OS: $OS_TYPE"; exit 1 ;;
+esac
 
 # ── Helper functions ────────────────────────────────────────────────
 
@@ -83,10 +96,16 @@ echo -e "${BOLD}╔════════════════════�
 echo -e "${BOLD}║         Orchestratia Agent Uninstaller           ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
+echo -e "  ${DIM}Detected OS: ${OS_TYPE}${NC}"
+echo ""
 
 # Show what will be removed
 echo -e "  ${DIM}This will remove:${NC}"
-[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ] && echo -e "    ${ARROW} systemd service: ${SERVICE_NAME}"
+if [ "$OS_TYPE" = "linux" ]; then
+    [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ] && echo -e "    ${ARROW} systemd service: ${SERVICE_NAME}"
+elif [ "$OS_TYPE" = "darwin" ]; then
+    [ -f "$LAUNCHD_PLIST" ] && echo -e "    ${ARROW} launchd service: ${LAUNCHD_LABEL}"
+fi
 [ -d "$INSTALL_DIR" ] && echo -e "    ${ARROW} agent code: ${INSTALL_DIR}"
 [ -d "$CONFIG_DIR" ] && echo -e "    ${ARROW} config: ${CONFIG_DIR}"
 [ -d "$LOG_DIR" ] && echo -e "    ${ARROW} logs: ${LOG_DIR}"
@@ -106,37 +125,64 @@ fi
 
 # ── Step 1: Stop and disable service ────────────────────────────────
 
-step 1 "Stopping systemd service"
+step 1 "Stopping service"
 
-if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    if sudo systemctl stop "$SERVICE_NAME" 2>/dev/null; then
-        ok "Service stopped"
+if [ "$OS_TYPE" = "linux" ]; then
+    # ── Linux: systemd ──
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        if sudo systemctl stop "$SERVICE_NAME" 2>/dev/null; then
+            ok "Service stopped"
+        else
+            warn "Could not stop service (may need manual cleanup)"
+        fi
     else
-        warn "Could not stop service (may need manual cleanup)"
+        skip "Service not running"
     fi
-else
-    skip "Service not running"
-fi
 
-if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-    if sudo systemctl disable "$SERVICE_NAME" 2>/dev/null; then
-        ok "Service disabled"
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        if sudo systemctl disable "$SERVICE_NAME" 2>/dev/null; then
+            ok "Service disabled"
+        else
+            warn "Could not disable service"
+        fi
     else
-        warn "Could not disable service"
+        skip "Service not enabled"
     fi
-else
-    skip "Service not enabled"
-fi
 
-if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
-    if sudo rm "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null; then
-        ok "Service file removed"
+    if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+        if sudo rm "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null; then
+            ok "Service file removed"
+        else
+            warn "Could not remove service file"
+        fi
+        sudo systemctl daemon-reload 2>/dev/null && ok "systemd reloaded" || true
     else
-        warn "Could not remove service file"
+        skip "Service file"
     fi
-    sudo systemctl daemon-reload 2>/dev/null && ok "systemd reloaded" || true
-else
-    skip "Service file"
+
+elif [ "$OS_TYPE" = "darwin" ]; then
+    # ── macOS: launchd ──
+    if sudo launchctl list "$LAUNCHD_LABEL" &>/dev/null; then
+        if sudo launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null; then
+            ok "Service stopped and unloaded"
+        else
+            # Fallback for older macOS
+            sudo launchctl unload "$LAUNCHD_PLIST" 2>/dev/null && ok "Service unloaded (legacy)" || warn "Could not unload service"
+            sudo launchctl remove "$LAUNCHD_LABEL" 2>/dev/null || true
+        fi
+    else
+        skip "Service not loaded"
+    fi
+
+    if [ -f "$LAUNCHD_PLIST" ]; then
+        if sudo rm "$LAUNCHD_PLIST" 2>/dev/null; then
+            ok "Plist removed: ${LAUNCHD_PLIST}"
+        else
+            warn "Could not remove plist"
+        fi
+    else
+        skip "Plist file"
+    fi
 fi
 
 # ── Step 2: Remove agent code ───────────────────────────────────────
@@ -210,7 +256,7 @@ fi
 echo ""
 echo -e "${BOLD}──────────────────────────────────────────────────${NC}"
 echo ""
-echo -e "  ${GREEN}${BOLD}✓ Agent uninstalled${NC}"
+echo -e "  ${GREEN}${BOLD}✓ Agent uninstalled${NC} ${DIM}(${OS_TYPE})${NC}"
 echo ""
 echo -e "  ${DIM}Note: The agent still appears in the hub dashboard.${NC}"
 echo -e "  ${DIM}It will show as 'offline' after ~90 seconds.${NC}"

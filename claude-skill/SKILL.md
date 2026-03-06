@@ -314,7 +314,27 @@ orchestratia task subscribe <task-id>
 
 After subscribing, your session receives push notifications for all events on that task (status changes, notes, interventions, completions).
 
-## 13. Documentation
+## 13. Cross-Session Commands
+
+Execute commands on other sessions in your project:
+
+```bash
+# List all sessions in your project
+orchestratia remote sessions
+
+# Run a command on another session's server
+orchestratia remote exec <session-name> "cargo test"
+
+# Read a file from another session's server
+orchestratia remote read <session-name> /path/to/file
+
+# With timeout (default 30s, max 300s)
+orchestratia remote exec <session-name> "npm run build" --timeout 120
+```
+
+All remote commands support `--json` for machine-readable output.
+
+## 14. Documentation
 
 Full documentation available at:
 

@@ -1130,6 +1130,55 @@ def cmd_init(args):
 # ── Main ─────────────────────────────────────────────────────────────
 
 
+# ── Remote Commands ──────────────────────────────────────────────────
+
+
+def cmd_remote_sessions(args):
+    """List sessions in the current project (alias for session list)."""
+    cmd_session_list(args)
+
+
+def cmd_remote_exec(args):
+    """Execute a command on a remote session."""
+    if not PROJECT_ID:
+        _error_exit("ORCHESTRATIA_PROJECT_ID not set (set env var or configure config.yaml)")
+
+    result = _api_request(
+        "POST", "",
+        data={
+            "session_name": args.session_name,
+            "command": args.command,
+            "timeout": args.timeout,
+        },
+        base=f"/api/v1/server/remote/exec?project_id={PROJECT_ID}",
+    )
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    exit_code = result.get("exit_code", -1)
+    stdout = result.get("stdout", "")
+    stderr = result.get("stderr", "")
+
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(f"{RED}{stderr}{RESET}", end="", file=sys.stderr)
+
+    if exit_code != 0:
+        print(f"\n{DIM}[exit code: {exit_code}]{RESET}")
+
+
+def cmd_remote_read(args):
+    """Read a file from a remote session (sugar for exec + cat)."""
+    # Reuse remote exec with cat
+    args.command = f"cat {args.path}"
+    if not hasattr(args, "timeout"):
+        args.timeout = 30
+    cmd_remote_exec(args)
+
+
 def main():
     global JSON_MODE
 
@@ -1300,6 +1349,25 @@ def main():
     pipe_create_p.add_argument("--file", help="Path to pipeline JSON file")
     pipe_create_p.add_argument("--inline", help="Inline pipeline JSON string")
 
+    # ── remote subcommand ──
+    remote_parser = subparsers.add_parser("remote", help="Cross-session remote commands")
+    remote_sub = remote_parser.add_subparsers(dest="action")
+
+    # remote sessions
+    remote_sub.add_parser("sessions", help="List sessions in this project")
+
+    # remote exec
+    remote_exec_p = remote_sub.add_parser("exec", help="Execute command on remote session")
+    remote_exec_p.add_argument("session_name", help="Target session name")
+    remote_exec_p.add_argument("command", help="Command to execute")
+    remote_exec_p.add_argument("--timeout", type=int, default=30, help="Timeout in seconds")
+
+    # remote read
+    remote_read_p = remote_sub.add_parser("read", help="Read file from remote session")
+    remote_read_p.add_argument("session_name", help="Target session name")
+    remote_read_p.add_argument("path", help="File path to read")
+    remote_read_p.add_argument("--timeout", type=int, default=30, help="Timeout in seconds")
+
     # ── status subcommand (top-level agent status) ──
     subparsers.add_parser("status", help="Show agent status: connection, session, tasks")
 
@@ -1383,6 +1451,18 @@ def main():
             "respond": cmd_intervention_respond,
         }
         intervention_actions[args.action](args)
+
+    elif args.command == "remote":
+        if not args.action:
+            remote_parser.print_help()
+            sys.exit(1)
+
+        remote_actions = {
+            "sessions": cmd_remote_sessions,
+            "exec": cmd_remote_exec,
+            "read": cmd_remote_read,
+        }
+        remote_actions[args.action](args)
 
     elif args.command == "pipeline":
         if not args.action:

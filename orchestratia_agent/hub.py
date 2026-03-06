@@ -530,6 +530,33 @@ async def ws_receive_loop(ws, state: DaemonState):
                     asyncio.create_task(_status_update_inject(session, message))
                     log.info(f"Task status update ({msg.get('status')}) injected into orchestrator session {session_id[:8]}")
 
+            elif msg_type == "tunnel_open":
+                from orchestratia_agent.tunnel import open_tunnel
+                tunnel_id = msg.get("tunnel_id")
+                target_host = msg.get("target_host", "127.0.0.1")
+                target_port = msg.get("target_port", 22)
+                if tunnel_id:
+                    asyncio.create_task(open_tunnel(tunnel_id, target_host, target_port, sender))
+
+            elif msg_type == "tunnel_data":
+                from orchestratia_agent.tunnel import write_tunnel_data
+                tunnel_id = msg.get("tunnel_id")
+                b64_data = msg.get("data", "")
+                if tunnel_id and b64_data:
+                    write_tunnel_data(tunnel_id, b64_data)
+
+            elif msg_type == "tunnel_close":
+                from orchestratia_agent.tunnel import close_tunnel
+                tunnel_id = msg.get("tunnel_id")
+                if tunnel_id:
+                    close_tunnel(tunnel_id)
+
+            elif msg_type == "remote_exec":
+                request_id = msg.get("request_id")
+                command = msg.get("command", "")
+                if request_id and command:
+                    asyncio.create_task(_handle_remote_exec(sender, request_id, command))
+
             elif msg_type == "pong":
                 pass
 
@@ -702,6 +729,40 @@ async def ws_connection_loop(state: DaemonState):
         backoff = min(backoff * 2, 30)
 
 
+async def _handle_remote_exec(sender, request_id: str, command: str):
+    """Execute a command locally and return the result via WS."""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        await sender({
+            "type": "remote_exec_result",
+            "request_id": request_id,
+            "exit_code": proc.returncode,
+            "stdout": stdout.decode(errors="replace"),
+            "stderr": stderr.decode(errors="replace"),
+        })
+    except asyncio.TimeoutError:
+        await sender({
+            "type": "remote_exec_result",
+            "request_id": request_id,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "Command timed out (120s)",
+        })
+    except Exception as e:
+        await sender({
+            "type": "remote_exec_result",
+            "request_id": request_id,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+        })
+
+
 async def cleanup_sessions(state: DaemonState):
     """Cleanup on daemon shutdown.
 
@@ -711,6 +772,10 @@ async def cleanup_sessions(state: DaemonState):
     Only non-persistent (plain PTY / direct ConPTY) sessions are
     terminated, since they cannot outlive the daemon anyway.
     """
+    # Close all active tunnels
+    from orchestratia_agent.tunnel import close_all_tunnels
+    close_all_tunnels()
+
     backend = state.backend
     persistent = backend.supports_persistence()
     for session_id, session in list(state.active_sessions.items()):

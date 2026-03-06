@@ -50,6 +50,7 @@ Issues = "https://github.com/kumarimlab/orchestratia-agent/issues"
 [project.scripts]
 orchestratia-agent = "orchestratia_agent.main:entry_point"
 orchestratia = "orchestratia_agent.cli:main"
+orchestratia-connect = "orchestratia_agent.connect:main"
 
 [tool.setuptools.packages.find]
 include = ["orchestratia_agent*"]

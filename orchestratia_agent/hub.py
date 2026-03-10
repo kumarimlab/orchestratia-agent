@@ -57,17 +57,23 @@ async def register_with_hub(
         return None
 
     try:
+        payload = {
+            "name": state.config.get("server_name", platform.node()),
+            "hostname": platform.node(),
+            "ip": "0.0.0.0",
+            "os": platform.system().lower(),
+            "repos": get_repos_info(state.config),
+            "system_info": get_system_info(),
+            "registration_token": reg_token,
+        }
+        # Send server_id for identity persistence across reinstalls
+        sid = state.config.get("server_id")
+        if sid:
+            payload["server_id"] = sid
+
         resp = await client.post(
             f"{state.hub_url}/api/v1/servers/register",
-            json={
-                "name": state.config.get("server_name", platform.node()),
-                "hostname": platform.node(),
-                "ip": "0.0.0.0",
-                "os": platform.system().lower(),
-                "repos": get_repos_info(state.config),
-                "system_info": get_system_info(),
-                "registration_token": reg_token,
-            },
+            json=payload,
         )
         if resp.status_code == 401:
             detail = resp.json().get("detail", "Unknown error")
@@ -81,10 +87,11 @@ async def register_with_hub(
         resp.raise_for_status()
         data = resp.json()
         state.api_key = data["api_key"]
-        log.info(f"Registered with hub. Server ID: {data['id']}, Key: {state.api_key[:8]}...")
+        server_id = data.get("id")
+        log.info(f"Registered with hub. Server ID: {server_id}, Key: {state.api_key[:8]}...")
 
         if state.config_path:
-            persist_api_key(state.config_path, state.api_key)
+            persist_api_key(state.config_path, state.api_key, server_id=server_id)
         else:
             log.warning(f"SAVE THIS API KEY to your config.yaml: {state.api_key}")
 

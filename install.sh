@@ -199,6 +199,18 @@ info "Platform: ${BOLD}${OS_TYPE}${NC}"
 # Step 1: Clean up existing installation
 step 1 "Removing existing installation (if any)"
 
+# Preserve server identity across reinstalls (prevents hostname collisions)
+OLD_SERVER_ID=""
+if [ -f "${CONFIG_DIR}/config.yaml" ]; then
+    OLD_SERVER_ID=$(grep '^server_id:' "${CONFIG_DIR}/config.yaml" | awk '{print $2}' 2>/dev/null || true)
+fi
+if [ -z "$OLD_SERVER_ID" ] && [ -f "${RUN_HOME}/.config/orchestratia/config.yaml" ]; then
+    OLD_SERVER_ID=$(grep '^server_id:' "${RUN_HOME}/.config/orchestratia/config.yaml" | awk '{print $2}' 2>/dev/null || true)
+fi
+if [ -n "$OLD_SERVER_ID" ]; then
+    ok "Preserved server identity: ${OLD_SERVER_ID:0:8}..."
+fi
+
 EXISTING=false
 
 # Service cleanup: systemd (Linux) or launchd (macOS)
@@ -538,7 +550,12 @@ if [ -z "$AGENT_CMD" ]; then
     info "Using fallback: ${AGENT_CMD}"
 fi
 REGISTER_OUTPUT=""
-if REGISTER_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" $AGENT_CMD --config "${CONFIG_DIR}/config.yaml" --register "$TOKEN" 2>&1); then
+REGISTER_ARGS="--config ${CONFIG_DIR}/config.yaml --register $TOKEN"
+if [ -n "$OLD_SERVER_ID" ]; then
+    REGISTER_ARGS="$REGISTER_ARGS --server-id $OLD_SERVER_ID"
+    info "Sending preserved server identity to hub"
+fi
+if REGISTER_OUTPUT=$(sudo -u "$RUN_USER" HOME="$RUN_HOME" $AGENT_CMD $REGISTER_ARGS 2>&1); then
     # Check for success indicators in output
     if echo "$REGISTER_OUTPUT" | grep -qi "api.key\|registered\|success\|saved"; then
         ok "Registered successfully"

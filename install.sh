@@ -230,6 +230,23 @@ elif [ "$OS_TYPE" = "darwin" ]; then
     fi
 fi
 
+# Kill ALL running orchestratia-agent processes (not just the service).
+# Catches agents started manually, from tmux, or from a previous non-systemd install.
+KILLED=0
+if pgrep -f "orchestratia.agent|orchestratia-agent" >/dev/null 2>&1; then
+    sudo pkill -f "orchestratia.agent|orchestratia-agent" 2>/dev/null || true
+    sleep 1
+    # Force kill any survivors
+    if pgrep -f "orchestratia.agent|orchestratia-agent" >/dev/null 2>&1; then
+        sudo pkill -9 -f "orchestratia.agent|orchestratia-agent" 2>/dev/null || true
+    fi
+    KILLED=1
+fi
+if [ "$KILLED" -eq 1 ]; then
+    EXISTING=true
+    ok "Killed running agent processes"
+fi
+
 if [ -d "$INSTALL_DIR" ]; then
     EXISTING=true
     OLD_COMMIT=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")

@@ -8,7 +8,9 @@ import json
 import logging
 import platform
 import ssl
+import subprocess
 import sys
+import uuid
 from typing import TYPE_CHECKING
 
 import httpx
@@ -23,6 +25,53 @@ if TYPE_CHECKING:
     from orchestratia_agent.main import DaemonState
 
 log = logging.getLogger("orchestratia-agent")
+
+
+def get_machine_id() -> str:
+    """Get a stable OS-level machine identifier.
+
+    - Linux: /etc/machine-id (32 hex chars, unique per OS install)
+    - macOS: IOPlatformUUID from IORegistry
+    - Windows: MachineGuid from registry
+    - Fallback: empty string (will always create a new server record)
+    """
+    if sys.platform == "linux":
+        try:
+            return open("/etc/machine-id").read().strip()
+        except OSError:
+            return ""
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.check_output(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                text=True, timeout=5,
+            )
+            for line in out.splitlines():
+                if "IOPlatformUUID" in line:
+                    # Format: "IOPlatformUUID" = "XXXXXXXX-XXXX-..."
+                    return line.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return ""
+    elif sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography",
+            )
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+            winreg.CloseKey(key)
+            return value
+        except Exception:
+            return ""
+    return ""
+
+
+def get_mac_address() -> str:
+    """Get the primary MAC address as colon-separated hex."""
+    node = uuid.getnode()
+    return ":".join(f"{(node >> (8 * i)) & 0xFF:02x}" for i in reversed(range(6)))
 
 
 async def ws_send(state: DaemonState, msg: dict) -> bool:
@@ -65,11 +114,9 @@ async def register_with_hub(
             "repos": get_repos_info(state.config),
             "system_info": get_system_info(),
             "registration_token": reg_token,
+            "machine_id": get_machine_id(),
+            "mac_address": get_mac_address(),
         }
-        # Send server_id for identity persistence across reinstalls
-        sid = state.config.get("server_id")
-        if sid:
-            payload["server_id"] = sid
 
         resp = await client.post(
             f"{state.hub_url}/api/v1/servers/register",
@@ -91,7 +138,7 @@ async def register_with_hub(
         log.info(f"Registered with hub. Server ID: {server_id}, Key: {state.api_key[:8]}...")
 
         if state.config_path:
-            persist_api_key(state.config_path, state.api_key, server_id=server_id)
+            persist_api_key(state.config_path, state.api_key)
         else:
             log.warning(f"SAVE THIS API KEY to your config.yaml: {state.api_key}")
 

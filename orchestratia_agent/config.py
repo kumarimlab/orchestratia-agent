@@ -110,14 +110,13 @@ def ensure_config_for_register(config_path: str, token: str) -> dict:
     return cfg
 
 
-def persist_api_key(config_path: str, key: str, server_id: str | None = None) -> None:
-    """After registration, save the API key, server_id, and remove the consumed token."""
+def persist_api_key(config_path: str, key: str) -> None:
+    """After registration, save the API key and remove the consumed token."""
     if not os.path.exists(config_path):
         return
     cfg = load_config(config_path)
     cfg["api_key"] = key
-    if server_id:
-        cfg["server_id"] = server_id
     cfg.pop("registration_token", None)
+    cfg.pop("server_id", None)  # Legacy field, no longer used
     save_config(config_path, cfg)
     log.info(f"API key saved to {config_path} (registration_token removed)")

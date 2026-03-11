@@ -65,7 +65,6 @@ async def main():
         help=f"Config file path (default: {default_config_path()})",
     )
     parser.add_argument("--register", metavar="TOKEN", help="One-time registration token")
-    parser.add_argument("--server-id", metavar="UUID", help="Persist server identity across reinstalls")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--version", action="version", version=f"orchestratia-agent {__version__}")
@@ -79,9 +78,6 @@ async def main():
 
     if args.register:
         state.config = ensure_config_for_register(state.config_path, args.register)
-        # Inject --server-id into config so it's sent during registration
-        if args.server_id:
-            state.config["server_id"] = args.server_id
         state.hub_url = state.config.get("hub_url", "").rstrip("/")
         if not state.hub_url:
             log.error("hub_url not set in config")
@@ -358,7 +354,7 @@ def entry_point():
     # The exe is built with console=False (WINDOWS subsystem) so no console
     # window is ever created — perfect for daemon mode but print() goes
     # nowhere without AttachConsole.
-    interactive_flags = {"--version", "--test-pty", "--register", "--server-id", "--help", "-h"}
+    interactive_flags = {"--version", "--test-pty", "--register", "--help", "-h"}
     if any(flag in sys.argv for flag in interactive_flags):
         _attach_parent_console()
 

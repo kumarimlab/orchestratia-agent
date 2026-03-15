@@ -26,6 +26,10 @@ a = Analysis(
         'orchestratia_agent.system',
         'orchestratia_agent.tmux',
         'orchestratia_agent.win_input_helper',
+        'orchestratia_agent.tunnel',
+        'orchestratia_agent.file_transfer',
+        'orchestratia_agent.connect',
+        'orchestratia_agent.virtual_screen',
         # httpx transport chain
         'httpx._transports.default',
         'httpcore._backends.anyio',

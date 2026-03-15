@@ -334,7 +334,29 @@ orchestratia remote exec <session-name> "npm run build" --timeout 120
 
 All remote commands support `--json` for machine-readable output.
 
-## 14. Documentation
+## 14. File Transfer Between Agents
+
+Send files to other sessions in your project via hub relay (chunked, SHA-256 verified):
+
+```bash
+# Send a file to another session
+orchestratia file send ./build-output.tar.gz --to other-session-name
+
+# Send with custom timeout (default 300s)
+orchestratia file send ./large-artifact.bin --to other-session --timeout 600
+
+# Check transfer status
+orchestratia file status <transfer-id>
+```
+
+Received files are saved to `~/.orchestratia/transfers/` (configurable via `ORCHESTRATIA_TRANSFER_DIR` env var).
+
+Requirements:
+- Sender and receiver must be in the **same project**
+- Both servers must be owned by the **same user**
+- Receiver must have an active session
+
+## 15. Documentation
 
 Full documentation available at:
 

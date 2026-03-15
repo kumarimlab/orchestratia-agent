@@ -47,7 +47,14 @@ LOG_DIR="/var/log/orchestratia"
 RUN_DIR="/var/run/orchestratia"
 
 LAUNCHD_LABEL="com.orchestratia.agent"
-LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
+LAUNCHD_PLIST_USER="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+LAUNCHD_PLIST_SYSTEM="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
+# Check both user-level (install-macos.sh) and system-level locations
+if [ -f "$LAUNCHD_PLIST_USER" ]; then
+    LAUNCHD_PLIST="$LAUNCHD_PLIST_USER"
+else
+    LAUNCHD_PLIST="$LAUNCHD_PLIST_SYSTEM"
+fi
 
 TOTAL_STEPS=4
 
@@ -162,27 +169,26 @@ if [ "$OS_TYPE" = "linux" ]; then
 
 elif [ "$OS_TYPE" = "darwin" ]; then
     # ── macOS: launchd ──
-    if sudo launchctl list "$LAUNCHD_LABEL" &>/dev/null; then
+    # Try user-level first (install-macos.sh), then system-level
+    if launchctl list "$LAUNCHD_LABEL" &>/dev/null; then
+        launchctl unload "$LAUNCHD_PLIST" 2>/dev/null && ok "User agent unloaded" || true
+    fi
+    if sudo launchctl list "$LAUNCHD_LABEL" &>/dev/null 2>/dev/null; then
         if sudo launchctl bootout "system/${LAUNCHD_LABEL}" 2>/dev/null; then
-            ok "Service stopped and unloaded"
+            ok "System service stopped and unloaded"
         else
-            # Fallback for older macOS
-            sudo launchctl unload "$LAUNCHD_PLIST" 2>/dev/null && ok "Service unloaded (legacy)" || warn "Could not unload service"
+            sudo launchctl unload "$LAUNCHD_PLIST" 2>/dev/null && ok "System service unloaded (legacy)" || warn "Could not unload service"
             sudo launchctl remove "$LAUNCHD_LABEL" 2>/dev/null || true
         fi
-    else
-        skip "Service not loaded"
     fi
 
-    if [ -f "$LAUNCHD_PLIST" ]; then
-        if sudo rm "$LAUNCHD_PLIST" 2>/dev/null; then
-            ok "Plist removed: ${LAUNCHD_PLIST}"
-        else
-            warn "Could not remove plist"
+    # Remove plist from both locations
+    for plist in "$LAUNCHD_PLIST_USER" "$LAUNCHD_PLIST_SYSTEM"; do
+        if [ -f "$plist" ]; then
+            rm -f "$plist" 2>/dev/null || sudo rm -f "$plist" 2>/dev/null
+            ok "Plist removed: ${plist}"
         fi
-    else
-        skip "Plist file"
-    fi
+    done
 fi
 
 # ── Step 2: Remove agent code ───────────────────────────────────────

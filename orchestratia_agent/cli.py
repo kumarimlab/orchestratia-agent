@@ -27,6 +27,8 @@ Usage:
   orchestratia server list [--json]
   orchestratia session list [--json]
   orchestratia pipeline create --file pipeline.json [--json]
+  orchestratia file send <path> --to <session-name> [--timeout 300]
+  orchestratia file status <transfer-id>
   orchestratia init [--print]
 
 All commands support --json for machine-readable output.
@@ -1093,6 +1095,21 @@ orchestratia session list --json
 orchestratia pipeline create --file pipeline.json --json
 ```
 
+### Remote execution on another session
+```bash
+orchestratia remote sessions                              # list sessions in project
+orchestratia remote exec <session-name> "ls -la"          # run command on remote session
+orchestratia remote read <session-name> /path/to/file     # read file from remote session
+```
+
+### File transfer between agents
+```bash
+orchestratia file send ./build.tar.gz --to other-session  # send file to another session
+orchestratia file status <transfer-id>                    # check transfer progress
+```
+
+Files are transferred through the hub (chunked, SHA-256 verified). Sender and receiver must be in the same project and owned by the same user.
+
 ## Workflow for AI Agents
 
 1. **Check** for assigned tasks: `orchestratia task check --json`
@@ -1177,6 +1194,131 @@ def cmd_remote_read(args):
     if not hasattr(args, "timeout"):
         args.timeout = 30
     cmd_remote_exec(args)
+
+
+# ── File Transfer Commands ──────────────────────────────────────────
+
+
+def cmd_file_send(args):
+    """Send a file to a target session via hub relay."""
+    import hashlib
+
+    if not PROJECT_ID:
+        _error_exit("ORCHESTRATIA_PROJECT_ID not set (set env var or configure config.yaml)")
+
+    file_path = os.path.abspath(args.path)
+    if not os.path.isfile(file_path):
+        _error_exit(f"File not found: {file_path}")
+
+    file_size = os.path.getsize(file_path)
+    filename = os.path.basename(file_path)
+
+    # Pre-compute SHA-256
+    if not JSON_MODE:
+        print(f"{DIM}Computing SHA-256...{RESET}", end="", flush=True)
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    sha256 = hasher.hexdigest()
+    if not JSON_MODE:
+        print(f"\r{DIM}SHA-256: {sha256[:16]}...{RESET}")
+
+    # Initiate transfer via REST
+    result = _api_request(
+        "POST", "",
+        data={
+            "target_session": args.to,
+            "project_id": PROJECT_ID,
+            "filename": filename,
+            "file_path": file_path,
+            "file_size": file_size,
+            "sha256": sha256,
+        },
+        base="/api/v1/server/remote/file-transfer",
+    )
+
+    transfer_id = result.get("transfer_id", "")
+    if not transfer_id:
+        _error_exit("Failed to initiate transfer: no transfer_id returned")
+
+    if not JSON_MODE:
+        print(f"{GREEN}[ORCHESTRATIA]{RESET} Transfer initiated: {transfer_id[:12]}...")
+        print(f"  File: {filename} ({file_size:,} bytes)")
+        print(f"  Target: {args.to}")
+        print(f"  {DIM}Waiting for receiver to accept...{RESET}")
+
+    # Poll for completion
+    timeout = getattr(args, "timeout", 300)
+    import time
+    start = time.time()
+    while time.time() - start < timeout:
+        status = _api_request(
+            "GET", f"/{transfer_id}",
+            base="/api/v1/server/remote/file-transfer",
+        )
+        st = status.get("status", "")
+
+        if st == "completed":
+            if JSON_MODE:
+                _json_output(status)
+            else:
+                print(f"{GREEN}[ORCHESTRATIA]{RESET} Transfer complete! File delivered to '{args.to}'")
+            return
+
+        if st in ("failed", "rejected"):
+            error = status.get("error", st)
+            if JSON_MODE:
+                _json_output(status)
+            else:
+                print(f"{RED}[ORCHESTRATIA]{RESET} Transfer {st}: {error}")
+            sys.exit(1)
+
+        if st == "transferring" and not JSON_MODE:
+            relayed = status.get("chunks_relayed", 0)
+            total = status.get("total_chunks", 0)
+            if total:
+                pct = int(relayed / total * 100)
+                print(f"\r  {DIM}Progress: {relayed}/{total} chunks ({pct}%){RESET}    ", end="", flush=True)
+
+        time.sleep(1)
+
+    if JSON_MODE:
+        _json_output({"error": f"Transfer timed out after {timeout}s", "transfer_id": transfer_id})
+    else:
+        print(f"\n{RED}[ORCHESTRATIA]{RESET} Transfer timed out after {timeout}s")
+    sys.exit(1)
+
+
+def cmd_file_status(args):
+    """Check file transfer status."""
+    result = _api_request(
+        "GET", f"/{args.transfer_id}",
+        base="/api/v1/server/remote/file-transfer",
+    )
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    st = result.get("status", "unknown")
+    status_color = {
+        "pending": YELLOW, "accepted": CYAN, "transferring": CYAN,
+        "completed": GREEN, "failed": RED, "rejected": RED,
+    }.get(st, "")
+
+    print(f"{BRAND}Transfer {result.get('transfer_id', '')[:12]}...{RESET}")
+    print(f"  Status: {status_color}{st}{RESET}")
+    print(f"  File: {result.get('filename', '?')} ({result.get('file_size', 0):,} bytes)")
+    relayed = result.get("chunks_relayed", 0)
+    total = result.get("total_chunks", 0)
+    if total:
+        print(f"  Progress: {relayed}/{total} chunks ({int(relayed / total * 100)}%)")
+    if result.get("error"):
+        print(f"  Error: {RED}{result['error']}{RESET}")
 
 
 def main():
@@ -1368,6 +1510,21 @@ def main():
     remote_read_p.add_argument("path", help="File path to read")
     remote_read_p.add_argument("--timeout", type=int, default=30, help="Timeout in seconds")
 
+    # ── file subcommand ──
+    file_parser = subparsers.add_parser("file", help="File transfer operations")
+    file_sub = file_parser.add_subparsers(dest="action")
+
+    # file send
+    file_send_p = file_sub.add_parser("send", help="Send a file to another session")
+    file_send_p.add_argument("path", help="Path to the file to send")
+    file_send_p.add_argument("--to", required=True, help="Target session name")
+    file_send_p.add_argument("--timeout", type=int, default=300,
+                             help="Timeout in seconds (default: 300)")
+
+    # file status
+    file_status_p = file_sub.add_parser("status", help="Check file transfer status")
+    file_status_p.add_argument("transfer_id", help="Transfer ID")
+
     # ── status subcommand (top-level agent status) ──
     subparsers.add_parser("status", help="Show agent status: connection, session, tasks")
 
@@ -1473,6 +1630,17 @@ def main():
             "create": cmd_pipeline_create,
         }
         pipeline_actions[args.action](args)
+
+    elif args.command == "file":
+        if not args.action:
+            file_parser.print_help()
+            sys.exit(1)
+
+        file_actions = {
+            "send": cmd_file_send,
+            "status": cmd_file_status,
+        }
+        file_actions[args.action](args)
 
     elif args.command == "status":
         cmd_agent_status(args)

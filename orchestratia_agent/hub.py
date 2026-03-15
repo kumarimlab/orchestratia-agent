@@ -611,6 +611,63 @@ async def ws_receive_loop(ws, state: DaemonState):
                 if request_id and command:
                     asyncio.create_task(_handle_remote_exec(sender, request_id, command))
 
+            # ── File Transfer Messages ──
+            elif msg_type == "file_offer":
+                from orchestratia_agent.file_transfer import handle_file_offer
+                asyncio.create_task(handle_file_offer(msg, sender))
+
+            elif msg_type == "file_send_start":
+                from orchestratia_agent.file_transfer import send_file
+                transfer_id = msg.get("transfer_id", "")
+                file_path = msg.get("file_path", "")
+                if transfer_id and file_path:
+                    asyncio.create_task(send_file(file_path, transfer_id, sender))
+
+            elif msg_type == "file_accepted":
+                from orchestratia_agent.file_transfer import resolve_outbound
+                transfer_id = msg.get("transfer_id", "")
+                if transfer_id:
+                    resolve_outbound(transfer_id, {"status": "accepted"})
+
+            elif msg_type == "file_rejected":
+                from orchestratia_agent.file_transfer import resolve_outbound
+                transfer_id = msg.get("transfer_id", "")
+                if transfer_id:
+                    resolve_outbound(transfer_id, {
+                        "status": "rejected",
+                        "reason": msg.get("reason", ""),
+                    })
+
+            elif msg_type == "file_chunk":
+                from orchestratia_agent.file_transfer import handle_file_chunk
+                handle_file_chunk(msg)
+
+            elif msg_type == "file_complete":
+                from orchestratia_agent.file_transfer import handle_file_complete
+                asyncio.create_task(handle_file_complete(msg, sender))
+
+            elif msg_type == "file_ack":
+                from orchestratia_agent.file_transfer import resolve_outbound
+                transfer_id = msg.get("transfer_id", "")
+                if transfer_id:
+                    resolve_outbound(transfer_id, {
+                        "status": "completed",
+                        "sha256_verified": msg.get("sha256_verified", False),
+                    })
+
+            elif msg_type == "file_error":
+                from orchestratia_agent.file_transfer import (
+                    resolve_outbound,
+                    _cleanup_incoming,
+                )
+                transfer_id = msg.get("transfer_id", "")
+                if transfer_id:
+                    resolve_outbound(transfer_id, {
+                        "status": "failed",
+                        "error": msg.get("error", "Unknown error"),
+                    })
+                    _cleanup_incoming(transfer_id)
+
             elif msg_type == "pong":
                 pass
 

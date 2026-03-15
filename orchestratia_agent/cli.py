@@ -934,8 +934,16 @@ def cmd_agent_status(args):
 
 
 def cmd_agent_update(args):
-    """Update the agent: pull latest code, reinstall package."""
+    """Update the agent: pull latest code, reinstall package.
+
+    On Linux/macOS: git pull + pip reinstall from /opt/orchestratia-agent.
+    On Windows (standalone exe): re-runs the PowerShell install script in upgrade mode.
+    """
     import subprocess
+
+    if sys.platform == "win32":
+        _agent_update_windows()
+        return
 
     install_dir = os.environ.get("ORCHESTRATIA_INSTALL_DIR", "/opt/orchestratia-agent")
 
@@ -1021,7 +1029,68 @@ def cmd_agent_update(args):
         _json_output(results)
     else:
         print(f"\n{GREEN}[ORCHESTRATIA]{RESET} Update complete. Skill file updated via symlink.")
-        print(f"  {DIM}Restart the daemon to apply: sudo systemctl restart orchestratia-agent{RESET}")
+        if sys.platform == "darwin":
+            print(f"  {DIM}Restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.orchestratia.agent{RESET}")
+        else:
+            print(f"  {DIM}Restart the daemon to apply: sudo systemctl restart orchestratia-agent{RESET}")
+
+
+def _agent_update_windows():
+    """Windows update: re-run the PowerShell installer in upgrade mode (no token = upgrade)."""
+    import subprocess
+
+    install_url = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1"
+
+    if JSON_MODE:
+        results = {"platform": "windows", "steps": []}
+
+    if not JSON_MODE:
+        print(f"{BRAND}[ORCHESTRATIA]{RESET} Updating agent (Windows exe)...")
+        print(f"  {DIM}Running install script in upgrade mode...{RESET}")
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-ExecutionPolicy", "Bypass", "-Command",
+                f"irm {install_url} | iex",
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        if result.returncode == 0:
+            if JSON_MODE:
+                results["steps"].append({"upgrade": "ok", "output": result.stdout[-500:] if result.stdout else ""})
+            else:
+                # Print the installer output (it has its own formatting)
+                if result.stdout:
+                    print(result.stdout)
+                print(f"{GREEN}[ORCHESTRATIA]{RESET} Update complete.")
+        else:
+            msg = result.stderr.strip() if result.stderr else f"exit code {result.returncode}"
+            if JSON_MODE:
+                results["steps"].append({"upgrade": "failed", "error": msg})
+            else:
+                print(f"  {RED}Upgrade failed:{RESET} {msg}")
+                if result.stdout:
+                    print(result.stdout[-500:])
+
+    except FileNotFoundError:
+        msg = "PowerShell not found. Run manually in PowerShell:"
+        if JSON_MODE:
+            results["steps"].append({"upgrade": "failed", "error": msg})
+        else:
+            print(f"  {RED}{msg}{RESET}")
+            print(f"  {CYAN}irm {install_url} | iex{RESET}")
+
+    except subprocess.TimeoutExpired:
+        msg = "Upgrade timed out after 120s"
+        if JSON_MODE:
+            results["steps"].append({"upgrade": "failed", "error": msg})
+        else:
+            print(f"  {RED}{msg}{RESET}")
+
+    if JSON_MODE:
+        _json_output(results)
 
 
 # ── Init Command ─────────────────────────────────────────────────────

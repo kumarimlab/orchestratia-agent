@@ -226,7 +226,7 @@ if ($pipAgent -and $pipAgent.Source -ne $AgentExePath) {
     Write-Info "Found existing installation at: $pipPath"
 
     # Check if it's a pip-installed script (lives in a Python Scripts directory)
-    if ($pipPath -match "Python.*Scripts" -or $pipPath -match "site-packages") {
+    if ($pipPath -match "Python.*Scripts" -or $pipPath -match "site-packages" -or $pipPath -match "anaconda.*Scripts" -or $pipPath -match "conda.*Scripts" -or $pipPath -match "envs.*Scripts") {
         Write-Info "Detected pip-installed version, removing..."
         # Try pip uninstall
         $pipExe = Get-Command pip -ErrorAction SilentlyContinue
@@ -319,6 +319,15 @@ try {
 } catch {
     # Start-Process -Wait works even if output capture fails
     Write-Ok "Binary downloaded"
+}
+
+# Create orchestratia.exe (CLI tool) — same binary, detects name at runtime
+$CliExePath = "$ConfigDir\orchestratia.exe"
+try {
+    Copy-Item $AgentExePath $CliExePath -Force -ErrorAction Stop
+    Write-Ok "Created CLI tool: orchestratia.exe"
+} catch {
+    Write-Warn "Could not create orchestratia.exe: $_"
 }
 
 # Step 3: Register (or verify existing config for upgrades)
@@ -537,6 +546,8 @@ Write-Host "  Sessions persist across agent restarts and reinstalls." -Foregroun
 Write-Host "  The pty-host process owns sessions independently." -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Useful commands:" -ForegroundColor DarkGray
+Write-Host "    CLI:      orchestratia status"
+Write-Host "    Tasks:    orchestratia task check"
 Write-Host "    Version:  orchestratia-agent --version"
 Write-Host "    Test PTY: orchestratia-agent --test-pty"
 Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"

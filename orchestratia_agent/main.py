@@ -340,7 +340,23 @@ def _attach_parent_console():
 
 
 def entry_point():
-    """Entry point for console_scripts and legacy shims."""
+    """Entry point for console_scripts and legacy shims.
+
+    When the exe is invoked as 'orchestratia' (not 'orchestratia-agent'),
+    route to the CLI instead of the daemon.  This allows the install script
+    to copy orchestratia-agent.exe → orchestratia.exe and have it work as
+    the CLI tool automatically.
+    """
+    # Detect if invoked as "orchestratia" (CLI) vs "orchestratia-agent" (daemon).
+    # On Windows the exe name might be orchestratia.exe, orchestratia.EXE, etc.
+    exe_name = os.path.basename(sys.executable if getattr(sys, "frozen", False) else sys.argv[0])
+    exe_stem = os.path.splitext(exe_name)[0].lower()
+    if exe_stem == "orchestratia":
+        _attach_parent_console()
+        from orchestratia_agent.cli import main as cli_main
+        cli_main()
+        return
+
     if "--pty-host" in sys.argv:
         # Must run BEFORE asyncio.run() — pty_host.main() calls asyncio.run() itself
         if sys.platform != "win32":

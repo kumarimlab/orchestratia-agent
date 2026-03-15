@@ -44,7 +44,7 @@ import urllib.error
 import ssl
 
 # Read config from environment (set by daemon when spawning PTY)
-HUB_URL = os.environ.get("ORCHESTRATIA_HUB_URL", "")
+HUB_URL = os.environ.get("ORCHESTRATIA_HUB_URL", "").rstrip("/")
 API_KEY = os.environ.get("ORCHESTRATIA_API_KEY", "")
 SESSION_ID = os.environ.get("ORCHESTRATIA_SESSION_ID", "")
 PROJECT_ID = os.environ.get("ORCHESTRATIA_PROJECT_ID", "")
@@ -62,7 +62,7 @@ try:
         _cfg_hub = _cfg.get("hub_url", "")
         _cfg_key = _cfg.get("api_key", "")
         if _cfg_hub:
-            HUB_URL = _cfg_hub
+            HUB_URL = _cfg_hub.rstrip("/")
         if _cfg_key:
             API_KEY = _cfg_key
 except Exception:

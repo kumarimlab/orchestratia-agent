@@ -321,34 +321,42 @@ async def ws_receive_loop(ws, state: DaemonState):
                 project_id = msg.get("project_id")
                 log.info(f"Hub requests session start: {session_id[:8]}")
 
-                env_vars = {
-                    "ORCHESTRATIA_HUB_URL": state.hub_url,
-                    "ORCHESTRATIA_API_KEY": state.api_key,
-                    "ORCHESTRATIA_SESSION_ID": session_id,
-                }
+                try:
+                    env_vars = {
+                        "ORCHESTRATIA_HUB_URL": state.hub_url,
+                        "ORCHESTRATIA_API_KEY": state.api_key,
+                        "ORCHESTRATIA_SESSION_ID": session_id,
+                    }
 
-                handle = backend.spawn(
-                    session_id, working_dir, cols, rows,
-                    env_vars=env_vars, project_id=project_id,
-                )
-                if handle:
-                    session = ManagedSession(
-                        session_id, handle, backend, sender,
-                        on_close=_on_session_close,
+                    handle = backend.spawn(
+                        session_id, working_dir, cols, rows,
+                        env_vars=env_vars, project_id=project_id,
                     )
-                    state.active_sessions[session_id] = session
-                    await session.start_reader()
-                    await ws_send(state, {
-                        "type": "session_started",
-                        "session_id": session_id,
-                        "pid": handle.pid,
-                        "tmux_name": handle.tmux_name or "",
-                    })
-                else:
+                    if handle:
+                        session = ManagedSession(
+                            session_id, handle, backend, sender,
+                            on_close=_on_session_close,
+                        )
+                        state.active_sessions[session_id] = session
+                        await session.start_reader()
+                        await ws_send(state, {
+                            "type": "session_started",
+                            "session_id": session_id,
+                            "pid": handle.pid,
+                            "tmux_name": handle.tmux_name or "",
+                        })
+                    else:
+                        await ws_send(state, {
+                            "type": "session_error",
+                            "session_id": session_id,
+                            "error": "Failed to spawn session",
+                        })
+                except Exception as e:
+                    log.error(f"Session spawn crashed for {session_id[:8]}: {e}", exc_info=True)
                     await ws_send(state, {
                         "type": "session_error",
                         "session_id": session_id,
-                        "error": "Failed to spawn session",
+                        "error": f"Spawn exception: {e}",
                     })
 
             elif msg_type == "session_input":

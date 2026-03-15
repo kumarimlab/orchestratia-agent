@@ -36,8 +36,10 @@ def _get_log_dir() -> str | None:
         base = os.environ.get("LOCALAPPDATA", "")
         if base:
             return os.path.join(base, "Orchestratia", "logs")
+    elif sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Logs/Orchestratia")
     else:
-        # Linux/macOS: use /var/log for root, ~/.local/state for user
+        # Linux: use /var/log for root, ~/.local/state for user
         if os.getuid() == 0:
             return "/var/log/orchestratia"
         return os.path.expanduser("~/.local/state/orchestratia/logs")

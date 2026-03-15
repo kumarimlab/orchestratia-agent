@@ -936,7 +936,8 @@ def cmd_agent_status(args):
 def cmd_agent_update(args):
     """Update the agent: pull latest code, reinstall package.
 
-    On Linux/macOS: git pull + pip reinstall from /opt/orchestratia-agent.
+    On Linux: git pull + pip reinstall from /opt/orchestratia-agent.
+    On macOS: pip install --upgrade (pip-based install, no git repo).
     On Windows (standalone exe): re-runs the PowerShell install script in upgrade mode.
     """
     import subprocess
@@ -945,10 +946,14 @@ def cmd_agent_update(args):
         _agent_update_windows()
         return
 
+    # Detect install method: git repo (Linux) or pip-only (macOS)
     install_dir = os.environ.get("ORCHESTRATIA_INSTALL_DIR", "/opt/orchestratia-agent")
+    has_git_repo = os.path.isdir(os.path.join(install_dir, ".git"))
 
-    if not os.path.isdir(os.path.join(install_dir, ".git")):
-        _error_exit(f"Not a git repo: {install_dir}")
+    if not has_git_repo:
+        # pip-only install (macOS, or Linux without git clone)
+        _agent_update_pip()
+        return
 
     if JSON_MODE:
         results = {"install_dir": install_dir, "steps": []}
@@ -1033,6 +1038,84 @@ def cmd_agent_update(args):
             print(f"  {DIM}Restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.orchestratia.agent{RESET}")
         else:
             print(f"  {DIM}Restart the daemon to apply: sudo systemctl restart orchestratia-agent{RESET}")
+
+
+def _agent_update_pip():
+    """Update via pip install --upgrade (macOS and pip-only Linux installs)."""
+    import subprocess
+
+    if JSON_MODE:
+        results = {"platform": sys.platform, "method": "pip", "steps": []}
+
+    if not JSON_MODE:
+        print(f"{BRAND}[ORCHESTRATIA]{RESET} Updating agent via pip...")
+
+    try:
+        # Get current version
+        old_ver = ""
+        try:
+            out = subprocess.run(
+                [sys.executable, "-m", "pip", "show", "orchestratia-agent"],
+                capture_output=True, text=True,
+            )
+            for line in out.stdout.splitlines():
+                if line.startswith("Version:"):
+                    old_ver = line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "orchestratia-agent"],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        if result.returncode == 0:
+            # Get new version
+            new_ver = ""
+            try:
+                out = subprocess.run(
+                    [sys.executable, "-m", "pip", "show", "orchestratia-agent"],
+                    capture_output=True, text=True,
+                )
+                for line in out.stdout.splitlines():
+                    if line.startswith("Version:"):
+                        new_ver = line.split(":", 1)[1].strip()
+            except Exception:
+                pass
+
+            if old_ver and new_ver and old_ver == new_ver:
+                step_msg = f"Already up to date ({new_ver})"
+            elif old_ver and new_ver:
+                step_msg = f"Updated {old_ver} -> {new_ver}"
+            else:
+                step_msg = "Package upgraded"
+
+            if JSON_MODE:
+                results["steps"].append({"pip": step_msg, "old": old_ver, "new": new_ver})
+            else:
+                print(f"  {GREEN}pip:{RESET} {step_msg}")
+        else:
+            msg = result.stderr.strip() if result.stderr else f"exit code {result.returncode}"
+            if JSON_MODE:
+                results["steps"].append({"pip": "failed", "error": msg})
+            else:
+                print(f"  {RED}pip:{RESET} {msg}")
+
+    except subprocess.TimeoutExpired:
+        msg = "pip install timed out after 120s"
+        if JSON_MODE:
+            results["steps"].append({"pip": "failed", "error": msg})
+        else:
+            print(f"  {RED}pip:{RESET} {msg}")
+
+    if JSON_MODE:
+        _json_output(results)
+    else:
+        print(f"\n{GREEN}[ORCHESTRATIA]{RESET} Update complete.")
+        if sys.platform == "darwin":
+            print(f"  {DIM}Restart the daemon: launchctl unload ~/Library/LaunchAgents/com.orchestratia.agent.plist && launchctl load ~/Library/LaunchAgents/com.orchestratia.agent.plist{RESET}")
+        else:
+            print(f"  {DIM}Restart the daemon: sudo systemctl restart orchestratia-agent{RESET}")
 
 
 def _agent_update_windows():

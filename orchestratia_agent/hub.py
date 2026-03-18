@@ -601,17 +601,82 @@ async def ws_receive_loop(ws, state: DaemonState):
                     asyncio.create_task(open_tunnel(tunnel_id, target_host, target_port, sender))
 
             elif msg_type == "tunnel_data":
-                from orchestratia_agent.tunnel import write_tunnel_data
                 tunnel_id = msg.get("tunnel_id")
                 b64_data = msg.get("data", "")
                 if tunnel_id and b64_data:
-                    write_tunnel_data(tunnel_id, b64_data)
+                    from orchestratia_agent import s2s_tunnel
+                    if tunnel_id in s2s_tunnel._writers:
+                        # S2S: data from hub → local TCP socket (source role)
+                        s2s_tunnel.write_data(tunnel_id, b64_data)
+                    else:
+                        # Regular tunnel (target role)
+                        from orchestratia_agent.tunnel import write_tunnel_data
+                        write_tunnel_data(tunnel_id, b64_data)
 
             elif msg_type == "tunnel_close":
-                from orchestratia_agent.tunnel import close_tunnel
                 tunnel_id = msg.get("tunnel_id")
                 if tunnel_id:
-                    close_tunnel(tunnel_id)
+                    from orchestratia_agent import s2s_tunnel
+                    if tunnel_id in s2s_tunnel._writers:
+                        s2s_tunnel.close_tunnel(tunnel_id)
+                    else:
+                        from orchestratia_agent.tunnel import close_tunnel
+                        close_tunnel(tunnel_id)
+
+            elif msg_type == "tunnel_closed":
+                # Hub relays close from peer
+                tunnel_id = msg.get("tunnel_id")
+                if tunnel_id:
+                    from orchestratia_agent import s2s_tunnel
+                    if tunnel_id in s2s_tunnel._writers:
+                        s2s_tunnel.close_tunnel(tunnel_id)
+                    else:
+                        from orchestratia_agent.tunnel import close_tunnel
+                        close_tunnel(tunnel_id)
+
+            # ── SSH Access Grant Messages ──
+            elif msg_type == "setup_ssh_access":
+                # Target role: add public key to orchestratia user
+                from orchestratia_agent.ssh_setup import setup_authorized_key, setup_sudoers
+                grant_id = msg.get("grant_id", "")
+                pub_key = msg.get("ssh_public_key", "")
+                priv_level = msg.get("privilege_level", "standard")
+                if grant_id and pub_key:
+                    setup_authorized_key(pub_key, grant_id)
+                    if priv_level == "elevated":
+                        setup_sudoers(priv_level)
+
+            elif msg_type == "revoke_ssh_access":
+                # Target role: remove public key
+                from orchestratia_agent.ssh_setup import remove_authorized_key, remove_sudoers
+                grant_id = msg.get("grant_id", "")
+                if grant_id:
+                    remove_authorized_key(grant_id)
+                    # Check if any elevated grants remain before removing sudoers
+                    remove_sudoers()
+
+            elif msg_type == "grant_ssh_access":
+                # Source role: store private key + start TCP listener
+                from orchestratia_agent.ssh_setup import store_private_key
+                from orchestratia_agent import s2s_tunnel
+                grant_id = msg.get("grant_id", "")
+                priv_key = msg.get("ssh_private_key", "")
+                bind_port = msg.get("local_bind_port", 0)
+                target_port = msg.get("target_port", 22)
+                if grant_id and priv_key and bind_port:
+                    store_private_key(grant_id, priv_key)
+                    asyncio.create_task(
+                        s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
+                    )
+
+            elif msg_type == "revoke_grant_access":
+                # Source role: remove private key + stop listener
+                from orchestratia_agent.ssh_setup import remove_private_key
+                from orchestratia_agent import s2s_tunnel
+                grant_id = msg.get("grant_id", "")
+                if grant_id:
+                    remove_private_key(grant_id)
+                    asyncio.create_task(s2s_tunnel.teardown_grant(grant_id))
 
             elif msg_type == "remote_exec":
                 request_id = msg.get("request_id")
@@ -824,6 +889,68 @@ async def report_alive_sessions(state: DaemonState):
             await session.start_reader()
         session.send_sigwinch()
 
+    # Restore SSH access grants after reconnect
+    await _restore_grants(state, sender)
+
+
+async def _restore_grants(state: DaemonState, sender):
+    """Poll hub for active grants and restore SSH keys + listeners."""
+    try:
+        import httpx
+
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        async with httpx.AsyncClient(verify=ssl_ctx) as client:
+            resp = await client.get(
+                f"{state.hub_url}/api/v1/server/access-grants",
+                headers={"X-API-Key": state.api_key},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                log.warning(f"Failed to fetch grants: HTTP {resp.status_code}")
+                return
+
+            grants = resp.json()
+            if not grants:
+                return
+
+            from orchestratia_agent.ssh_setup import (
+                setup_authorized_key, setup_sudoers,
+                store_private_key,
+            )
+            from orchestratia_agent import s2s_tunnel
+
+            source_count = target_count = 0
+            for g in grants:
+                grant_id = g["grant_id"]
+                role = g["role"]
+
+                if role == "source":
+                    priv_key = g.get("ssh_private_key", "")
+                    bind_port = g.get("local_bind_port", 0)
+                    target_port = g.get("target_port", 22)
+                    if priv_key and bind_port:
+                        store_private_key(grant_id, priv_key)
+                        await s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
+                        source_count += 1
+
+                elif role == "target":
+                    pub_key = g.get("ssh_public_key", "")
+                    priv_level = g.get("privilege_level", "standard")
+                    if pub_key:
+                        setup_authorized_key(pub_key, grant_id)
+                        if priv_level == "elevated":
+                            setup_sudoers(priv_level)
+                        target_count += 1
+
+            if source_count or target_count:
+                log.info(f"Restored {source_count} source + {target_count} target SSH grants")
+
+    except Exception as e:
+        log.warning(f"Failed to restore grants: {e}")
+
 
 async def ws_connection_loop(state: DaemonState):
     """Maintain the WebSocket connection with automatic reconnection."""
@@ -891,9 +1018,11 @@ async def cleanup_sessions(state: DaemonState):
     Only non-persistent (plain PTY / direct ConPTY) sessions are
     terminated, since they cannot outlive the daemon anyway.
     """
-    # Close all active tunnels
+    # Close all active tunnels (regular + S2S)
     from orchestratia_agent.tunnel import close_all_tunnels
     close_all_tunnels()
+    from orchestratia_agent import s2s_tunnel
+    await s2s_tunnel.close_all()
 
     backend = state.backend
     persistent = backend.supports_persistence()

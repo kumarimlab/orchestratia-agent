@@ -44,7 +44,7 @@ LOG_DIR="/var/log/orchestratia"
 RUN_DIR="/var/run/orchestratia"
 REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 SERVICE_NAME="orchestratia-agent"
-TOTAL_STEPS=8
+TOTAL_STEPS=9
 ERRORS=0
 
 # ── OS detection ──────────────────────────────────────────────────
@@ -150,6 +150,18 @@ if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
 fi
 
 TOKEN="$1"
+REMOTE_SSH_ACCESS="yes"  # Default: enable remote SSH access
+
+# Parse optional flags
+shift
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-remote-access)
+            REMOTE_SSH_ACCESS="no"
+            ;;
+    esac
+    shift
+done
 
 # Validate token format
 if [[ ! "$TOKEN" =~ ^orcreg_ ]]; then
@@ -740,8 +752,110 @@ elif [ "$OS_TYPE" = "darwin" ]; then
     fi
 fi
 
-# Step 8: Claude Code integration (skill + session hook)
-step 8 "Setting up Claude Code integration"
+# Step 8: Create orchestratia system user for remote SSH access
+step 8 "Setting up remote SSH access"
+
+if [ "$REMOTE_SSH_ACCESS" = "no" ]; then
+    info "Remote SSH access disabled (--no-remote-access flag)"
+else
+    # Interactive prompt (only if stdin is a terminal and not --no-remote-access)
+    SETUP_SSH="y"
+    if [ -t 0 ]; then
+        echo -ne "     ${ARROW} Allow remote SSH access via Orchestratia? (Y/n): "
+        read -r SETUP_SSH_ANSWER </dev/tty || SETUP_SSH_ANSWER=""
+        case "$SETUP_SSH_ANSWER" in
+            [nN]*) SETUP_SSH="n" ;;
+            *)     SETUP_SSH="y" ;;
+        esac
+    fi
+
+    if [ "$SETUP_SSH" = "y" ]; then
+        REMOTE_SSH_ACCESS="yes"
+
+        # Create orchestratia system user (idempotent)
+        if id "orchestratia" &>/dev/null; then
+            ok "System user 'orchestratia' already exists"
+        else
+            if [ "$OS_TYPE" = "darwin" ]; then
+                # macOS: use sysadminctl
+                if sudo sysadminctl -addUser orchestratia -shell /bin/bash -home /Users/orchestratia 2>/dev/null; then
+                    ok "Created system user 'orchestratia' (macOS)"
+                else
+                    warn "Could not create orchestratia user on macOS"
+                    REMOTE_SSH_ACCESS="no"
+                fi
+            else
+                # Linux
+                if sudo useradd --system --create-home --shell /bin/bash orchestratia 2>/dev/null; then
+                    ok "Created system user 'orchestratia'"
+                else
+                    warn "Could not create orchestratia user"
+                    REMOTE_SSH_ACCESS="no"
+                fi
+            fi
+        fi
+
+        if [ "$REMOTE_SSH_ACCESS" = "yes" ]; then
+            # Add to run group for repo access
+            if sudo usermod -aG "$RUN_GROUP" orchestratia 2>/dev/null; then
+                ok "Added orchestratia to group ${RUN_GROUP}"
+            else
+                warn "Could not add orchestratia to group ${RUN_GROUP}"
+            fi
+
+            # Setup SSH directory
+            ORCH_HOME=$(eval echo ~orchestratia 2>/dev/null || echo "/home/orchestratia")
+            ORCH_SSH_DIR="${ORCH_HOME}/.ssh"
+            sudo mkdir -p "$ORCH_SSH_DIR" 2>/dev/null
+            sudo chmod 700 "$ORCH_SSH_DIR" 2>/dev/null
+            sudo touch "${ORCH_SSH_DIR}/authorized_keys" 2>/dev/null
+            sudo chmod 600 "${ORCH_SSH_DIR}/authorized_keys" 2>/dev/null
+            sudo chown -R orchestratia:orchestratia "$ORCH_SSH_DIR" 2>/dev/null
+            ok "SSH directory configured: ${ORCH_SSH_DIR}"
+
+            # Grant agent user sudo for specific SSH management commands
+            AGENT_SUDOERS="/etc/sudoers.d/orchestratia-agent"
+            cat <<SUDOERS_EOF | sudo tee "$AGENT_SUDOERS" > /dev/null
+# Allow the Orchestratia agent (running as ${RUN_USER}) to manage SSH keys
+${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/tee /home/orchestratia/.ssh/authorized_keys
+${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/cat /home/orchestratia/.ssh/authorized_keys
+${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /home/orchestratia/.ssh
+${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/chmod * /home/orchestratia/.ssh*
+${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/chown * /home/orchestratia/.ssh*
+${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/sudoers.d/orchestratia
+${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/sudoers.d/orchestratia
+SUDOERS_EOF
+            sudo chmod 440 "$AGENT_SUDOERS" 2>/dev/null
+            ok "Agent sudoers configured: ${AGENT_SUDOERS}"
+
+            # Check if sshd is running
+            if command -v systemctl >/dev/null 2>&1; then
+                if systemctl is-active --quiet sshd 2>/dev/null || systemctl is-active --quiet ssh 2>/dev/null; then
+                    ok "SSH server is running"
+                else
+                    warn "SSH server (sshd) does not appear to be running"
+                    warn "Remote SSH access will not work until sshd is started"
+                fi
+            fi
+        fi
+    else
+        REMOTE_SSH_ACCESS="no"
+        info "Remote SSH access disabled by user"
+    fi
+fi
+
+# Save preference to config
+if [ -f "${CONFIG_DIR}/config.yaml" ]; then
+    if grep -q "remote_ssh_access:" "${CONFIG_DIR}/config.yaml" 2>/dev/null; then
+        sudo sed -i "s/^remote_ssh_access:.*/remote_ssh_access: ${REMOTE_SSH_ACCESS}/" "${CONFIG_DIR}/config.yaml"
+    else
+        echo "remote_ssh_access: ${REMOTE_SSH_ACCESS}" | sudo tee -a "${CONFIG_DIR}/config.yaml" > /dev/null
+    fi
+    ok "Config updated: remote_ssh_access=${REMOTE_SSH_ACCESS}"
+fi
+
+# Step 9: Claude Code integration (skill + session hook)
+step 9 "Setting up Claude Code integration"
 
 # 8a. Symlink skill file to ~/.claude/skills/orchestratia/
 # Symlink (not copy) so updates to /opt/orchestratia-agent/ are reflected immediately.

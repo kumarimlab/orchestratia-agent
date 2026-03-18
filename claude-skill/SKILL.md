@@ -356,7 +356,98 @@ Requirements:
 - Both servers must be owned by the **same user**
 - Receiver must have an active session
 
-## 15. Documentation
+## 15. SSH Access to Other Servers
+
+When an admin creates an SSH access grant for your server, you automatically get SSH access to another server in the same project. The agent daemon handles everything — key storage and a local TCP tunnel that relays through the Orchestratia hub.
+
+### How it works
+
+When a grant is active, the daemon:
+1. Stores the SSH private key at `~/.orchestratia/ssh_keys/grant_<grant-id>`
+2. Starts a local TCP listener on an assigned port (30000-30999)
+3. Traffic from that port tunnels through the hub to the target server's SSH daemon
+
+### Connecting via SSH
+
+```bash
+# Basic SSH connection to the remote server
+ssh -i ~/.orchestratia/ssh_keys/grant_<grant-id> -p <local-port> orchestratia@localhost
+```
+
+### Discovering active grants
+
+Check which grants are active on your server:
+
+```bash
+ls ~/.orchestratia/ssh_keys/
+# grant_a1b2c3d4-... grant_e5f6a7b8-...
+
+# Check which ports are listening
+ss -tlnp | grep '300[0-9][0-9]'
+```
+
+### Port forwarding to access remote services
+
+This is the key capability: once you have SSH access, you can forward **any port** on the remote server to your localhost. This lets you access web UIs, APIs, databases, or any TCP service running on the remote server's private network.
+
+```bash
+# Forward remote frontend (port 3000) to local port 3000
+ssh -i ~/.orchestratia/ssh_keys/grant_<id> -p <local-port> -L 3000:localhost:3000 -N orchestratia@localhost &
+
+# Forward remote backend API (port 8000)
+ssh -i ~/.orchestratia/ssh_keys/grant_<id> -p <local-port> -L 8000:localhost:8000 -N orchestratia@localhost &
+
+# Forward multiple ports at once
+ssh -i ~/.orchestratia/ssh_keys/grant_<id> -p <local-port> \
+  -L 3000:localhost:3000 \
+  -L 8000:localhost:8000 \
+  -L 5432:localhost:5432 \
+  -N orchestratia@localhost &
+
+# Now access remote services locally
+curl http://localhost:3000          # Remote frontend
+curl http://localhost:8000/api/v1   # Remote API
+psql -h localhost -p 5432           # Remote database
+```
+
+The `-N` flag means "no remote command" (just forward ports). The `&` runs it in the background.
+
+### Practical workflow: testing against a remote server
+
+```bash
+# 1. SSH in to discover what's running
+ssh -i ~/.orchestratia/ssh_keys/grant_<id> -p 30000 orchestratia@localhost
+ss -tlnp   # see listening ports
+exit
+
+# 2. Forward the ports you need
+ssh -i ~/.orchestratia/ssh_keys/grant_<id> -p 30000 \
+  -L 3000:localhost:3000 -L 8000:localhost:8000 -N orchestratia@localhost &
+
+# 3. Now work with the remote services as if they were local
+curl http://localhost:3000
+curl -X POST http://localhost:8000/api/v1/test
+
+# 4. When done, kill the SSH tunnel
+kill %1
+```
+
+### Elevated access
+
+If the grant has `privilege_level: elevated`, the `orchestratia` user on the remote server has sudo access:
+
+```bash
+ssh -i ~/.orchestratia/ssh_keys/grant_<id> -p 30000 orchestratia@localhost
+sudo systemctl restart nginx    # works with elevated grants
+```
+
+### Scope rules
+
+- Both servers must be in the **same project** — cross-project access is blocked
+- Grants can expire or be revoked by the admin at any time
+- When a grant is revoked, the key and tunnel are automatically cleaned up
+
+## 16. Documentation
 
 Full documentation available at:
 

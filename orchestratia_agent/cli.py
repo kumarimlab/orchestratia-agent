@@ -958,16 +958,29 @@ def cmd_agent_update(args):
     if JSON_MODE:
         results = {"install_dir": install_dir, "steps": []}
 
+    # Helper: run a command, use sudo if it fails with permission error
+    def _run_git(cmd_args):
+        try:
+            return subprocess.run(
+                cmd_args, cwd=install_dir, check=True,
+                capture_output=True, text=True,
+            )
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or "") + (e.stdout or "")
+            if "Permission denied" in err or "unable to create" in err:
+                return subprocess.run(
+                    ["sudo"] + cmd_args, cwd=install_dir, check=True,
+                    capture_output=True, text=True,
+                )
+            raise
+
     # Step 1: git fetch + reset
     if not JSON_MODE:
         print(f"{BRAND}[ORCHESTRATIA]{RESET} Updating agent from {install_dir}...")
 
     try:
-        subprocess.run(
-            ["git", "fetch", "origin"],
-            cwd=install_dir, check=True,
-            capture_output=True, text=True,
-        )
+        _run_git(["git", "fetch", "origin"])
+
         # Detect default branch (main or master)
         branch_result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -980,11 +993,7 @@ def cmd_agent_update(args):
             cwd=install_dir, capture_output=True, text=True,
         ).stdout.strip()
 
-        subprocess.run(
-            ["git", "reset", "--hard", f"origin/{branch}"],
-            cwd=install_dir, check=True,
-            capture_output=True, text=True,
-        )
+        _run_git(["git", "reset", "--hard", f"origin/{branch}"])
 
         new_commit = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -1012,21 +1021,37 @@ def cmd_agent_update(args):
         return
 
     # Step 2: reinstall package (no-deps, just update entry points + code)
+    # Try plain pip first, then with --break-system-packages (PEP 668 on Ubuntu 24.04+)
+    pip_cmd = [sys.executable, "-m", "pip", "install", "--no-deps", "--quiet", install_dir]
     try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-deps", "--quiet", install_dir],
-            check=True, capture_output=True, text=True,
-        )
+        subprocess.run(pip_cmd, check=True, capture_output=True, text=True)
         if JSON_MODE:
             results["steps"].append({"pip": "ok"})
         else:
             print(f"  {GREEN}pip:{RESET} Package reinstalled")
     except subprocess.CalledProcessError as e:
-        msg = e.stderr.strip() if e.stderr else str(e)
-        if JSON_MODE:
-            results["steps"].append({"pip": "failed", "error": msg})
+        err = e.stderr.strip() if e.stderr else ""
+        if "externally-managed-environment" in err:
+            # PEP 668: retry with --break-system-packages
+            try:
+                pip_cmd_bsp = [sys.executable, "-m", "pip", "install", "--no-deps",
+                               "--quiet", "--break-system-packages", install_dir]
+                subprocess.run(pip_cmd_bsp, check=True, capture_output=True, text=True)
+                if JSON_MODE:
+                    results["steps"].append({"pip": "ok"})
+                else:
+                    print(f"  {GREEN}pip:{RESET} Package reinstalled")
+            except subprocess.CalledProcessError as e2:
+                msg = e2.stderr.strip() if e2.stderr else str(e2)
+                if JSON_MODE:
+                    results["steps"].append({"pip": "failed", "error": msg})
+                else:
+                    print(f"  {YELLOW}pip:{RESET} {msg}")
         else:
-            print(f"  {YELLOW}pip:{RESET} {msg}")
+            if JSON_MODE:
+                results["steps"].append({"pip": "failed", "error": err or str(e)})
+            else:
+                print(f"  {YELLOW}pip:{RESET} {err or str(e)}")
 
     # Skill file updates automatically via symlink — no action needed
 
@@ -1064,11 +1089,15 @@ def _agent_update_pip():
         except Exception:
             pass
 
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
-             "git+https://github.com/kumarimlab/orchestratia-agent.git"],
-            capture_output=True, text=True, timeout=120,
-        )
+        pip_src = "git+https://github.com/kumarimlab/orchestratia-agent.git"
+        pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", pip_src]
+        result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=120)
+
+        # Retry with --break-system-packages if PEP 668 blocks it
+        if result.returncode != 0 and "externally-managed-environment" in (result.stderr or ""):
+            pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
+                       "--break-system-packages", pip_src]
+            result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=120)
 
         if result.returncode == 0:
             # Get new version

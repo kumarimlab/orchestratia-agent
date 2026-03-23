@@ -30,6 +30,9 @@ _active_tunnels: dict[str, tuple[asyncio.Task, asyncio.StreamWriter, str]] = {}
 # For hub.py to route incoming tunnel_data from hub
 _writers: dict[str, asyncio.StreamWriter] = {}
 
+# Tunnel ready events — source waits for target to confirm TCP connection
+_ready_events: dict[str, asyncio.Event] = {}
+
 # Module-level ws_send reference (set during setup)
 _ws_send: WsSender | None = None
 
@@ -80,6 +83,14 @@ async def teardown_grant(grant_id: str):
         close_tunnel(tid)
 
 
+def mark_ready(tunnel_id: str):
+    """Called by hub.py when target confirms tunnel is connected."""
+    ev = _ready_events.get(tunnel_id)
+    if ev:
+        ev.set()
+        log.info(f"S2S tunnel {tunnel_id[:8]}: target ready")
+
+
 async def _handle_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -93,14 +104,29 @@ async def _handle_connection(
 
     log.info(f"S2S tunnel {tunnel_id[:8]}: new TCP connection (grant {grant_id[:8]})")
 
-    # Tell hub to open tunnel to target
+    # Create ready event and tell hub to open tunnel to target
+    ready = asyncio.Event()
+    _ready_events[tunnel_id] = ready
+
     await ws_send({
         "type": "s2s_tunnel_open",
         "tunnel_id": tunnel_id,
         "grant_id": grant_id,
     })
 
-    # Start TCP→WS reader
+    # Wait for target to confirm TCP connection (up to 10s)
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=10.0)
+    except asyncio.TimeoutError:
+        log.warning(f"S2S tunnel {tunnel_id[:8]}: target not ready after 10s, aborting")
+        _ready_events.pop(tunnel_id, None)
+        _writers.pop(tunnel_id, None)
+        writer.close()
+        return
+    finally:
+        _ready_events.pop(tunnel_id, None)
+
+    # Start TCP→WS reader only after target is connected
     task = asyncio.create_task(_tcp_to_ws(tunnel_id, reader, ws_send))
     _active_tunnels[tunnel_id] = (task, writer, grant_id)
 

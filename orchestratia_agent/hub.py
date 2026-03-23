@@ -613,6 +613,13 @@ async def ws_receive_loop(ws, state: DaemonState):
                         from orchestratia_agent.tunnel import write_tunnel_data
                         await write_tunnel_data(tunnel_id, b64_data)
 
+            elif msg_type == "tunnel_ready":
+                # Target confirmed TCP connection — unblock source relay
+                tunnel_id = msg.get("tunnel_id")
+                if tunnel_id:
+                    from orchestratia_agent import s2s_tunnel
+                    s2s_tunnel.mark_ready(tunnel_id)
+
             elif msg_type == "tunnel_close":
                 tunnel_id = msg.get("tunnel_id")
                 if tunnel_id:

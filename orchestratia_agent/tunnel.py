@@ -55,6 +55,12 @@ async def open_tunnel(
     task = asyncio.create_task(_tcp_to_ws(tunnel_id, reader, ws_send))
     active_tunnels[tunnel_id] = (task, writer)
 
+    # Notify hub that target TCP connection is established
+    await ws_send({
+        "type": "tunnel_ready",
+        "tunnel_id": tunnel_id,
+    })
+
 
 async def _tcp_to_ws(
     tunnel_id: str,

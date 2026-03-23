@@ -29,6 +29,7 @@ Usage:
   orchestratia pipeline create --file pipeline.json [--json]
   orchestratia file send <path> --to <session-name> [--timeout 300]
   orchestratia file status <transfer-id>
+  orchestratia grants [--json]
   orchestratia init [--print]
 
 All commands support --json for machine-readable output.
@@ -930,6 +931,75 @@ def cmd_agent_status(args):
         print(f"  {DIM}No assigned tasks{RESET}")
 
 
+# ── Grants Command ───────────────────────────────────────────────
+
+
+def cmd_grants(args):
+    """List active SSH access grants for this server."""
+    if not HUB_URL or not API_KEY:
+        _error_exit("Not in an Orchestratia session (no hub_url / api_key)")
+        sys.exit(1)
+
+    url = f"{HUB_URL}/api/v1/server/access-grants"
+    headers = {"X-API-Key": API_KEY}
+
+    ctx = ssl.create_default_context()
+    if HUB_URL.startswith("https://staging.") or HUB_URL.startswith("https://localhost"):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        resp = urllib.request.urlopen(req, context=ctx, timeout=10)
+        grants = json.loads(resp.read())
+    except Exception as e:
+        _error_exit(f"Failed to fetch grants: {e}")
+        sys.exit(1)
+
+    if JSON_MODE:
+        # Redact private keys in JSON output
+        safe = []
+        for g in grants:
+            entry = dict(g)
+            if "ssh_private_key" in entry:
+                entry["ssh_private_key"] = "(redacted)"
+            safe.append(entry)
+        _json_output(safe)
+        return
+
+    if not grants:
+        print(f"{DIM}[ORCHESTRATIA] No active SSH access grants{RESET}")
+        return
+
+    source_grants = [g for g in grants if g.get("role") == "source"]
+    target_grants = [g for g in grants if g.get("role") == "target"]
+
+    print(f"{BRAND}[ORCHESTRATIA]{RESET} {BOLD}{len(grants)} active SSH grant(s){RESET}")
+
+    if source_grants:
+        print(f"\n  {BOLD}Source grants{RESET} (you can SSH to remote servers):")
+        for g in source_grants:
+            grant_id = g["grant_id"]
+            bind_port = g.get("local_bind_port", "?")
+            target_port = g.get("target_port", 22)
+            level = g.get("privilege_level", "standard")
+            key_path = os.path.expanduser(
+                f"~/.orchestratia/ssh_keys/grant_{grant_id}"
+            )
+            print(f"\n    {BRAND}Grant {grant_id[:8]}{RESET}  port={target_port}  level={level}")
+            print(f"    {GREEN}ssh -i {key_path} -p {bind_port} orchestratia@localhost{RESET}")
+
+    if target_grants:
+        print(f"\n  {BOLD}Target grants{RESET} (remote servers can SSH to you):")
+        for g in target_grants:
+            grant_id = g["grant_id"]
+            target_port = g.get("target_port", 22)
+            level = g.get("privilege_level", "standard")
+            print(f"    {BRAND}Grant {grant_id[:8]}{RESET}  port={target_port}  level={level}")
+
+    print()
+
+
 # ── Update Command ───────────────────────────────────────────────
 
 
@@ -1710,6 +1780,9 @@ def main():
     file_status_p = file_sub.add_parser("status", help="Check file transfer status")
     file_status_p.add_argument("transfer_id", help="Transfer ID")
 
+    # ── grants subcommand ──
+    subparsers.add_parser("grants", help="List active SSH access grants for this server")
+
     # ── status subcommand (top-level agent status) ──
     subparsers.add_parser("status", help="Show agent status: connection, session, tasks")
 
@@ -1826,6 +1899,9 @@ def main():
             "status": cmd_file_status,
         }
         file_actions[args.action](args)
+
+    elif args.command == "grants":
+        cmd_grants(args)
 
     elif args.command == "status":
         cmd_agent_status(args)

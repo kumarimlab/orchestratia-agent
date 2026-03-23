@@ -225,6 +225,24 @@ After authenticating on `/ws/server`, send `{"type": "subscribe_task", "task_id"
 
 ---
 
+## SSH Access Grants
+
+If an admin has granted SSH access from this server to another, the agent daemon automatically sets up a local TCP tunnel. Use the CLI to discover active grants:
+
+```bash
+orchestratia grants
+```
+
+This shows the SSH command to connect. For source grants (you can SSH out):
+
+```bash
+ssh -i ~/.orchestratia/ssh_keys/grant_<id> -p <bind_port> orchestratia@localhost
+```
+
+Use `orchestratia grants --json` for machine-readable output.
+
+---
+
 ## Upgrading the Agent
 
 To upgrade to the latest version, use the built-in CLI command:

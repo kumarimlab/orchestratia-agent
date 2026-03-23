@@ -1065,7 +1065,8 @@ def _agent_update_pip():
             pass
 
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "orchestratia-agent"],
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
+             "git+https://github.com/kumarimlab/orchestratia-agent.git"],
             capture_output=True, text=True, timeout=120,
         )
 

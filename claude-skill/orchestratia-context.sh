@@ -19,7 +19,7 @@ fi
 
 # Check if CLI is available
 if ! command -v orchestratia >/dev/null 2>&1; then
-    echo "Orchestratia: CLI not found on PATH. Install: pip install orchestratia-agent"
+    echo "Orchestratia: CLI not found on PATH. Install: pip install git+https://github.com/kumarimlab/orchestratia-agent.git"
     exit 0
 fi
 

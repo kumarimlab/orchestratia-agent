@@ -225,6 +225,26 @@ After authenticating on `/ws/server`, send `{"type": "subscribe_task", "task_id"
 
 ---
 
+## Upgrading the Agent
+
+To upgrade to the latest version, use the built-in CLI command:
+
+```bash
+orchestratia update
+```
+
+This will pull the latest code from GitHub and reinstall the package. On Linux (installed via `install.sh`), it does `git pull` + `pip reinstall` from `/opt/orchestratia-agent`. On macOS, it does `pip install --upgrade` from GitHub.
+
+**Do NOT run** `pip3 install --upgrade orchestratia-agent` — the package is not on PyPI.
+
+After updating, restart the daemon:
+
+```bash
+sudo systemctl restart orchestratia-agent
+```
+
+---
+
 ## Troubleshooting
 
 | Problem | Solution |

@@ -29,12 +29,6 @@ irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts
 Requires Python 3.10 or newer.
 
 ```bash
-pip install orchestratia-agent
-```
-
-Or install directly from GitHub:
-
-```bash
 pip install git+https://github.com/kumarimlab/orchestratia-agent.git
 ```
 

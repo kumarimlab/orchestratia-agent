@@ -145,7 +145,7 @@ async def _tcp_to_ws(
         _cleanup_tunnel(tunnel_id)
 
 
-def write_data(tunnel_id: str, b64_data: str):
+async def write_data(tunnel_id: str, b64_data: str):
     """WS→TCP: decode base64 and write to local TCP socket."""
     writer = _writers.get(tunnel_id)
     if not writer:
@@ -155,6 +155,7 @@ def write_data(tunnel_id: str, b64_data: str):
     try:
         raw = base64.b64decode(b64_data)
         writer.write(raw)
+        await writer.drain()
     except Exception as e:
         log.warning(f"S2S tunnel {tunnel_id[:8]}: write error: {e}")
 

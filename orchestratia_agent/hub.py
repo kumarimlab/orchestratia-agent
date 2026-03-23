@@ -607,11 +607,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                     from orchestratia_agent import s2s_tunnel
                     if tunnel_id in s2s_tunnel._writers:
                         # S2S: data from hub → local TCP socket (source role)
-                        s2s_tunnel.write_data(tunnel_id, b64_data)
+                        await s2s_tunnel.write_data(tunnel_id, b64_data)
                     else:
                         # Regular tunnel (target role)
                         from orchestratia_agent.tunnel import write_tunnel_data
-                        write_tunnel_data(tunnel_id, b64_data)
+                        await write_tunnel_data(tunnel_id, b64_data)
 
             elif msg_type == "tunnel_close":
                 tunnel_id = msg.get("tunnel_id")

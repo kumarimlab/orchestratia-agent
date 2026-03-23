@@ -97,8 +97,8 @@ async def _tcp_to_ws(
         _cleanup_tunnel(tunnel_id)
 
 
-def write_tunnel_data(tunnel_id: str, b64_data: str):
-    """Decode base64 and write to TCP socket (non-blocking buffered write)."""
+async def write_tunnel_data(tunnel_id: str, b64_data: str):
+    """Decode base64 and write to TCP socket, flushing to ensure delivery."""
     entry = active_tunnels.get(tunnel_id)
     if not entry:
         log.warning(f"Tunnel {tunnel_id[:8]}: write to unknown tunnel")
@@ -108,7 +108,7 @@ def write_tunnel_data(tunnel_id: str, b64_data: str):
     try:
         raw = base64.b64decode(b64_data)
         writer.write(raw)
-        # Don't await drain — let it buffer. asyncio will flush.
+        await writer.drain()
     except Exception as e:
         log.warning(f"Tunnel {tunnel_id[:8]}: write error: {e}")
 

@@ -958,6 +958,9 @@ def cmd_agent_update(args):
     if JSON_MODE:
         results = {"install_dir": install_dir, "steps": []}
 
+    # Git safe.directory flag to handle root-owned repos run by non-root user
+    _git_safe = ["git", "-c", f"safe.directory={install_dir}"]
+
     # Helper: run a command, use sudo if it fails with permission error
     def _run_git(cmd_args):
         try:
@@ -979,24 +982,24 @@ def cmd_agent_update(args):
         print(f"{BRAND}[ORCHESTRATIA]{RESET} Updating agent from {install_dir}...")
 
     try:
-        _run_git(["git", "fetch", "origin"])
+        _run_git(_git_safe + ["fetch", "origin"])
 
         # Detect default branch (main or master)
         branch_result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            _git_safe + ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=install_dir, capture_output=True, text=True,
         )
         branch = branch_result.stdout.strip() or "main"
 
         old_commit = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            _git_safe + ["rev-parse", "--short", "HEAD"],
             cwd=install_dir, capture_output=True, text=True,
         ).stdout.strip()
 
-        _run_git(["git", "reset", "--hard", f"origin/{branch}"])
+        _run_git(_git_safe + ["reset", "--hard", f"origin/{branch}"])
 
         new_commit = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            _git_safe + ["rev-parse", "--short", "HEAD"],
             cwd=install_dir, capture_output=True, text=True,
         ).stdout.strip()
 

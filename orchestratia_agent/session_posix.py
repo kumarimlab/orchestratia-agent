@@ -314,6 +314,18 @@ class PosixSessionBackend:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
+    def exit_copy_mode(self, handle: SessionHandle) -> None:
+        """Exit tmux copy-mode if active (no-op if not in copy-mode)."""
+        if not handle.tmux_name:
+            return
+        try:
+            subprocess.run(
+                ["tmux", "send-keys", "-X", "cancel", "-t", handle.tmux_name],
+                capture_output=True, timeout=2,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
     def send_sigwinch(self, handle: SessionHandle) -> None:
         try:
             os.killpg(os.getpgid(handle.pid), signal.SIGWINCH)

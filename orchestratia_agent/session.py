@@ -296,6 +296,11 @@ class ManagedSession:
         # Fallback for Windows/non-tmux: use pyte history
         return self._vscreen.scrollback()
 
+    def exit_copy_mode(self):
+        """Exit tmux copy-mode if active."""
+        if hasattr(self.backend, 'exit_copy_mode'):
+            self.backend.exit_copy_mode(self.handle)
+
     def send_sigwinch(self):
         self.backend.send_sigwinch(self.handle)
 

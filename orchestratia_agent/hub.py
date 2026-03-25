@@ -411,6 +411,12 @@ async def ws_receive_loop(ws, state: DaemonState):
                         session.send_sigwinch()
                         log.info(f"Started reader for recovered session {real_id[:8]}")
 
+            elif msg_type == "session_exit_copy_mode":
+                session_id = msg.get("session_id")
+                session = state.active_sessions.get(session_id)
+                if session and not session.closed:
+                    session.exit_copy_mode()
+
             elif msg_type == "capture_scrollback":
                 session_id = msg.get("session_id")
                 session = state.active_sessions.get(session_id)

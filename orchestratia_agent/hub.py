@@ -655,7 +655,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                 pub_key = msg.get("ssh_public_key", "")
                 priv_level = msg.get("privilege_level", "standard")
                 if grant_id and pub_key:
-                    setup_authorized_key(pub_key, grant_id)
+                    setup_authorized_key(pub_key, grant_id, priv_level)
                     if priv_level == "elevated":
                         setup_sudoers(priv_level)
 
@@ -953,7 +953,7 @@ async def _restore_grants(state: DaemonState, sender):
                     pub_key = g.get("ssh_public_key", "")
                     priv_level = g.get("privilege_level", "standard")
                     if pub_key:
-                        setup_authorized_key(pub_key, grant_id)
+                        setup_authorized_key(pub_key, grant_id, priv_level)
                         if priv_level == "elevated":
                             setup_sudoers(priv_level)
                         target_count += 1

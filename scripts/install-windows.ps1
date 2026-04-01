@@ -74,7 +74,7 @@ $ReleaseUrl = if ($env:ORCHESTRATIA_EXE_URL) {
     "https://github.com/kumarimlab/orchestratia-agent/releases/latest/download/orchestratia-agent.exe"
 }
 $Errors = 0
-$TotalSteps = 5
+$TotalSteps = 6
 
 # ── Helper functions ─────────────────────────────────────────────────
 
@@ -530,6 +530,102 @@ if (-not $ServiceInstalled) {
     Write-Info "& `"$AgentExePath`""
 }
 
+# Step 6: Claude Code integration (skill + session hook)
+Write-Step 6 $TotalSteps "Setting up Claude Code integration"
+
+# Claude Code discovers skills from ~/.claude/skills/<name>/SKILL.md
+# and SessionStart hooks from ~/.claude/settings.json.
+# Since the Windows installer uses a standalone .exe (no git clone),
+# we download the skill and hook files from the public GitHub repo.
+
+$ClaudeDir = "$env:USERPROFILE\.claude"
+$SkillDir = "$ClaudeDir\skills\orchestratia"
+$HookDir = "$ConfigDir\claude-skill"
+$SkillUrl = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/claude-skill/SKILL.md"
+$HookUrl = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/claude-skill/orchestratia-context.ps1"
+
+# 6a. Download and install skill file
+New-Item -ItemType Directory -Force -Path $SkillDir | Out-Null
+
+try {
+    Invoke-WebRequest -Uri $SkillUrl -OutFile "$SkillDir\SKILL.md" -UseBasicParsing -TimeoutSec 15
+    Write-Ok "Skill installed: $SkillDir\SKILL.md"
+} catch {
+    Write-Warn "Could not download SKILL.md: $_"
+    Write-Info "Manual: save $SkillUrl to $SkillDir\SKILL.md"
+}
+
+# 6b. Download session hook script
+New-Item -ItemType Directory -Force -Path $HookDir | Out-Null
+
+try {
+    Invoke-WebRequest -Uri $HookUrl -OutFile "$HookDir\orchestratia-context.ps1" -UseBasicParsing -TimeoutSec 15
+    Write-Ok "Hook script: $HookDir\orchestratia-context.ps1"
+} catch {
+    Write-Warn "Could not download orchestratia-context.ps1: $_"
+    Write-Info "Manual: save $HookUrl to $HookDir\orchestratia-context.ps1"
+}
+
+# 6c. Merge SessionStart hook into ~/.claude/settings.json
+$ClaudeSettings = "$ClaudeDir\settings.json"
+New-Item -ItemType Directory -Force -Path $ClaudeDir | Out-Null
+
+$HookCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HookDir\orchestratia-context.ps1`""
+
+try {
+    # Load existing settings or start fresh
+    $settings = @{}
+    if (Test-Path $ClaudeSettings) {
+        try {
+            $raw = Get-Content $ClaudeSettings -Raw -ErrorAction Stop
+            if ($raw) {
+                $settings = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            }
+        } catch {
+            # Corrupted JSON — start fresh but warn
+            Write-Warn "Could not parse existing settings.json — creating new one"
+        }
+    }
+
+    # Ensure hooks.SessionStart structure exists
+    if (-not $settings.ContainsKey("hooks")) { $settings["hooks"] = @{} }
+    if (-not $settings["hooks"].ContainsKey("SessionStart")) { $settings["hooks"]["SessionStart"] = @() }
+
+    # Check if orchestratia hook already exists
+    $alreadyExists = $false
+    foreach ($entry in $settings["hooks"]["SessionStart"]) {
+        if ($entry -and $entry.ContainsKey("hooks")) {
+            foreach ($h in $entry["hooks"]) {
+                if ($h -and $h.ContainsKey("command") -and $h["command"] -match "orchestratia") {
+                    $alreadyExists = $true
+                    break
+                }
+            }
+        }
+        if ($alreadyExists) { break }
+    }
+
+    if (-not $alreadyExists) {
+        $newHook = @{
+            "hooks" = @(
+                @{
+                    "type" = "command"
+                    "command" = $HookCommand
+                    "timeout" = 10000
+                }
+            )
+        }
+        $settings["hooks"]["SessionStart"] += $newHook
+    }
+
+    # Write settings back
+    $settings | ConvertTo-Json -Depth 10 | Set-Content $ClaudeSettings -Encoding UTF8
+    Write-Ok "SessionStart hook registered in $ClaudeSettings"
+} catch {
+    Write-Warn "Could not update settings.json: $_"
+    Write-Info "Manual: add SessionStart hook for $HookCommand"
+}
+
 # ── Summary ──────────────────────────────────────────────────────────
 
 Write-Host ""
@@ -548,6 +644,7 @@ Write-Host ""
 Write-Host "  Useful commands:" -ForegroundColor DarkGray
 Write-Host "    CLI:      orchestratia status"
 Write-Host "    Tasks:    orchestratia task check"
+Write-Host "    Skill:    /orchestratia (inside Claude Code)"
 Write-Host "    Version:  orchestratia-agent --version"
 Write-Host "    Test PTY: orchestratia-agent --test-pty"
 Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"

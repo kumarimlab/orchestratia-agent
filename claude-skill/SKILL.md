@@ -371,19 +371,19 @@ When a grant is active, the daemon:
 
 ```bash
 # Basic SSH connection to the remote server
-ssh -i ~/.orchestratia/ssh_keys/grant_<grant-id> -p <local-port> orchestratia@localhost
+# The username depends on the target OS: "orchestratia" on Linux/macOS, or the actual
+# Windows username (e.g., "abhis") on Windows. Run "orchestratia grants" to see the
+# exact command with the correct username.
+ssh -i ~/.orchestratia/ssh_keys/grant_<grant-id> -p <local-port> <ssh-user>@localhost
 ```
 
 ### Discovering active grants
 
-Check which grants are active on your server:
+Run `orchestratia grants` to see all active grants with ready-to-use SSH commands:
 
 ```bash
-ls ~/.orchestratia/ssh_keys/
-# grant_a1b2c3d4-... grant_e5f6a7b8-...
-
-# Check which ports are listening
-ss -tlnp | grep '300[0-9][0-9]'
+orchestratia grants
+# Shows grant IDs, ports, and the full SSH command with correct username
 ```
 
 ### Port forwarding to access remote services

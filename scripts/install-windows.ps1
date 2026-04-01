@@ -572,58 +572,95 @@ New-Item -ItemType Directory -Force -Path $ClaudeDir | Out-Null
 
 $HookCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HookDir\orchestratia-context.ps1`""
 
-try {
-    # Load existing settings or start fresh
-    $settings = @{}
-    if (Test-Path $ClaudeSettings) {
-        try {
-            $raw = Get-Content $ClaudeSettings -Raw -ErrorAction Stop
-            if ($raw) {
-                $settings = $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+# Use Python for reliable JSON merge (same approach as Linux installer).
+# PowerShell 5.x lacks ConvertFrom-Json -AsHashtable and writes BOM with UTF8.
+$PythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $PythonExe) { $PythonExe = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
+
+if ($PythonExe) {
+    $pyScript = @"
+import json, os, sys
+
+settings_path = sys.argv[1]
+hook_command = sys.argv[2]
+
+settings = {}
+if os.path.exists(settings_path):
+    try:
+        with open(settings_path, 'r', encoding='utf-8-sig') as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        print('WARN: Could not parse existing settings.json', file=sys.stderr)
+
+hooks = settings.setdefault('hooks', {})
+session_start = hooks.setdefault('SessionStart', [])
+
+already_exists = any(
+    any('orchestratia' in h.get('command', '') for h in entry.get('hooks', []))
+    for entry in session_start
+    if isinstance(entry, dict)
+)
+
+if not already_exists:
+    session_start.append({
+        'hooks': [{'type': 'command', 'command': hook_command, 'timeout': 10000}]
+    })
+
+with open(settings_path, 'w', encoding='utf-8', newline='\n') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+"@
+    $pyTmp = "$env:TEMP\orc_settings_merge.py"
+    Set-Content -Path $pyTmp -Value $pyScript -Encoding ASCII
+    try {
+        & $PythonExe $pyTmp $ClaudeSettings $HookCommand 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "SessionStart hook registered in $ClaudeSettings"
+        } else {
+            Write-Warn "Python JSON merge returned non-zero exit"
+        }
+    } catch {
+        Write-Warn "Could not update settings.json via Python: $_"
+    }
+    Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
+} else {
+    # Fallback: pure PowerShell (PS 5.x compatible, no -AsHashtable)
+    try {
+        $needsWrite = $true
+        if (Test-Path $ClaudeSettings) {
+            $raw = Get-Content $ClaudeSettings -Raw -ErrorAction SilentlyContinue
+            if ($raw -and $raw -match "orchestratia") {
+                Write-Ok "Orchestratia hook already in $ClaudeSettings"
+                $needsWrite = $false
             }
-        } catch {
-            # Corrupted JSON — start fresh but warn
-            Write-Warn "Could not parse existing settings.json — creating new one"
         }
-    }
-
-    # Ensure hooks.SessionStart structure exists
-    if (-not $settings.ContainsKey("hooks")) { $settings["hooks"] = @{} }
-    if (-not $settings["hooks"].ContainsKey("SessionStart")) { $settings["hooks"]["SessionStart"] = @() }
-
-    # Check if orchestratia hook already exists
-    $alreadyExists = $false
-    foreach ($entry in $settings["hooks"]["SessionStart"]) {
-        if ($entry -and $entry.ContainsKey("hooks")) {
-            foreach ($h in $entry["hooks"]) {
-                if ($h -and $h.ContainsKey("command") -and $h["command"] -match "orchestratia") {
-                    $alreadyExists = $true
-                    break
-                }
-            }
+        if ($needsWrite) {
+            # Minimal valid settings with just the hook
+            $json = @"
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$($HookCommand -replace '\\', '\\\\' -replace '"', '\"')",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}
+"@
+            Set-Content -Path $ClaudeSettings -Value $json -Encoding ASCII
+            Write-Ok "SessionStart hook registered in $ClaudeSettings"
+            Write-Warn "No Python found — wrote minimal settings.json (existing settings may be lost)"
         }
-        if ($alreadyExists) { break }
+    } catch {
+        Write-Warn "Could not update settings.json: $_"
+        Write-Info "Manual: add SessionStart hook for $HookCommand"
     }
-
-    if (-not $alreadyExists) {
-        $newHook = @{
-            "hooks" = @(
-                @{
-                    "type" = "command"
-                    "command" = $HookCommand
-                    "timeout" = 10000
-                }
-            )
-        }
-        $settings["hooks"]["SessionStart"] += $newHook
-    }
-
-    # Write settings back
-    $settings | ConvertTo-Json -Depth 10 | Set-Content $ClaudeSettings -Encoding UTF8
-    Write-Ok "SessionStart hook registered in $ClaudeSettings"
-} catch {
-    Write-Warn "Could not update settings.json: $_"
-    Write-Info "Manual: add SessionStart hook for $HookCommand"
 }
 
 # ── Summary ──────────────────────────────────────────────────────────

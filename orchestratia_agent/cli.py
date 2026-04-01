@@ -987,7 +987,8 @@ def cmd_grants(args):
                 f"~/.orchestratia/ssh_keys/grant_{grant_id}"
             )
             print(f"\n    {BRAND}Grant {grant_id[:8]}{RESET}  port={target_port}  level={level}")
-            print(f"    {GREEN}ssh -i {key_path} -p {bind_port} orchestratia@localhost{RESET}")
+            username = g.get("ssh_username", "orchestratia")
+            print(f"    {GREEN}ssh -i {key_path} -p {bind_port} {username}@localhost{RESET}")
 
     if target_grants:
         print(f"\n  {BOLD}Target grants{RESET} (remote servers can SSH to you):")

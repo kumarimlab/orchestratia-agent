@@ -100,24 +100,102 @@ def _win_ensure_sshd() -> bool:
             log.error(f"Failed to start sshd: {e}")
             return False
 
-    # Not installed — try to install the OpenSSH Server optional feature
-    log.info("OpenSSH Server not found, attempting to install...")
+    # Not installed — try Add-WindowsCapability first (requires Windows Update)
+    log.info("OpenSSH Server not found, attempting to install via Windows capability...")
     try:
         result = _win_run([
             "powershell", "-NoProfile", "-Command",
             "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0"
         ], timeout=120)
-        if result.returncode != 0:
-            log.error(f"Failed to install OpenSSH Server: {result.stderr}")
+        if result.returncode == 0:
+            _win_run(["powershell", "-NoProfile", "-Command",
+                      "Start-Service sshd; Set-Service sshd -StartupType Automatic"])
+            log.info("Installed and started OpenSSH Server via Windows capability")
+            return True
+        log.warning(f"Add-WindowsCapability failed: {result.stderr.strip()}")
+    except Exception as e:
+        log.warning(f"Add-WindowsCapability failed: {e}")
+
+    # Fallback: download Win32-OpenSSH from GitHub
+    return _win_install_sshd_from_github()
+
+
+def _win_install_sshd_from_github() -> bool:
+    """Download and install Win32-OpenSSH from GitHub releases (fallback)."""
+    import shutil
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    OPENSSH_URL = (
+        "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/"
+        "download/OpenSSH-Win64.zip"
+    )
+    INSTALL_DIR = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "OpenSSH"
+
+    log.info("Attempting Win32-OpenSSH install from GitHub...")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = Path(tmpdir) / "OpenSSH-Win64.zip"
+            log.info(f"Downloading {OPENSSH_URL}...")
+            urllib.request.urlretrieve(OPENSSH_URL, str(zip_path))
+
+            with zipfile.ZipFile(str(zip_path), "r") as zf:
+                zf.extractall(tmpdir)
+
+            # ZIP contains an "OpenSSH-Win64" subfolder
+            extracted = Path(tmpdir) / "OpenSSH-Win64"
+            if not extracted.exists():
+                log.error("Unexpected ZIP structure: OpenSSH-Win64 folder not found")
+                return False
+
+            if INSTALL_DIR.exists():
+                shutil.rmtree(str(INSTALL_DIR))
+            shutil.copytree(str(extracted), str(INSTALL_DIR))
+
+        # Run the bundled install-sshd.ps1
+        install_script = INSTALL_DIR / "install-sshd.ps1"
+        if not install_script.exists():
+            log.error(f"install-sshd.ps1 not found at {install_script}")
             return False
+
+        result = _win_run([
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(install_script),
+        ], timeout=60)
+        if result.returncode != 0:
+            log.error(f"install-sshd.ps1 failed: {result.stderr}")
+            return False
+
+        # Add to system PATH
+        _win_run([
+            "powershell", "-NoProfile", "-Command",
+            f"$p = [Environment]::GetEnvironmentVariable('PATH','Machine'); "
+            f"if ($p -notlike '*OpenSSH*') {{ "
+            f"[Environment]::SetEnvironmentVariable('PATH', $p + ';{INSTALL_DIR}', 'Machine') }}"
+        ])
+
+        # Firewall rule for SSH
+        _win_run([
+            "powershell", "-NoProfile", "-Command",
+            "New-NetFirewallRule -Name 'OpenSSH-Server' -DisplayName 'OpenSSH Server (sshd)' "
+            "-Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 "
+            "-ErrorAction SilentlyContinue"
+        ])
 
         # Start and enable
         _win_run(["powershell", "-NoProfile", "-Command",
                   "Start-Service sshd; Set-Service sshd -StartupType Automatic"])
-        log.info("Installed and started OpenSSH Server")
-        return True
+
+        if _win_get_sshd_status() == "Running":
+            log.info("Installed and started OpenSSH Server from GitHub release")
+            return True
+
+        log.error("sshd not running after GitHub install")
+        return False
+
     except Exception as e:
-        log.error(f"Failed to install OpenSSH Server: {e}")
+        log.error(f"Failed to install OpenSSH from GitHub: {e}")
         return False
 
 

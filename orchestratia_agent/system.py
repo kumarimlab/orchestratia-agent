@@ -1,5 +1,7 @@
 """Cross-platform system information gathering."""
 
+import getpass
+import os
 import platform
 import sys
 
@@ -14,6 +16,15 @@ def get_system_info() -> dict:
     disk_path = "C:\\" if sys.platform == "win32" else "/"
     disk = psutil.disk_usage(disk_path)
 
+    # OS-level username (used by hub to auto-resolve SSH usernames)
+    if sys.platform == "win32":
+        os_username = os.environ.get("USERNAME", "")
+    else:
+        try:
+            os_username = getpass.getuser()
+        except Exception:
+            os_username = ""
+
     return {
         "cpu_count": psutil.cpu_count(),
         "cpu_percent": psutil.cpu_percent(interval=0.5),
@@ -27,6 +38,7 @@ def get_system_info() -> dict:
         "platform_release": platform.release(),
         "python_version": platform.python_version(),
         "uptime_seconds": int(psutil.boot_time()),
+        "os_username": os_username,
     }
 
 

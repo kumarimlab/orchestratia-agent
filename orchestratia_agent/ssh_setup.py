@@ -165,13 +165,38 @@ def _win_set_auth_keys_acl(path: Path, admin_keys: bool = False) -> bool:
         return False
 
 
+def _win_user_is_in_administrators() -> bool:
+    """Check if the current user is a member of the Administrators group.
+
+    This is different from _win_is_admin() which checks if the process has
+    elevated privileges. A user can be in Administrators but running a
+    non-elevated process.
+    """
+    try:
+        username = os.environ.get("USERNAME", "")
+        if not username:
+            return False
+        result = _win_run([
+            "powershell", "-NoProfile", "-Command",
+            "(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue).Name"
+        ])
+        return any(username.lower() in line.lower() for line in result.stdout.splitlines())
+    except Exception:
+        return False
+
+
 def _win_get_auth_keys_path(privilege_level: str = "standard") -> Path:
     """Determine the correct authorized_keys path for Windows.
 
-    Admin users with elevated grants use the administrators_authorized_keys.
-    Standard grants use the per-user authorized_keys.
+    Windows OpenSSH has a special rule: if the user is in the Administrators
+    group, sshd IGNORES ~/.ssh/authorized_keys and ONLY checks
+    %ProgramData%/ssh/administrators_authorized_keys. This is enforced by
+    the default 'Match Group administrators' block in sshd_config.
+
+    So we must write to administrators_authorized_keys for ANY admin user,
+    regardless of grant privilege level.
     """
-    if privilege_level == "elevated" and _win_is_admin():
+    if _win_is_admin() or _win_user_is_in_administrators():
         return _ADMIN_AUTH_KEYS
     return _USER_AUTH_KEYS
 
@@ -211,8 +236,8 @@ def _win_setup_authorized_key(tagged_key: str, grant_id: str,
             log.error("Cannot setup SSH access: OpenSSH Server not available")
             return False
 
-        is_admin_keys = privilege_level == "elevated" and _win_is_admin()
         auth_keys_path = _win_get_auth_keys_path(privilege_level)
+        is_admin_keys = (auth_keys_path == _ADMIN_AUTH_KEYS)
 
         # Ensure parent directory exists
         auth_keys_path.parent.mkdir(parents=True, exist_ok=True)

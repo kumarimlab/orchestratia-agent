@@ -30,8 +30,19 @@ jobs:
           dist\orchestratia-agent.exe --version
           dist\orchestratia-agent.exe --help
 
+      - name: Package hook scripts alongside exe
+        run: |
+          Copy-Item claude-skill\orchestratia-pretooluse.ps1 dist\
+          Copy-Item claude-skill\orchestratia-context.ps1 dist\
+          Copy-Item claude-skill\SKILL.md dist\
+        shell: pwsh
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/orchestratia-agent.exe
+          files: |
+            dist/orchestratia-agent.exe
+            dist/orchestratia-pretooluse.ps1
+            dist/orchestratia-context.ps1
+            dist/SKILL.md
           fail_on_unmatched_files: true

@@ -933,6 +933,55 @@ else
     info "Manual setup: add SessionStart hook pointing to ${HOOK_SCRIPT}"
 fi
 
+# 8d. Merge PreToolUse hook into ~/.claude/settings.json
+PRETOOLUSE_SCRIPT="$INSTALL_DIR/claude-skill/orchestratia-pretooluse.sh"
+
+if sudo -u "$RUN_USER" python3 -c "
+import json, os, sys
+
+path = '$CLAUDE_SETTINGS'
+hook_cmd = '$PRETOOLUSE_SCRIPT'
+
+settings = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        settings = {}
+
+hooks = settings.setdefault('hooks', {})
+pre_tool_use = hooks.setdefault('PreToolUse', [])
+
+already_exists = False
+for entry in pre_tool_use:
+    if isinstance(entry, dict):
+        for h in entry.get('hooks', []):
+            if isinstance(h, dict) and 'orchestratia' in h.get('command', ''):
+                already_exists = True
+                break
+
+if not already_exists:
+    pre_tool_use.append({
+        'hooks': [{
+            'type': 'command',
+            'command': hook_cmd,
+            'timeout': 30000
+        }]
+    })
+
+with open(path, 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+
+print('ok')
+" 2>/dev/null; then
+    ok "PreToolUse hook registered in ${CLAUDE_SETTINGS}"
+else
+    warn "Could not update ${CLAUDE_SETTINGS}"
+    info "Manual setup: add PreToolUse hook pointing to ${PRETOOLUSE_SCRIPT}"
+fi
+
 # ── Summary ─────────────────────────────────────────────────────────
 
 echo ""

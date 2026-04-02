@@ -754,6 +754,10 @@ async def ws_receive_loop(ws, state: DaemonState):
                     })
                     _cleanup_incoming(transfer_id)
 
+            elif msg_type == "approval_rules_updated":
+                log.info("Approval rules updated by hub, refreshing cache")
+                asyncio.create_task(_refresh_rules_cache(state))
+
             elif msg_type == "pong":
                 pass
 
@@ -965,6 +969,100 @@ async def _restore_grants(state: DaemonState, sender):
         log.warning(f"Failed to restore grants: {e}")
 
 
+# ── Approval rules cache + permission log flush ──────────────────
+
+
+def _get_rules_cache_path(state: DaemonState) -> str:
+    """Return path to the local rules cache file."""
+    import hashlib
+    api_hash = hashlib.md5(state.api_key.encode()).hexdigest()[:12]
+    tmp_dir = os.environ.get("TMPDIR", os.environ.get("TEMP", os.environ.get("TMP", "/tmp")))
+    return os.path.join(tmp_dir, f"orchestratia-rules-{api_hash}.json")
+
+
+def _get_permlog_path(state: DaemonState) -> str:
+    """Return path to the local permission log file."""
+    import hashlib
+    api_hash = hashlib.md5(state.api_key.encode()).hexdigest()[:12]
+    tmp_dir = os.environ.get("TMPDIR", os.environ.get("TEMP", os.environ.get("TMP", "/tmp")))
+    return os.path.join(tmp_dir, f"orchestratia-permlog-{api_hash}.jsonl")
+
+
+async def _refresh_rules_cache(state: DaemonState):
+    """Fetch approval rules from hub and write to local cache file."""
+    try:
+        import httpx
+        hub_url = state.hub_url.replace("wss://", "https://").replace("ws://", "http://")
+        if hub_url.endswith("/ws/server"):
+            hub_url = hub_url[: -len("/ws/server")]
+        url = f"{hub_url}/api/v1/server/approval-rules"
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers={"X-API-Key": state.api_key})
+            if resp.status_code == 200:
+                rules = resp.json()
+                cache_path = _get_rules_cache_path(state)
+                with open(cache_path, "w") as f:
+                    json.dump(rules, f)
+                log.info(f"Refreshed approval rules cache: {len(rules)} rules → {cache_path}")
+            else:
+                log.warning(f"Failed to fetch approval rules: HTTP {resp.status_code}")
+    except Exception as e:
+        log.warning(f"Failed to refresh approval rules cache: {e}")
+
+
+async def permlog_flush_loop(state: DaemonState):
+    """Periodically flush permission log entries to the hub API."""
+    while state.running:
+        await asyncio.sleep(5)
+        log_path = _get_permlog_path(state)
+        try:
+            if not os.path.exists(log_path):
+                continue
+            with open(log_path, "r") as f:
+                lines = f.readlines()
+            if not lines:
+                continue
+
+            # Truncate the file immediately to avoid re-sending
+            with open(log_path, "w") as f:
+                pass
+
+            # Parse log entries
+            entries = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+            if not entries:
+                continue
+
+            # POST to hub
+            import httpx
+            hub_url = state.hub_url.replace("wss://", "https://").replace("ws://", "http://")
+            if hub_url.endswith("/ws/server"):
+                hub_url = hub_url[: -len("/ws/server")]
+            url = f"{hub_url}/api/v1/server/permissions/log"
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    url,
+                    headers={"X-API-Key": state.api_key, "Content-Type": "application/json"},
+                    json={"entries": entries},
+                )
+                if resp.status_code == 201:
+                    log.debug(f"Flushed {len(entries)} permission log entries to hub")
+                else:
+                    log.warning(f"Permission log flush failed: HTTP {resp.status_code}")
+        except Exception as e:
+            log.debug(f"Permission log flush error: {e}")
+
+
 async def ws_connection_loop(state: DaemonState):
     """Maintain the WebSocket connection with automatic reconnection."""
     backoff = 1
@@ -975,6 +1073,8 @@ async def ws_connection_loop(state: DaemonState):
             state.ws_connection = ws
             backoff = 1
             await report_alive_sessions(state)
+            # Fetch approval rules on connect (non-blocking)
+            asyncio.create_task(_refresh_rules_cache(state))
             await ws_receive_loop(ws, state)
             state.ws_connection = None
             log.info("WebSocket disconnected, will reconnect...")

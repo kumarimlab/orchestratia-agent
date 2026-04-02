@@ -23,6 +23,7 @@ from orchestratia_agent.hub import (
     _inject_text,
     cleanup_sessions,
     heartbeat_loop,
+    permlog_flush_loop,
     register_with_hub,
     ws_connection_loop,
 )
@@ -164,6 +165,7 @@ async def main():
                 heartbeat_loop(client, state),
                 ws_connection_loop(state),
                 idle_note_flush_loop(state),
+                permlog_flush_loop(state),
             )
         finally:
             await cleanup_sessions(state)

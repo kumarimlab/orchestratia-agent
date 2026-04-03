@@ -50,10 +50,14 @@ def _win_is_admin() -> bool:
         return False
 
 
+_CREATE_NO_WINDOW = 0x08000000
+
+
 def _win_run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Run a command on Windows, capturing output."""
     return subprocess.run(
         cmd, capture_output=True, text=True, timeout=15,
+        creationflags=_CREATE_NO_WINDOW,
         **kwargs,
     )
 

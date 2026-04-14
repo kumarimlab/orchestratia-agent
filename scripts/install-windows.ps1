@@ -530,137 +530,182 @@ if (-not $ServiceInstalled) {
     Write-Info "& `"$AgentExePath`""
 }
 
-# Step 6: Claude Code integration (skill + session hook)
-Write-Step 6 $TotalSteps "Setting up Claude Code integration"
+# Step 6: AI Agent integration (Claude Code, Gemini CLI, Codex CLI)
+Write-Step 6 $TotalSteps "Setting up AI agent integrations"
 
-# Claude Code discovers skills from ~/.claude/skills/<name>/SKILL.md
-# and SessionStart hooks from ~/.claude/settings.json.
-# Since the Windows installer uses a standalone .exe (no git clone),
-# we download the skill and hook files from the public GitHub repo.
-
-$ClaudeDir = "$env:USERPROFILE\.claude"
-$SkillDir = "$ClaudeDir\skills\orchestratia"
-$HookDir = "$ConfigDir\claude-skill"
-$SkillUrl = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/claude-skill/SKILL.md"
-$HookUrl = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/claude-skill/orchestratia-context.ps1"
-
-# 6a. Download and install skill file
-New-Item -ItemType Directory -Force -Path $SkillDir | Out-Null
-
-try {
-    Invoke-WebRequest -Uri $SkillUrl -OutFile "$SkillDir\SKILL.md" -UseBasicParsing -TimeoutSec 15
-    Write-Ok "Skill installed: $SkillDir\SKILL.md"
-} catch {
-    Write-Warn "Could not download SKILL.md: $_"
-    Write-Info "Manual: save $SkillUrl to $SkillDir\SKILL.md"
-}
-
-# 6b. Download session hook script
+# Download hook scripts (shared across all agents)
+$HookDir = "$ConfigDir\agent-skills\hooks"
+$RepoBase = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/agent-skills"
 New-Item -ItemType Directory -Force -Path $HookDir | Out-Null
 
 try {
-    Invoke-WebRequest -Uri $HookUrl -OutFile "$HookDir\orchestratia-context.ps1" -UseBasicParsing -TimeoutSec 15
-    Write-Ok "Hook script: $HookDir\orchestratia-context.ps1"
+    Invoke-WebRequest -Uri "$RepoBase/hooks/orchestratia-context.ps1" -OutFile "$HookDir\orchestratia-context.ps1" -UseBasicParsing -TimeoutSec 15
+    Invoke-WebRequest -Uri "$RepoBase/hooks/orchestratia-pretooluse.ps1" -OutFile "$HookDir\orchestratia-pretooluse.ps1" -UseBasicParsing -TimeoutSec 15
+    Write-Ok "Hook scripts downloaded to $HookDir"
 } catch {
-    Write-Warn "Could not download orchestratia-context.ps1: $_"
-    Write-Info "Manual: save $HookUrl to $HookDir\orchestratia-context.ps1"
+    Write-Warn "Could not download hook scripts: $_"
 }
 
-# 6c. Merge SessionStart hook into ~/.claude/settings.json
-$ClaudeSettings = "$ClaudeDir\settings.json"
-New-Item -ItemType Directory -Force -Path $ClaudeDir | Out-Null
+$ContextHookCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HookDir\orchestratia-context.ps1`""
+$PretoolHookCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HookDir\orchestratia-pretooluse.ps1`""
 
-$HookCommand = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HookDir\orchestratia-context.ps1`""
-
-# Use Python for reliable JSON merge (same approach as Linux installer).
-# PowerShell 5.x lacks ConvertFrom-Json -AsHashtable and writes BOM with UTF8.
+# Python for reliable JSON merge
 $PythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $PythonExe) { $PythonExe = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
 
-if ($PythonExe) {
+# Helper: merge hooks into a JSON settings file
+function Merge-JsonHooks($SettingsPath, $SessionEvent, $PretoolEvent, $ContextCmd, $PretoolCmd) {
+    if (-not $PythonExe) {
+        Write-Warn "Python not found — cannot merge hooks into $SettingsPath"
+        return $false
+    }
     $pyScript = @"
 import json, os, sys
-
-settings_path = sys.argv[1]
-hook_command = sys.argv[2]
+path = sys.argv[1]
+session_event = sys.argv[2]
+pretool_event = sys.argv[3]
+context_cmd = sys.argv[4]
+pretool_cmd = sys.argv[5]
 
 settings = {}
-if os.path.exists(settings_path):
+if os.path.exists(path):
     try:
-        with open(settings_path, 'r', encoding='utf-8-sig') as f:
+        with open(path, 'r', encoding='utf-8-sig') as f:
             settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        print('WARN: Could not parse existing settings.json', file=sys.stderr)
+    except: pass
 
 hooks = settings.setdefault('hooks', {})
-session_start = hooks.setdefault('SessionStart', [])
 
-already_exists = any(
-    any('orchestratia' in h.get('command', '') for h in entry.get('hooks', []))
-    for entry in session_start
-    if isinstance(entry, dict)
-)
+for event, cmd in [(session_event, context_cmd), (pretool_event, pretool_cmd)]:
+    event_list = hooks.setdefault(event, [])
+    if not any('orchestratia' in str(e) for e in event_list):
+        event_list.append({'hooks': [{'type': 'command', 'command': cmd, 'timeout': 10000 if 'context' in cmd else 30000}]})
 
-if not already_exists:
-    session_start.append({
-        'hooks': [{'type': 'command', 'command': hook_command, 'timeout': 10000}]
-    })
-
-with open(settings_path, 'w', encoding='utf-8', newline='\n') as f:
+with open(path, 'w', encoding='utf-8', newline='\n') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
 "@
-    $pyTmp = "$env:TEMP\orc_settings_merge.py"
+    $pyTmp = "$env:TEMP\orc_merge_hooks.py"
     Set-Content -Path $pyTmp -Value $pyScript -Encoding ASCII
     try {
-        & $PythonExe $pyTmp $ClaudeSettings $HookCommand 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Ok "SessionStart hook registered in $ClaudeSettings"
-        } else {
-            Write-Warn "Python JSON merge returned non-zero exit"
-        }
+        & $PythonExe $pyTmp $SettingsPath $SessionEvent $PretoolEvent $ContextCmd $PretoolCmd 2>&1 | Out-Null
+        Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
+        return ($LASTEXITCODE -eq 0)
     } catch {
-        Write-Warn "Could not update settings.json via Python: $_"
+        Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
+        return $false
     }
-    Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
-} else {
-    # Fallback: pure PowerShell (PS 5.x compatible, no -AsHashtable)
+}
+
+# ── Claude Code ──
+$ClaudeDetected = $null -ne (Get-Command claude -ErrorAction SilentlyContinue)
+if ($ClaudeDetected) {
+    $ClaudeSkillDir = "$env:USERPROFILE\.claude\skills\orchestratia"
+    New-Item -ItemType Directory -Force -Path $ClaudeSkillDir | Out-Null
     try {
-        $needsWrite = $true
-        if (Test-Path $ClaudeSettings) {
-            $raw = Get-Content $ClaudeSettings -Raw -ErrorAction SilentlyContinue
-            if ($raw -and $raw -match "orchestratia") {
-                Write-Ok "Orchestratia hook already in $ClaudeSettings"
-                $needsWrite = $false
-            }
+        Invoke-WebRequest -Uri "$RepoBase/claude/SKILL.md" -OutFile "$ClaudeSkillDir\SKILL.md" -UseBasicParsing -TimeoutSec 15
+        Write-Ok "Claude Code skill installed"
+    } catch { Write-Warn "Could not download Claude SKILL.md" }
+
+    $ClaudeSettings = "$env:USERPROFILE\.claude\settings.json"
+    New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude" | Out-Null
+    if (Merge-JsonHooks $ClaudeSettings "SessionStart" "PreToolUse" $ContextHookCmd $PretoolHookCmd) {
+        Write-Ok "Claude Code hooks configured"
+    } else { Write-Warn "Could not configure Claude Code hooks" }
+}
+
+# ── Gemini CLI ──
+$GeminiDetected = $null -ne (Get-Command gemini -ErrorAction SilentlyContinue)
+if ($GeminiDetected) {
+    $GeminiSkillDir = "$env:USERPROFILE\.gemini\skills\orchestratia"
+    $SharedSkillDir = "$env:USERPROFILE\.agents\skills\orchestratia"
+    New-Item -ItemType Directory -Force -Path $GeminiSkillDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $SharedSkillDir | Out-Null
+    try {
+        Invoke-WebRequest -Uri "$RepoBase/gemini/SKILL.md" -OutFile "$GeminiSkillDir\SKILL.md" -UseBasicParsing -TimeoutSec 15
+        Copy-Item "$GeminiSkillDir\SKILL.md" "$SharedSkillDir\SKILL.md" -Force -ErrorAction SilentlyContinue
+        Write-Ok "Gemini CLI skill installed"
+    } catch { Write-Warn "Could not download Gemini SKILL.md" }
+
+    $GeminiSettings = "$env:USERPROFILE\.gemini\settings.json"
+    New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.gemini" | Out-Null
+    if (Merge-JsonHooks $GeminiSettings "SessionStart" "BeforeTool" $ContextHookCmd $PretoolHookCmd) {
+        Write-Ok "Gemini CLI hooks configured"
+    } else { Write-Warn "Could not configure Gemini CLI hooks" }
+}
+
+# ── Codex CLI ──
+$CodexDetected = $null -ne (Get-Command codex -ErrorAction SilentlyContinue)
+if ($CodexDetected) {
+    $CodexSkillDir = "$env:USERPROFILE\.codex\skills\orchestratia"
+    $SharedSkillDir = "$env:USERPROFILE\.agents\skills\orchestratia"
+    New-Item -ItemType Directory -Force -Path $CodexSkillDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $SharedSkillDir | Out-Null
+    try {
+        Invoke-WebRequest -Uri "$RepoBase/codex/SKILL.md" -OutFile "$CodexSkillDir\SKILL.md" -UseBasicParsing -TimeoutSec 15
+        if (-not (Test-Path "$SharedSkillDir\SKILL.md")) {
+            Copy-Item "$CodexSkillDir\SKILL.md" "$SharedSkillDir\SKILL.md" -Force -ErrorAction SilentlyContinue
         }
-        if ($needsWrite) {
-            # Minimal valid settings with just the hook
-            $json = @"
+        Write-Ok "Codex CLI skill installed"
+    } catch { Write-Warn "Could not download Codex SKILL.md" }
+
+    # Enable hooks feature flag in config.toml
+    $CodexConfig = "$env:USERPROFILE\.codex\config.toml"
+    New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.codex" | Out-Null
+    if (Test-Path $CodexConfig) {
+        $content = Get-Content $CodexConfig -Raw -ErrorAction SilentlyContinue
+        if ($content -notmatch "codex_hooks") {
+            Add-Content $CodexConfig "`n[features]`ncodex_hooks = true"
+        }
+    } else {
+        Set-Content $CodexConfig "[features]`ncodex_hooks = true" -Encoding ASCII
+    }
+
+    # Configure hooks via hooks.json
+    $CodexHooks = "$env:USERPROFILE\.codex\hooks.json"
+    if ((Test-Path $CodexHooks) -and (Get-Content $CodexHooks -Raw -ErrorAction SilentlyContinue) -match "orchestratia") {
+        Write-Ok "Codex CLI hooks already configured"
+    } else {
+        $hooksJson = @"
 {
   "hooks": {
     "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$($HookCommand -replace '\\', '\\\\' -replace '"', '\"')",
-            "timeout": 10000
-          }
-        ]
-      }
+      {"hooks": [{"type": "command", "command": "$($ContextHookCmd -replace '\\', '\\\\' -replace '"', '\\"')", "timeout": 10000}]}
+    ],
+    "PreToolUse": [
+      {"matcher": ".*", "hooks": [{"type": "command", "command": "$($PretoolHookCmd -replace '\\', '\\\\' -replace '"', '\\"')", "timeout": 30000}]}
     ]
   }
 }
 "@
-            Set-Content -Path $ClaudeSettings -Value $json -Encoding ASCII
-            Write-Ok "SessionStart hook registered in $ClaudeSettings"
-            Write-Warn "No Python found — wrote minimal settings.json (existing settings may be lost)"
-        }
-    } catch {
-        Write-Warn "Could not update settings.json: $_"
-        Write-Info "Manual: add SessionStart hook for $HookCommand"
+        Set-Content $CodexHooks $hooksJson -Encoding ASCII
+        Write-Ok "Codex CLI hooks configured (feature flag enabled)"
     }
+}
+
+# ── Agent detection summary ──
+Write-Host ""
+Write-Info "Agent Detection:"
+if ($ClaudeDetected) {
+    Write-Ok "Claude Code  - skill + hooks configured"
+} else {
+    Write-Host "     x " -ForegroundColor Red -NoNewline
+    Write-Host "Claude Code  - not found. Install it, then run: " -NoNewline
+    Write-Host "orchestratia setup --agent claude" -ForegroundColor Cyan
+}
+if ($GeminiDetected) {
+    Write-Ok "Gemini CLI   - skill + hooks configured"
+} else {
+    Write-Host "     x " -ForegroundColor Red -NoNewline
+    Write-Host "Gemini CLI   - not found. Install it, then run: " -NoNewline
+    Write-Host "orchestratia setup --agent gemini" -ForegroundColor Cyan
+}
+if ($CodexDetected) {
+    Write-Ok "Codex CLI    - skill + hooks + feature flag configured"
+} else {
+    Write-Host "     x " -ForegroundColor Red -NoNewline
+    Write-Host "Codex CLI    - not found. Install it, then run: " -NoNewline
+    Write-Host "orchestratia setup --agent codex" -ForegroundColor Cyan
 }
 
 # ── Summary ──────────────────────────────────────────────────────────

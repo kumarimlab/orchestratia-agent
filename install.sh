@@ -906,15 +906,15 @@ if os.path.exists(path):
 
 hooks = settings.setdefault('hooks', {})
 
-# SessionStart / BeforeTool
+# SessionStart / BeforeTool — remove old orchestratia hooks, add fresh
 session_list = hooks.setdefault('$SESSION_EVENT', [])
-if not any('orchestratia' in str(e) for e in session_list):
-    session_list.append({'hooks': [{'type': 'command', 'command': '$HOOK_CONTEXT_CMD', 'timeout': 10000}]})
+hooks['$SESSION_EVENT'] = [e for e in session_list if 'orchestratia' not in str(e)]
+hooks['$SESSION_EVENT'].append({'hooks': [{'type': 'command', 'command': '$HOOK_CONTEXT_CMD', 'timeout': 10000}]})
 
-# PreToolUse / BeforeTool
+# PreToolUse / BeforeTool — remove old orchestratia hooks, add fresh
 pretool_list = hooks.setdefault('$PRETOOL_EVENT', [])
-if not any('orchestratia' in str(e) for e in pretool_list):
-    pretool_list.append({'hooks': [{'type': 'command', 'command': '$HOOK_PRETOOL_CMD', 'timeout': 30000}]})
+hooks['$PRETOOL_EVENT'] = [e for e in pretool_list if 'orchestratia' not in str(e)]
+hooks['$PRETOOL_EVENT'].append({'hooks': [{'type': 'command', 'command': '$HOOK_PRETOOL_CMD', 'timeout': 30000}]})
 
 with open(path, 'w') as f:
     json.dump(settings, f, indent=2)

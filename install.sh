@@ -104,12 +104,25 @@ fatal() {
 
 check_command() {
     local cmd=$1
-    local name=${2:-$1}
     if command -v "$cmd" >/dev/null 2>&1; then
         return 0
     else
         return 1
     fi
+}
+
+# Check if a command exists in the real user's environment (not sudo's)
+check_user_command() {
+    local cmd=$1
+    # Try current PATH first
+    if command -v "$cmd" >/dev/null 2>&1; then return 0; fi
+    # Try as the run user (sources their .profile/.bashrc)
+    if sudo -u "$RUN_USER" bash -lc "command -v $cmd" >/dev/null 2>&1; then return 0; fi
+    # Check common npm/user paths explicitly
+    for p in "$RUN_HOME/.npm-global/bin/$cmd" "$RUN_HOME/.local/bin/$cmd" "/usr/local/bin/$cmd"; do
+        if [ -x "$p" ]; then return 0; fi
+    done
+    return 1
 }
 
 # Package install helper (macOS: brew, Linux: apt)
@@ -421,22 +434,22 @@ fi
 
 # AI coding agents (detect all, warn if none found)
 AGENTS_FOUND=0
-if check_command claude; then
-    CLAUDE_VER=$(claude --version 2>/dev/null || echo "installed")
+if check_user_command claude; then
+    CLAUDE_VER=$(sudo -u "$RUN_USER" bash -lc "claude --version 2>/dev/null" || echo "installed")
     ok "Claude Code ${CLAUDE_VER}"
     AGENTS_FOUND=$((AGENTS_FOUND + 1))
 else
     info "Claude Code not found (optional)"
 fi
-if check_command gemini; then
-    GEMINI_VER=$(gemini --version 2>/dev/null || echo "installed")
+if check_user_command gemini; then
+    GEMINI_VER=$(sudo -u "$RUN_USER" bash -lc "gemini --version 2>/dev/null" || echo "installed")
     ok "Gemini CLI ${GEMINI_VER}"
     AGENTS_FOUND=$((AGENTS_FOUND + 1))
 else
     info "Gemini CLI not found (optional)"
 fi
-if check_command codex; then
-    CODEX_VER=$(codex --version 2>/dev/null || echo "installed")
+if check_user_command codex; then
+    CODEX_VER=$(sudo -u "$RUN_USER" bash -lc "codex --version 2>/dev/null" || echo "installed")
     ok "Codex CLI ${CODEX_VER}"
     AGENTS_FOUND=$((AGENTS_FOUND + 1))
 else
@@ -925,7 +938,7 @@ print('ok')
 
 # ── Claude Code ──
 CLAUDE_DETECTED=false
-if sudo -u "$RUN_USER" bash -lc "command -v claude" >/dev/null 2>&1; then
+if check_user_command claude; then
     CLAUDE_DETECTED=true
 fi
 
@@ -947,7 +960,7 @@ fi
 
 # ── Gemini CLI ──
 GEMINI_DETECTED=false
-if sudo -u "$RUN_USER" bash -lc "command -v gemini" >/dev/null 2>&1; then
+if check_user_command gemini; then
     GEMINI_DETECTED=true
 fi
 
@@ -971,7 +984,7 @@ fi
 
 # ── Codex CLI ──
 CODEX_DETECTED=false
-if sudo -u "$RUN_USER" bash -lc "command -v codex" >/dev/null 2>&1; then
+if check_user_command codex; then
     CODEX_DETECTED=true
 fi
 

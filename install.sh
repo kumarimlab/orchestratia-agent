@@ -17,6 +17,8 @@
 #   3. Installs Python dependencies
 #   4. Registers with the hub using your one-time token
 #   5. Installs a persistent service (systemd on Linux, launchd on macOS)
+#   ...
+#   9. Configures AI agent integrations (Claude Code, Gemini CLI, Codex CLI)
 #
 # Always safe to re-run — uninstalls first, then installs fresh.
 # ──────────────────────────────────────────────────────────────────────
@@ -417,14 +419,34 @@ else
     fi
 fi
 
-# Claude Code (warning only, not fatal)
+# AI coding agents (detect all, warn if none found)
+AGENTS_FOUND=0
 if check_command claude; then
     CLAUDE_VER=$(claude --version 2>/dev/null || echo "installed")
     ok "Claude Code ${CLAUDE_VER}"
+    AGENTS_FOUND=$((AGENTS_FOUND + 1))
 else
-    warn "Claude Code CLI not found in PATH"
-    info "The daemon needs it for interactive sessions. Install:"
-    info "npm install -g @anthropic-ai/claude-code && claude auth login"
+    info "Claude Code not found (optional)"
+fi
+if check_command gemini; then
+    GEMINI_VER=$(gemini --version 2>/dev/null || echo "installed")
+    ok "Gemini CLI ${GEMINI_VER}"
+    AGENTS_FOUND=$((AGENTS_FOUND + 1))
+else
+    info "Gemini CLI not found (optional)"
+fi
+if check_command codex; then
+    CODEX_VER=$(codex --version 2>/dev/null || echo "installed")
+    ok "Codex CLI ${CODEX_VER}"
+    AGENTS_FOUND=$((AGENTS_FOUND + 1))
+else
+    info "Codex CLI not found (optional)"
+fi
+if [ "$AGENTS_FOUND" -eq 0 ]; then
+    warn "No AI coding agents found. Install at least one:"
+    info "Claude Code: npm install -g @anthropic-ai/claude-code"
+    info "Gemini CLI:  npm install -g @anthropic-ai/gemini-cli"
+    info "Codex CLI:   npm install -g @openai/codex"
 fi
 
 # Sudo access
@@ -854,132 +876,164 @@ if [ -f "${CONFIG_DIR}/config.yaml" ]; then
     ok "Config updated: remote_ssh_access=${REMOTE_SSH_ACCESS}"
 fi
 
-# Step 9: Claude Code integration (skill + session hook)
-step 9 "Setting up Claude Code integration"
+# Step 9: AI Agent integration (skill + hooks for Claude Code, Gemini CLI, Codex CLI)
+step 9 "Setting up AI agent integrations"
 
-# 8a. Symlink skill file to ~/.claude/skills/orchestratia/
-# Symlink (not copy) so updates to /opt/orchestratia-agent/ are reflected immediately.
-SKILL_DIR="${RUN_HOME}/.claude/skills/orchestratia"
-if sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" 2>/dev/null; then
-    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/claude-skill/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-        ok "Skill symlinked: ${SKILL_DIR}/SKILL.md -> ${INSTALL_DIR}/claude-skill/SKILL.md"
+HOOK_CONTEXT="$INSTALL_DIR/agent-skills/hooks/orchestratia-context.sh"
+HOOK_PRETOOLUSE="$INSTALL_DIR/agent-skills/hooks/orchestratia-pretooluse.sh"
+
+# Make hook scripts executable
+chmod +x "$INSTALL_DIR/agent-skills/hooks/"*.sh 2>/dev/null || true
+
+# ── Helper: merge JSON hooks into a settings.json file ──
+merge_json_hooks() {
+    local SETTINGS_PATH="$1"
+    local SESSION_EVENT="$2"
+    local PRETOOL_EVENT="$3"
+    local HOOK_CONTEXT_CMD="$4"
+    local HOOK_PRETOOL_CMD="$5"
+
+    sudo -u "$RUN_USER" python3 -c "
+import json, os
+path = '$SETTINGS_PATH'
+settings = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        settings = {}
+
+hooks = settings.setdefault('hooks', {})
+
+# SessionStart / BeforeTool
+session_list = hooks.setdefault('$SESSION_EVENT', [])
+if not any('orchestratia' in str(e) for e in session_list):
+    session_list.append({'hooks': [{'type': 'command', 'command': '$HOOK_CONTEXT_CMD', 'timeout': 10000}]})
+
+# PreToolUse / BeforeTool
+pretool_list = hooks.setdefault('$PRETOOL_EVENT', [])
+if not any('orchestratia' in str(e) for e in pretool_list):
+    pretool_list.append({'hooks': [{'type': 'command', 'command': '$HOOK_PRETOOL_CMD', 'timeout': 30000}]})
+
+with open(path, 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+print('ok')
+" 2>/dev/null
+}
+
+# ── Claude Code ──
+CLAUDE_DETECTED=false
+if sudo -u "$RUN_USER" bash -lc "command -v claude" >/dev/null 2>&1; then
+    CLAUDE_DETECTED=true
+fi
+
+if $CLAUDE_DETECTED; then
+    SKILL_DIR="${RUN_HOME}/.claude/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" "${RUN_HOME}/.claude" 2>/dev/null || true
+    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/agent-skills/claude/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        ok "Claude Code skill installed"
     else
-        warn "Could not symlink skill file to ${SKILL_DIR}"
+        warn "Could not install Claude Code skill"
     fi
-else
-    warn "Could not create ${SKILL_DIR}"
+    CLAUDE_SETTINGS="${RUN_HOME}/.claude/settings.json"
+    if merge_json_hooks "$CLAUDE_SETTINGS" "SessionStart" "PreToolUse" "$HOOK_CONTEXT" "$HOOK_PRETOOLUSE" | grep -q "ok"; then
+        ok "Claude Code hooks configured"
+    else
+        warn "Could not configure Claude Code hooks"
+    fi
 fi
 
-# 8b. Make hook script executable
-if [ -f "$INSTALL_DIR/claude-skill/orchestratia-context.sh" ]; then
-    chmod +x "$INSTALL_DIR/claude-skill/orchestratia-context.sh"
-    ok "Hook script: ${INSTALL_DIR}/claude-skill/orchestratia-context.sh"
-else
-    warn "Hook script not found at ${INSTALL_DIR}/claude-skill/orchestratia-context.sh"
+# ── Gemini CLI ──
+GEMINI_DETECTED=false
+if sudo -u "$RUN_USER" bash -lc "command -v gemini" >/dev/null 2>&1; then
+    GEMINI_DETECTED=true
 fi
 
-# 8c. Merge SessionStart hook into ~/.claude/settings.json
-CLAUDE_SETTINGS="${RUN_HOME}/.claude/settings.json"
-HOOK_SCRIPT="$INSTALL_DIR/claude-skill/orchestratia-context.sh"
-
-sudo -u "$RUN_USER" mkdir -p "${RUN_HOME}/.claude" 2>/dev/null || true
-
-if sudo -u "$RUN_USER" python3 -c "
-import json, os, sys
-
-path = '$CLAUDE_SETTINGS'
-hook_cmd = '$HOOK_SCRIPT'
-
-# Load existing settings or start fresh
-settings = {}
-if os.path.exists(path):
-    try:
-        with open(path) as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        settings = {}
-
-# Ensure hooks.SessionStart structure exists
-hooks = settings.setdefault('hooks', {})
-session_start = hooks.setdefault('SessionStart', [])
-
-# Check if orchestratia hook already exists (avoid duplicates)
-already_exists = False
-for entry in session_start:
-    if isinstance(entry, dict):
-        for h in entry.get('hooks', []):
-            if isinstance(h, dict) and 'orchestratia' in h.get('command', ''):
-                already_exists = True
-                break
-
-if not already_exists:
-    session_start.append({
-        'hooks': [{
-            'type': 'command',
-            'command': hook_cmd,
-            'timeout': 10000
-        }]
-    })
-
-with open(path, 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-
-print('ok')
-" 2>/dev/null; then
-    ok "SessionStart hook registered in ${CLAUDE_SETTINGS}"
-else
-    warn "Could not update ${CLAUDE_SETTINGS}"
-    info "Manual setup: add SessionStart hook pointing to ${HOOK_SCRIPT}"
+if $GEMINI_DETECTED; then
+    SKILL_DIR="${RUN_HOME}/.gemini/skills/orchestratia"
+    SHARED_DIR="${RUN_HOME}/.agents/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" "$SHARED_DIR" "${RUN_HOME}/.gemini" 2>/dev/null || true
+    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/agent-skills/gemini/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        sudo -u "$RUN_USER" cp "$INSTALL_DIR/agent-skills/gemini/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
+        ok "Gemini CLI skill installed"
+    else
+        warn "Could not install Gemini CLI skill"
+    fi
+    GEMINI_SETTINGS="${RUN_HOME}/.gemini/settings.json"
+    if merge_json_hooks "$GEMINI_SETTINGS" "SessionStart" "BeforeTool" "$HOOK_CONTEXT" "$HOOK_PRETOOLUSE" | grep -q "ok"; then
+        ok "Gemini CLI hooks configured"
+    else
+        warn "Could not configure Gemini CLI hooks"
+    fi
 fi
 
-# 8d. Merge PreToolUse hook into ~/.claude/settings.json
-PRETOOLUSE_SCRIPT="$INSTALL_DIR/claude-skill/orchestratia-pretooluse.sh"
+# ── Codex CLI ──
+CODEX_DETECTED=false
+if sudo -u "$RUN_USER" bash -lc "command -v codex" >/dev/null 2>&1; then
+    CODEX_DETECTED=true
+fi
 
-if sudo -u "$RUN_USER" python3 -c "
-import json, os, sys
+if $CODEX_DETECTED; then
+    SKILL_DIR="${RUN_HOME}/.codex/skills/orchestratia"
+    SHARED_DIR="${RUN_HOME}/.agents/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" "$SHARED_DIR" "${RUN_HOME}/.codex" 2>/dev/null || true
+    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/agent-skills/codex/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        sudo -u "$RUN_USER" cp "$INSTALL_DIR/agent-skills/codex/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
+        ok "Codex CLI skill installed"
+    else
+        warn "Could not install Codex CLI skill"
+    fi
 
-path = '$CLAUDE_SETTINGS'
-hook_cmd = '$PRETOOLUSE_SCRIPT'
+    # Enable hooks feature flag in config.toml
+    CODEX_CONFIG="${RUN_HOME}/.codex/config.toml"
+    if [ -f "$CODEX_CONFIG" ]; then
+        if ! grep -q "codex_hooks" "$CODEX_CONFIG" 2>/dev/null; then
+            echo -e "\n[features]\ncodex_hooks = true" | sudo -u "$RUN_USER" tee -a "$CODEX_CONFIG" >/dev/null
+        fi
+    else
+        echo -e "[features]\ncodex_hooks = true" | sudo -u "$RUN_USER" tee "$CODEX_CONFIG" >/dev/null
+    fi
 
-settings = {}
-if os.path.exists(path):
-    try:
-        with open(path) as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        settings = {}
+    # Configure hooks via hooks.json
+    CODEX_HOOKS="${RUN_HOME}/.codex/hooks.json"
+    if [ -f "$CODEX_HOOKS" ] && grep -q "orchestratia" "$CODEX_HOOKS" 2>/dev/null; then
+        ok "Codex CLI hooks already configured"
+    else
+        sudo -u "$RUN_USER" cat > "$CODEX_HOOKS" <<CODEXEOF
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "$HOOK_CONTEXT", "timeout": 10000}]}
+    ],
+    "PreToolUse": [
+      {"matcher": ".*", "hooks": [{"type": "command", "command": "$HOOK_PRETOOLUSE", "timeout": 30000}]}
+    ]
+  }
+}
+CODEXEOF
+        ok "Codex CLI hooks configured (feature flag enabled)"
+    fi
+fi
 
-hooks = settings.setdefault('hooks', {})
-pre_tool_use = hooks.setdefault('PreToolUse', [])
-
-already_exists = False
-for entry in pre_tool_use:
-    if isinstance(entry, dict):
-        for h in entry.get('hooks', []):
-            if isinstance(h, dict) and 'orchestratia' in h.get('command', ''):
-                already_exists = True
-                break
-
-if not already_exists:
-    pre_tool_use.append({
-        'hooks': [{
-            'type': 'command',
-            'command': hook_cmd,
-            'timeout': 30000
-        }]
-    })
-
-with open(path, 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-
-print('ok')
-" 2>/dev/null; then
-    ok "PreToolUse hook registered in ${CLAUDE_SETTINGS}"
+# ── Agent detection summary ──
+echo ""
+info "Agent Detection:"
+if $CLAUDE_DETECTED; then
+    echo -e "     ${PASS} Claude Code  — skill + hooks configured"
 else
-    warn "Could not update ${CLAUDE_SETTINGS}"
-    info "Manual setup: add PreToolUse hook pointing to ${PRETOOLUSE_SCRIPT}"
+    echo -e "     ${FAIL} Claude Code  — not found. Install it, then run: ${CYAN}orchestratia setup --agent claude${NC}"
+fi
+if $GEMINI_DETECTED; then
+    echo -e "     ${PASS} Gemini CLI   — skill + hooks configured"
+else
+    echo -e "     ${FAIL} Gemini CLI   — not found. Install it, then run: ${CYAN}orchestratia setup --agent gemini${NC}"
+fi
+if $CODEX_DETECTED; then
+    echo -e "     ${PASS} Codex CLI    — skill + hooks + feature flag configured"
+else
+    echo -e "     ${FAIL} Codex CLI    — not found. Install it, then run: ${CYAN}orchestratia setup --agent codex${NC}"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────

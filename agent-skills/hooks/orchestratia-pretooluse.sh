@@ -40,6 +40,20 @@ if not tool_name:
 session_id = os.environ.get('ORCHESTRATIA_SESSION_ID', '')
 project_id = os.environ.get('ORCHESTRATIA_PROJECT_ID', '')
 
+# Detect which AI agent is running
+agent_name = os.environ.get('ORCHESTRATIA_AGENT_NAME', '')
+if not agent_name:
+    claude_tools = {'Edit','Write','Read','Glob','Grep','WebFetch','Agent','Skill','MultiEdit','NotebookEdit','ToolSearch','EnterPlanMode','ExitPlanMode','TaskCreate','TaskUpdate','TaskList','TaskGet','TaskOutput','AskUserQuestion'}
+    gemini_tools = {'run_shell_command','write_file','read_file','grep_search','glob_search','web_fetch','replace','create_file','activate_skill'}
+    if tool_name in claude_tools:
+        agent_name = 'claude'
+    elif tool_name in gemini_tools:
+        agent_name = 'gemini'
+    elif tool_name == 'shell' or os.environ.get('CODEX_SANDBOX_DIR'):
+        agent_name = 'codex'
+    else:
+        agent_name = 'claude'
+
 # Determine the parameter to match against
 # Supports Claude Code, Gemini CLI, and Codex CLI tool names
 param = ''
@@ -92,6 +106,12 @@ for rule in rules:
         continue
     # server scope is already filtered by the hub when caching rules
 
+    # Agent filter check
+    agent_f = rule.get('agent_filter', 'all')
+    if agent_f != 'all' and agent_name:
+        if agent_name not in [a.strip() for a in agent_f.split(',')]:
+            continue
+
     # Match found
     action = rule.get('action', 'allow')
     decision = 'allow' if action == 'allow' else 'deny'
@@ -110,6 +130,7 @@ log_entry = {
     'decision': 'allowed' if decision == 'allow' else ('denied' if decision == 'deny' else 'asked'),
     'matched_rule_id': matched_rule_id,
     'reason': reason,
+    'agent_name': agent_name or None,
     'created_at': time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime()),
 }
 try:

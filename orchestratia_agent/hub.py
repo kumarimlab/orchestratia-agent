@@ -671,7 +671,7 @@ async def ws_receive_loop(ws, state: DaemonState):
 
             elif msg_type == "grant_ssh_access":
                 # Source role: store private key + start TCP listener
-                from orchestratia_agent.ssh_setup import store_private_key
+                from orchestratia_agent.ssh_setup import store_private_key, clean_known_hosts
                 from orchestratia_agent import s2s_tunnel
                 grant_id = msg.get("grant_id", "")
                 priv_key = msg.get("ssh_private_key", "")
@@ -679,6 +679,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                 target_port = msg.get("target_port", 22)
                 if grant_id and priv_key and bind_port:
                     store_private_key(grant_id, priv_key)
+                    clean_known_hosts(bind_port)
                     asyncio.create_task(
                         s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
                     )

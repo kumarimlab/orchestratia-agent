@@ -42,6 +42,8 @@ import os
 import sys
 import urllib.request
 import urllib.error
+
+from orchestratia_agent import __version__
 import ssl
 
 # Read config from environment (set by daemon when spawning PTY)
@@ -1591,6 +1593,8 @@ def main():
         prog="orchestratia",
         description="Orchestratia CLI - Inter-agent task communication",
     )
+    parser.add_argument("--version", "-V", action="version",
+                        version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     # ── task subcommand ──

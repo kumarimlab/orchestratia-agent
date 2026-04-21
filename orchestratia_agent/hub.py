@@ -309,6 +309,111 @@ async def _ack_upload(
         log.warning(f"Ack failed for upload {upload_id[:8]}: {e}")
 
 
+# 10 MB cap (matches hub side). Agents reject larger files before upload.
+_PULL_MAX_SIZE = 10 * 1024 * 1024
+
+
+async def _process_pending_pull(
+    client: httpx.AsyncClient, state: DaemonState, item: dict
+) -> None:
+    """Read a requested file from local disk and stream it back to the hub."""
+    from pathlib import Path
+
+    download_id = item.get("download_id") or ""
+    raw_path = item.get("path") or ""
+    if not download_id or not raw_path:
+        return
+
+    # Permissive path handling: expand ~, resolve, but refuse anything that
+    # isn't an existing regular file the agent can read.
+    try:
+        p = Path(os.path.expanduser(raw_path)).resolve()
+    except Exception as e:
+        await _fail_pull(client, state, download_id, f"path resolution failed: {e}")
+        return
+
+    if not p.exists():
+        await _fail_pull(client, state, download_id, f"file not found: {raw_path}")
+        return
+    if not p.is_file():
+        await _fail_pull(client, state, download_id, f"not a regular file: {raw_path}")
+        return
+
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        await _fail_pull(client, state, download_id, f"stat failed: {e}")
+        return
+
+    if size > _PULL_MAX_SIZE:
+        await _fail_pull(
+            client, state, download_id,
+            f"file too large ({size} B > {_PULL_MAX_SIZE // (1024*1024)} MB cap)",
+        )
+        return
+
+    try:
+        with open(p, "rb") as f:
+            files = {"file": (p.name, f, "application/octet-stream")}
+            resp = await client.post(
+                f"{state.hub_url}/api/v1/server/files/pulls/{download_id}/upload",
+                files=files,
+                headers={"X-API-Key": state.api_key},
+                timeout=120,
+            )
+        if resp.status_code >= 400:
+            await _fail_pull(client, state, download_id, f"upload rejected: {resp.status_code} {resp.text[:200]}")
+            return
+        log.info(f"Direct pull delivered: {p} ({size} B)")
+    except httpx.HTTPError as e:
+        await _fail_pull(client, state, download_id, f"upload failed: {e}")
+    except OSError as e:
+        await _fail_pull(client, state, download_id, f"read failed: {e}")
+
+
+async def _fail_pull(
+    client: httpx.AsyncClient,
+    state: DaemonState,
+    download_id: str,
+    error: str,
+) -> None:
+    try:
+        resp = await client.post(
+            f"{state.hub_url}/api/v1/server/files/pulls/{download_id}/fail",
+            json={"error": error},
+            headers={"X-API-Key": state.api_key},
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        log.warning(f"Pull-fail report failed for {download_id[:8]}: {e}")
+    log.info(f"Direct pull failed: {error}")
+
+
+async def pending_pulls_loop(client: httpx.AsyncClient, state: DaemonState):
+    """Poll the hub for file-pull requests and stream the files back."""
+    url = f"{state.hub_url}/api/v1/server/files/pulls/pending"
+    headers = {"X-API-Key": state.api_key}
+
+    while state.running:
+        try:
+            resp = await client.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                items = resp.json() or []
+                for item in items:
+                    if not state.running:
+                        return
+                    await _process_pending_pull(client, state, item)
+        except httpx.HTTPError as e:
+            log.debug(f"pending_pulls poll failed: {e}")
+        except Exception as e:
+            log.warning(f"pending_pulls loop error: {e}")
+
+        for _ in range(3):
+            if not state.running:
+                return
+            await asyncio.sleep(1)
+
+
 async def pending_uploads_loop(client: httpx.AsyncClient, state: DaemonState):
     """Poll the hub for pending direct uploads and download them to disk.
 

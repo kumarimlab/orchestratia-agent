@@ -217,6 +217,120 @@ async def heartbeat_loop(client: httpx.AsyncClient, state: DaemonState):
             await asyncio.sleep(1)
 
 
+# Destination directory on server filesystem for browser-initiated uploads
+UPLOAD_DEST_DIR = "/tmp/orchestratia-uploads"
+
+
+async def _process_pending_upload(
+    client: httpx.AsyncClient, state: DaemonState, item: dict
+) -> None:
+    """Download one queued upload to local disk and ack back to the hub."""
+    import hashlib
+    from pathlib import Path
+
+    upload_id = item.get("upload_id")
+    filename = item.get("filename") or "file"
+    download_url = item.get("download_url") or ""
+    dest_path_hint = item.get("dest_path") or f"{UPLOAD_DEST_DIR}/{filename}"
+    expected_sha = item.get("sha256")
+
+    if not upload_id or not download_url:
+        return
+
+    dest = Path(dest_path_hint)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        await _ack_upload(client, state, upload_id, success=False, error=f"mkdir failed: {e}")
+        return
+
+    url = download_url
+    if url.startswith("/"):
+        url = f"{state.hub_url}{url}"
+
+    try:
+        sha = hashlib.sha256()
+        size = 0
+        tmp_path = dest.with_suffix(dest.suffix + ".part")
+        async with client.stream("GET", url, headers={"X-API-Key": state.api_key}) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(64 * 1024):
+                    f.write(chunk)
+                    sha.update(chunk)
+                    size += len(chunk)
+
+        if expected_sha and sha.hexdigest() != expected_sha:
+            tmp_path.unlink(missing_ok=True)
+            await _ack_upload(client, state, upload_id, success=False, error="sha256 mismatch")
+            return
+
+        tmp_path.replace(dest)
+        log.info(f"Direct upload delivered: {filename} ({size} B) → {dest}")
+        await _ack_upload(client, state, upload_id, success=True, path=str(dest))
+
+    except httpx.HTTPError as e:
+        await _ack_upload(client, state, upload_id, success=False, error=f"download failed: {e}")
+    except OSError as e:
+        await _ack_upload(client, state, upload_id, success=False, error=f"write failed: {e}")
+
+
+async def _ack_upload(
+    client: httpx.AsyncClient,
+    state: DaemonState,
+    upload_id: str,
+    success: bool,
+    path: str | None = None,
+    error: str | None = None,
+) -> None:
+    try:
+        body: dict = {"success": success}
+        if path:
+            body["path"] = path
+        if error:
+            body["error"] = error
+        resp = await client.post(
+            f"{state.hub_url}/api/v1/server/files/{upload_id}/ack",
+            json=body,
+            headers={"X-API-Key": state.api_key},
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        log.warning(f"Ack failed for upload {upload_id[:8]}: {e}")
+
+
+async def pending_uploads_loop(client: httpx.AsyncClient, state: DaemonState):
+    """Poll the hub for pending direct uploads and download them to disk.
+
+    Uses a 3s interval — fast enough for responsive UX, slow enough that
+    load stays trivial. Each iteration fetches the pending list and
+    processes entries serially (preserves order, avoids concurrent writes
+    to the same destination).
+    """
+    url = f"{state.hub_url}/api/v1/server/files/pending"
+    headers = {"X-API-Key": state.api_key}
+
+    while state.running:
+        try:
+            resp = await client.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                items = resp.json() or []
+                for item in items:
+                    if not state.running:
+                        return
+                    await _process_pending_upload(client, state, item)
+        except httpx.HTTPError as e:
+            log.debug(f"pending_uploads poll failed: {e}")
+        except Exception as e:
+            log.warning(f"pending_uploads loop error: {e}")
+
+        # Sleep in 1s increments so we can exit promptly
+        for _ in range(3):
+            if not state.running:
+                return
+            await asyncio.sleep(1)
+
+
 def _get_tmux_name(session: "ManagedSession") -> str | None:
     """Extract tmux session name from a ManagedSession."""
     tmux_name = getattr(session.handle, "tmux_name", None) if hasattr(session, "handle") else None
@@ -756,12 +870,6 @@ async def ws_receive_loop(ws, state: DaemonState):
                     })
                     _cleanup_incoming(transfer_id)
 
-            # ── Direct File Upload (dashboard user → server filesystem) ──
-            elif msg_type == "file_download_direct":
-                asyncio.create_task(
-                    _handle_file_download_direct(msg, sender, state)
-                )
-
             elif msg_type == "approval_rules_updated":
                 log.info("Approval rules updated by hub, refreshing cache")
                 asyncio.create_task(_refresh_rules_cache(state))
@@ -1127,70 +1235,6 @@ async def _handle_remote_exec(sender, request_id: str, command: str):
             "exit_code": -1,
             "stdout": "",
             "stderr": str(e),
-        })
-
-
-async def _handle_file_download_direct(msg: dict, sender, state: DaemonState):
-    """Download a file from the hub and save to /tmp/orchestratia/.
-
-    Used for direct file uploads from the dashboard — the user uploads
-    a file to the hub, and the hub tells us to download it to a
-    predictable location on the server filesystem.
-    """
-    import tempfile
-
-    url = msg.get("url", "")
-    filename = msg.get("filename", "")
-    session_id = msg.get("session_id", "")
-    request_id = msg.get("request_id", "")
-
-    if not url or not filename:
-        log.warning("file_download_direct: missing url or filename")
-        return
-
-    dest_dir = os.path.join(tempfile.gettempdir(), "orchestratia")
-    os.makedirs(dest_dir, exist_ok=True)
-    dest_path = os.path.join(dest_dir, filename)
-
-    # Avoid overwriting — append (1), (2), etc. if file exists
-    if os.path.exists(dest_path):
-        base, ext = os.path.splitext(filename)
-        counter = 1
-        while os.path.exists(dest_path):
-            dest_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
-            counter += 1
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-
-        with open(dest_path, "wb") as f:
-            f.write(resp.content)
-
-        file_size = len(resp.content)
-        log.info(f"Direct upload saved: {dest_path} ({file_size} bytes)")
-
-        await sender({
-            "type": "file_download_ack",
-            "session_id": session_id,
-            "request_id": request_id,
-            "path": dest_path,
-            "filename": os.path.basename(dest_path),
-            "size": file_size,
-            "success": True,
-        })
-    except Exception as e:
-        log.error(f"Direct upload failed: {e}")
-        await sender({
-            "type": "file_download_ack",
-            "session_id": session_id,
-            "request_id": request_id,
-            "path": "",
-            "filename": filename,
-            "size": 0,
-            "success": False,
-            "error": str(e),
         })
 
 

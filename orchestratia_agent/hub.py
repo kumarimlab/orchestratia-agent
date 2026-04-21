@@ -756,6 +756,12 @@ async def ws_receive_loop(ws, state: DaemonState):
                     })
                     _cleanup_incoming(transfer_id)
 
+            # ── Direct File Upload (dashboard user → server filesystem) ──
+            elif msg_type == "file_download_direct":
+                asyncio.create_task(
+                    _handle_file_download_direct(msg, sender, state)
+                )
+
             elif msg_type == "approval_rules_updated":
                 log.info("Approval rules updated by hub, refreshing cache")
                 asyncio.create_task(_refresh_rules_cache(state))
@@ -1121,6 +1127,70 @@ async def _handle_remote_exec(sender, request_id: str, command: str):
             "exit_code": -1,
             "stdout": "",
             "stderr": str(e),
+        })
+
+
+async def _handle_file_download_direct(msg: dict, sender, state: DaemonState):
+    """Download a file from the hub and save to /tmp/orchestratia/.
+
+    Used for direct file uploads from the dashboard — the user uploads
+    a file to the hub, and the hub tells us to download it to a
+    predictable location on the server filesystem.
+    """
+    import tempfile
+
+    url = msg.get("url", "")
+    filename = msg.get("filename", "")
+    session_id = msg.get("session_id", "")
+    request_id = msg.get("request_id", "")
+
+    if not url or not filename:
+        log.warning("file_download_direct: missing url or filename")
+        return
+
+    dest_dir = os.path.join(tempfile.gettempdir(), "orchestratia")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, filename)
+
+    # Avoid overwriting — append (1), (2), etc. if file exists
+    if os.path.exists(dest_path):
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(dest_path):
+            dest_path = os.path.join(dest_dir, f"{base} ({counter}){ext}")
+            counter += 1
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+
+        with open(dest_path, "wb") as f:
+            f.write(resp.content)
+
+        file_size = len(resp.content)
+        log.info(f"Direct upload saved: {dest_path} ({file_size} bytes)")
+
+        await sender({
+            "type": "file_download_ack",
+            "session_id": session_id,
+            "request_id": request_id,
+            "path": dest_path,
+            "filename": os.path.basename(dest_path),
+            "size": file_size,
+            "success": True,
+        })
+    except Exception as e:
+        log.error(f"Direct upload failed: {e}")
+        await sender({
+            "type": "file_download_ack",
+            "session_id": session_id,
+            "request_id": request_id,
+            "path": "",
+            "filename": filename,
+            "size": 0,
+            "success": False,
+            "error": str(e),
         })
 
 

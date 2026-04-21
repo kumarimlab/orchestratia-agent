@@ -217,8 +217,17 @@ async def heartbeat_loop(client: httpx.AsyncClient, state: DaemonState):
             await asyncio.sleep(1)
 
 
-# Destination directory on server filesystem for browser-initiated uploads
-UPLOAD_DEST_DIR = "/tmp/orchestratia-uploads"
+def _upload_dest_dir() -> "Path":
+    """Return the per-OS directory for browser-initiated uploads.
+
+    Uses tempfile.gettempdir() so we get the right root on every OS:
+    - Linux: /tmp
+    - macOS: /var/folders/... (user-scoped)
+    - Windows: C:\\Users\\<user>\\AppData\\Local\\Temp
+    """
+    import tempfile
+    from pathlib import Path
+    return Path(tempfile.gettempdir()) / "orchestratia-uploads"
 
 
 async def _process_pending_upload(
@@ -231,13 +240,14 @@ async def _process_pending_upload(
     upload_id = item.get("upload_id")
     filename = item.get("filename") or "file"
     download_url = item.get("download_url") or ""
-    dest_path_hint = item.get("dest_path") or f"{UPLOAD_DEST_DIR}/{filename}"
     expected_sha = item.get("sha256")
 
     if not upload_id or not download_url:
         return
 
-    dest = Path(dest_path_hint)
+    # Always compute dest locally — never trust hub's hint (hub sends a
+    # /tmp/... path that doesn't exist on Windows).
+    dest = _upload_dest_dir() / filename
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
     except Exception as e:

@@ -322,6 +322,46 @@ if check_command codex; then
     else
         warn "Could not download Codex SKILL.md"
     fi
+
+    # Enable codex_hooks feature flag in config.toml (idempotent).
+    CODEX_CONFIG="$HOME/.codex/config.toml"
+    if [ -f "$CODEX_CONFIG" ]; then
+        grep -q "codex_hooks" "$CODEX_CONFIG" 2>/dev/null || \
+            printf '\n[features]\ncodex_hooks = true\n' >> "$CODEX_CONFIG"
+    else
+        printf '[features]\ncodex_hooks = true\n' > "$CODEX_CONFIG"
+    fi
+
+    # Write hooks.json (Codex uses a separate file, not settings.json).
+    # Idempotent: skip if orchestratia entries already exist.
+    CODEX_HOOKS="$HOME/.codex/hooks.json"
+    if [ -f "$CODEX_HOOKS" ] && grep -q "orchestratia" "$CODEX_HOOKS" 2>/dev/null; then
+        ok "Codex CLI hooks already configured"
+    else
+        if python3 - "$CODEX_HOOKS" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD" <<'PYEOF' >/dev/null 2>&1
+import json, os, sys
+path, context_cmd, pretool_cmd = sys.argv[1:4]
+data = {
+    "hooks": {
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": context_cmd, "timeout": 10000}]}
+        ],
+        "PreToolUse": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": pretool_cmd, "timeout": 30000}]}
+        ]
+    }
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+PYEOF
+        then
+            ok "Codex CLI hooks configured (feature flag enabled)"
+        else
+            warn "Could not configure Codex CLI hooks"
+        fi
+    fi
 fi
 
 CONFIGURED=""; AVAILABLE=""

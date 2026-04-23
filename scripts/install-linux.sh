@@ -484,6 +484,10 @@ if sudo -u "$RUN_USER" bash -lc 'command -v gemini >/dev/null 2>&1'; then
 fi
 
 # ── Codex CLI ──
+# Codex uses a TOML config + separate hooks.json, not the
+# settings.json pattern used by Claude/Gemini. The feature flag
+# `codex_hooks = true` must be enabled in config.toml for hook events
+# to actually fire.
 if sudo -u "$RUN_USER" bash -lc 'command -v codex >/dev/null 2>&1'; then
     CODEX_DETECTED=true
     CODEX_SKILL_DIR="${RUN_HOME}/.codex/skills/orchestratia"
@@ -494,6 +498,47 @@ if sudo -u "$RUN_USER" bash -lc 'command -v codex >/dev/null 2>&1'; then
         ok "Codex CLI skill installed"
     else
         warn "Could not download Codex SKILL.md"
+    fi
+
+    # Enable codex_hooks feature flag in config.toml (idempotent).
+    CODEX_CONFIG="${RUN_HOME}/.codex/config.toml"
+    if sudo -u "$RUN_USER" test -f "$CODEX_CONFIG"; then
+        if ! sudo -u "$RUN_USER" grep -q "codex_hooks" "$CODEX_CONFIG" 2>/dev/null; then
+            sudo -u "$RUN_USER" bash -c "printf '\n[features]\ncodex_hooks = true\n' >> '$CODEX_CONFIG'"
+        fi
+    else
+        sudo -u "$RUN_USER" bash -c "printf '[features]\ncodex_hooks = true\n' > '$CODEX_CONFIG'"
+    fi
+
+    # Write hooks.json (Codex reads a separate file, not settings.json).
+    # Idempotent: skip the write if orchestratia entries already exist.
+    CODEX_HOOKS="${RUN_HOME}/.codex/hooks.json"
+    if sudo -u "$RUN_USER" test -f "$CODEX_HOOKS" && sudo -u "$RUN_USER" grep -q "orchestratia" "$CODEX_HOOKS" 2>/dev/null; then
+        ok "Codex CLI hooks already configured"
+    else
+        if sudo -u "$RUN_USER" python3 - "$CODEX_HOOKS" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD" <<'PYEOF' >/dev/null 2>&1
+import json, os, sys
+path, context_cmd, pretool_cmd = sys.argv[1:4]
+data = {
+    "hooks": {
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": context_cmd, "timeout": 10000}]}
+        ],
+        "PreToolUse": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": pretool_cmd, "timeout": 30000}]}
+        ]
+    }
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+PYEOF
+        then
+            ok "Codex CLI hooks configured (feature flag enabled)"
+        else
+            warn "Could not configure Codex CLI hooks"
+        fi
     fi
 fi
 

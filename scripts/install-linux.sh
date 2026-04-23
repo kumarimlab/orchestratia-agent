@@ -284,12 +284,17 @@ else
     fi
 fi
 
-if check_command claude; then
-    CLAUDE_VER=$(claude --version 2>/dev/null || echo "installed")
+# Claude Code is typically installed per-user via npm install -g --prefix
+# ~/.npm-global, which puts it in ~/.npm-global/bin/. The installer runs
+# as root via sudo and doesn't see those user-level PATH entries. Shell
+# out as the target user with a login shell so .bashrc/.profile are
+# sourced and ~/.npm-global/bin is picked up.
+if sudo -u "$RUN_USER" bash -lc 'command -v claude >/dev/null 2>&1'; then
+    CLAUDE_VER=$(sudo -u "$RUN_USER" bash -lc 'claude --version 2>/dev/null' || echo "installed")
     ok "Claude Code ${CLAUDE_VER}"
 else
-    warn "Claude Code CLI not found in PATH"
-    info "Install: npm install -g @anthropic-ai/claude-code && claude auth login"
+    warn "Claude Code CLI not found in ${RUN_USER}'s PATH"
+    info "Install: sudo -u ${RUN_USER} npm install -g @anthropic-ai/claude-code && claude auth login"
 fi
 
 # Step 3: Install package
@@ -461,12 +466,38 @@ REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 # Ensure the asset tree exists and is fresh at /opt/orchestratia-agent.
 # On a fresh box: clone. On an existing install: fetch + hard reset so
 # the tree matches origin/main regardless of local state.
+#
+# Git 2.35+ has a "dubious ownership" safety check that refuses to
+# operate on a repo whose dir is owned by a different user than the
+# caller. Our scripts run as root via sudo but the repo dir was
+# chown'd to $RUN_USER on a previous install — that combination trips
+# the check. Mark the dir safe globally before any git operation.
+if sudo git config --global --get-all safe.directory 2>/dev/null | grep -qx "$INSTALL_DIR" ; then
+    :
+else
+    sudo git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
+fi
+
+git_fetch_reset() {
+    sudo git -C "$INSTALL_DIR" fetch --depth 1 origin main 2>&1 && \
+    sudo git -C "$INSTALL_DIR" reset --hard FETCH_HEAD 2>&1
+}
+
 if [ -d "$INSTALL_DIR/.git" ]; then
-    if sudo git -C "$INSTALL_DIR" fetch --depth 1 origin main >/dev/null 2>&1 && \
-       sudo git -C "$INSTALL_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1; then
+    GIT_OUT=$(git_fetch_reset)
+    if [ $? -eq 0 ]; then
         ok "Asset tree refreshed: $INSTALL_DIR"
     else
-        warn "Could not refresh $INSTALL_DIR from remote"
+        warn "Could not refresh $INSTALL_DIR — falling back to fresh clone"
+        info "Git error: $(echo "$GIT_OUT" | tail -1)"
+        # Re-clone the tree so Step 6 can create valid symlinks even
+        # if the existing checkout is corrupt / ownership-locked.
+        sudo rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        if sudo git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1; then
+            ok "Asset tree re-cloned: $INSTALL_DIR"
+        else
+            fail "git clone fallback also failed for $REPO_URL"
+        fi
     fi
 else
     sudo rm -rf "$INSTALL_DIR" 2>/dev/null || true

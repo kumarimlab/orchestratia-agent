@@ -147,7 +147,11 @@ fi
 step 3 "Installing orchestratia-agent"
 
 info "Installing via pip..."
-if pip3 install -q "$INSTALL_SOURCE" 2>&1; then
+# --upgrade --force-reinstall --no-cache-dir forces a fresh build from
+# git, bypassing pip's wheel cache. Without these, pip reuses a cached
+# wheel keyed by the git URL string, so re-installs never see new
+# versions pushed to main.
+if pip3 install --upgrade --force-reinstall --no-cache-dir -q "$INSTALL_SOURCE" 2>&1; then
     ok "Package installed"
 else
     fail "pip install failed"

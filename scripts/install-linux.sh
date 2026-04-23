@@ -243,10 +243,20 @@ step 3 "Installing orchestratia-agent"
 
 info "Installing via pip..."
 PIP_OUTPUT=""
+# Flags:
+#   --upgrade          — replace an existing install with the new version
+#   --force-reinstall  — reinstall even if the version is already present
+#   --no-cache-dir     — never reuse a wheel from pip's cache. pip caches
+#                        wheels by git URL; if the URL string is the same
+#                        across releases (we use @main), the old wheel
+#                        would be reused and pip would never see the new
+#                        version. This flag guarantees a fresh build.
+PIP_FLAGS="--upgrade --force-reinstall --no-cache-dir -q"
+
 # Try plain install first, then --user, then --break-system-packages (pip 23+/Python 3.11+)
-if PIP_OUTPUT=$(pip3 install -q "$INSTALL_SOURCE" 2>&1); then
+if PIP_OUTPUT=$(pip3 install $PIP_FLAGS "$INSTALL_SOURCE" 2>&1); then
     ok "Package installed"
-elif PIP_OUTPUT=$(pip3 install -q --user "$INSTALL_SOURCE" 2>&1); then
+elif PIP_OUTPUT=$(pip3 install $PIP_FLAGS --user "$INSTALL_SOURCE" 2>&1); then
     ok "Package installed (--user)"
     # Ensure ~/.local/bin is in PATH for this session and the service
     USER_BIN="${RUN_HOME}/.local/bin"
@@ -255,7 +265,7 @@ elif PIP_OUTPUT=$(pip3 install -q --user "$INSTALL_SOURCE" 2>&1); then
         info "Added $USER_BIN to PATH"
     fi
 elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
-     PIP_OUTPUT=$(pip3 install -q --break-system-packages "$INSTALL_SOURCE" 2>&1); then
+     PIP_OUTPUT=$(pip3 install $PIP_FLAGS --break-system-packages "$INSTALL_SOURCE" 2>&1); then
     ok "Package installed (--break-system-packages)"
 else
     fail "pip3 install failed:"

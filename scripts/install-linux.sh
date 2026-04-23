@@ -160,10 +160,20 @@ if [ -d "/opt/orchestratia-agent" ]; then
     sudo rm -rf "/opt/orchestratia-agent" 2>/dev/null && ok "Removed legacy /opt/orchestratia-agent" || warn "Could not remove"
 fi
 
-# Uninstall pip package
+# Uninstall pip package. On newer Debian/Ubuntu the system Python is
+# "externally managed" (PEP 668) so `pip uninstall` refuses without the
+# --break-system-packages flag. Mirror the install fallback chain:
+# plain → --break-system-packages. Either succeeding is fine; if both
+# fail, the subsequent reinstall will overwrite in place.
 if pip3 show orchestratia-agent >/dev/null 2>&1; then
     EXISTING=true
-    pip3 uninstall -y orchestratia-agent >/dev/null 2>&1 && ok "Uninstalled pip package" || warn "Could not uninstall"
+    if pip3 uninstall -y orchestratia-agent >/dev/null 2>&1; then
+        ok "Uninstalled pip package"
+    elif pip3 uninstall -y --break-system-packages orchestratia-agent >/dev/null 2>&1; then
+        ok "Uninstalled pip package"
+    else
+        warn "Could not uninstall — reinstall will overwrite in place"
+    fi
 fi
 
 if [ "$EXISTING" = false ]; then

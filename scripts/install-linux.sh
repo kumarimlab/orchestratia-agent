@@ -37,7 +37,7 @@ STEP_COLOR="${BLUE}"
 CONFIG_DIR="/etc/orchestratia"
 LOG_DIR="/var/log/orchestratia"
 SERVICE_NAME="orchestratia-agent"
-TOTAL_STEPS=5
+TOTAL_STEPS=6
 ERRORS=0
 
 # Install from the public GitHub repo by default (the package is not on
@@ -391,6 +391,121 @@ else
     warn "Service status: ${STATUS}"
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
 fi
+
+# Step 6: AI Agent integration (Claude Code, Gemini CLI, Codex CLI)
+step 6 "Setting up AI agent integrations"
+
+HOOK_DIR="${RUN_HOME}/.orchestratia/agent-skills/hooks"
+REPO_BASE="https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/agent-skills"
+
+# Download shared hook scripts into the user's home so they run as the user.
+sudo -u "$RUN_USER" mkdir -p "$HOOK_DIR"
+if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/hooks/orchestratia-context.sh" -o "$HOOK_DIR/orchestratia-context.sh" 2>/dev/null && \
+   sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/hooks/orchestratia-pretooluse.sh" -o "$HOOK_DIR/orchestratia-pretooluse.sh" 2>/dev/null; then
+    sudo -u "$RUN_USER" chmod +x "$HOOK_DIR/orchestratia-context.sh" "$HOOK_DIR/orchestratia-pretooluse.sh"
+    ok "Hook scripts downloaded"
+else
+    warn "Could not download hook scripts"
+fi
+
+CONTEXT_HOOK_CMD="bash \"$HOOK_DIR/orchestratia-context.sh\""
+PRETOOL_HOOK_CMD="bash \"$HOOK_DIR/orchestratia-pretooluse.sh\""
+
+# Merge hook entries into a JSON settings file. Idempotent — existing
+# orchestratia entries are left alone (detected by substring match).
+# Uses Python via sudo -u so the file is owned by the target user.
+merge_json_hooks() {
+    local path="$1"
+    local session_event="$2"
+    local pretool_event="$3"
+    local context_cmd="$4"
+    local pretool_cmd="$5"
+    sudo -u "$RUN_USER" python3 - "$path" "$session_event" "$pretool_event" "$context_cmd" "$pretool_cmd" <<'PYEOF' >/dev/null 2>&1
+import json, os, sys
+path, session_event, pretool_event, context_cmd, pretool_cmd = sys.argv[1:6]
+settings = {}
+if os.path.exists(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            settings = json.load(f)
+    except Exception:
+        pass
+hooks = settings.setdefault('hooks', {})
+for event, cmd in [(session_event, context_cmd), (pretool_event, pretool_cmd)]:
+    event_list = hooks.setdefault(event, [])
+    if not any('orchestratia' in str(e) for e in event_list):
+        event_list.append({'hooks': [{'type': 'command', 'command': cmd, 'timeout': 10000 if 'context' in cmd else 30000}]})
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+PYEOF
+    return $?
+}
+
+CLAUDE_DETECTED=false
+GEMINI_DETECTED=false
+CODEX_DETECTED=false
+
+# ── Claude Code ──
+if sudo -u "$RUN_USER" bash -lc 'command -v claude >/dev/null 2>&1'; then
+    CLAUDE_DETECTED=true
+    CLAUDE_SKILL_DIR="${RUN_HOME}/.claude/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$CLAUDE_SKILL_DIR" "${RUN_HOME}/.claude"
+    if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/claude/SKILL.md" -o "$CLAUDE_SKILL_DIR/SKILL.md" 2>/dev/null; then
+        ok "Claude Code skill installed"
+    else
+        warn "Could not download Claude SKILL.md"
+    fi
+    if merge_json_hooks "${RUN_HOME}/.claude/settings.json" "SessionStart" "PreToolUse" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD"; then
+        ok "Claude Code hooks configured"
+    else
+        warn "Could not configure Claude Code hooks"
+    fi
+fi
+
+# ── Gemini CLI ──
+if sudo -u "$RUN_USER" bash -lc 'command -v gemini >/dev/null 2>&1'; then
+    GEMINI_DETECTED=true
+    GEMINI_SKILL_DIR="${RUN_HOME}/.gemini/skills/orchestratia"
+    SHARED_SKILL_DIR="${RUN_HOME}/.agents/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$GEMINI_SKILL_DIR" "$SHARED_SKILL_DIR" "${RUN_HOME}/.gemini"
+    if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/gemini/SKILL.md" -o "$GEMINI_SKILL_DIR/SKILL.md" 2>/dev/null; then
+        sudo -u "$RUN_USER" cp -f "$GEMINI_SKILL_DIR/SKILL.md" "$SHARED_SKILL_DIR/SKILL.md" 2>/dev/null || true
+        ok "Gemini CLI skill installed"
+    else
+        warn "Could not download Gemini SKILL.md"
+    fi
+    if merge_json_hooks "${RUN_HOME}/.gemini/settings.json" "SessionStart" "BeforeTool" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD"; then
+        ok "Gemini CLI hooks configured"
+    else
+        warn "Could not configure Gemini CLI hooks"
+    fi
+fi
+
+# ── Codex CLI ──
+if sudo -u "$RUN_USER" bash -lc 'command -v codex >/dev/null 2>&1'; then
+    CODEX_DETECTED=true
+    CODEX_SKILL_DIR="${RUN_HOME}/.codex/skills/orchestratia"
+    SHARED_SKILL_DIR="${RUN_HOME}/.agents/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$CODEX_SKILL_DIR" "$SHARED_SKILL_DIR" "${RUN_HOME}/.codex"
+    if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/codex/SKILL.md" -o "$CODEX_SKILL_DIR/SKILL.md" 2>/dev/null; then
+        sudo -u "$RUN_USER" cp -f "$CODEX_SKILL_DIR/SKILL.md" "$SHARED_SKILL_DIR/SKILL.md" 2>/dev/null || true
+        ok "Codex CLI skill installed"
+    else
+        warn "Could not download Codex SKILL.md"
+    fi
+fi
+
+# Summary of detected AI agents — single configured line + single note
+# for what else is supported. Neutral tone, not red for "not installed".
+CONFIGURED=""
+AVAILABLE=""
+[ "$CLAUDE_DETECTED" = true ] && CONFIGURED="${CONFIGURED}${CONFIGURED:+, }Claude Code" || AVAILABLE="${AVAILABLE}${AVAILABLE:+, }Claude Code"
+[ "$GEMINI_DETECTED" = true ] && CONFIGURED="${CONFIGURED}${CONFIGURED:+, }Gemini CLI"  || AVAILABLE="${AVAILABLE}${AVAILABLE:+, }Gemini CLI"
+[ "$CODEX_DETECTED"  = true ] && CONFIGURED="${CONFIGURED}${CONFIGURED:+, }Codex CLI"   || AVAILABLE="${AVAILABLE}${AVAILABLE:+, }Codex CLI"
+[ -n "$CONFIGURED" ] && ok "Configured: ${CONFIGURED}"
+[ -n "$AVAILABLE" ]  && echo -e "     ${DIM}- Also supported (install separately if needed): ${AVAILABLE}${NC}"
 
 # ── Summary ─────────────────────────────────────────────────────────
 

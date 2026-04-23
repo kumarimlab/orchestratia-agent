@@ -289,7 +289,7 @@ if ($build -ge 17763) {
     Write-Warn "Windows build $build — ConPTY requires build 17763+ (Windows 10 1809)"
 }
 
-Write-Info "Downloading from: $ReleaseUrl"
+Write-Info "Fetching agent binary…"
 try {
     # If pty-host is running, the exe file is locked. Rename it first.
     if (Test-Path $AgentExePath) {

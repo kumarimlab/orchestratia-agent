@@ -94,8 +94,22 @@ fi
 
 if pip3 show orchestratia-agent >/dev/null 2>&1; then
     EXISTING=true
-    pip3 uninstall -y orchestratia-agent >/dev/null 2>&1 && ok "Uninstalled pip package" || warn "Could not uninstall"
+    if pip3 uninstall -y orchestratia-agent >/dev/null 2>&1; then
+        ok "Uninstalled pip package"
+    elif pip3 uninstall -y --break-system-packages orchestratia-agent >/dev/null 2>&1; then
+        ok "Uninstalled pip package"
+    else
+        warn "Could not uninstall — reinstall will overwrite"
+    fi
 fi
+
+# Clean up stale entry-point scripts that may have been left behind by
+# previous partial installs or by pip install --user runs. This prevents
+# a ghost binary from shadowing the new one via PATH ordering.
+for bin in orchestratia-agent orchestratia orchestratia-connect; do
+    rm -f "/usr/local/bin/$bin" "/opt/homebrew/bin/$bin" 2>/dev/null || true
+    [ -n "${HOME:-}" ] && rm -f "$HOME/.local/bin/$bin" 2>/dev/null || true
+done
 
 [ "$EXISTING" = false ] && ok "No existing installation found"
 

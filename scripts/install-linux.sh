@@ -160,21 +160,56 @@ if [ -d "/opt/orchestratia-agent" ]; then
     sudo rm -rf "/opt/orchestratia-agent" 2>/dev/null && ok "Removed legacy /opt/orchestratia-agent" || warn "Could not remove"
 fi
 
-# Uninstall pip package. On newer Debian/Ubuntu the system Python is
-# "externally managed" (PEP 668) so `pip uninstall` refuses without the
-# --break-system-packages flag. Mirror the install fallback chain:
-# plain → --break-system-packages. Either succeeding is fine; if both
-# fail, the subsequent reinstall will overwrite in place.
-if pip3 show orchestratia-agent >/dev/null 2>&1; then
-    EXISTING=true
-    if pip3 uninstall -y orchestratia-agent >/dev/null 2>&1; then
-        ok "Uninstalled pip package"
-    elif pip3 uninstall -y --break-system-packages orchestratia-agent >/dev/null 2>&1; then
-        ok "Uninstalled pip package"
+# Uninstall pip package. Check BOTH locations:
+#   (1) System site-packages (what `sudo pip3` sees)
+#   (2) The real user's site-packages (~/.local). The script runs as
+#       root via sudo, so its default pip context is root's, not the
+#       target user's. If a previous install used `pip install --user`,
+#       it lives under ~/.local/ and stays invisible to `sudo pip3
+#       show` — yet ~/.local/bin is typically earlier in PATH than
+#       /usr/local/bin, so the old user-level binary shadows the new
+#       system install. This was the cause of "fresh install reports
+#       old version" reports.
+# Also clean up orphan entry-point scripts that some pip versions
+# leave behind after a failed/partial uninstall.
+
+uninstall_pip() {
+    # $1 = user context ("root" or target username), rest = pip flags
+    local user="$1"; shift
+    local flags="$*"
+    if [ "$user" = "root" ]; then
+        pip3 uninstall -y $flags orchestratia-agent >/dev/null 2>&1
     else
-        warn "Could not uninstall — reinstall will overwrite in place"
+        sudo -u "$user" pip3 uninstall -y $flags orchestratia-agent >/dev/null 2>&1
     fi
-fi
+}
+
+for ctx in "root" "$RUN_USER"; do
+    # Does this context have the package installed?
+    if [ "$ctx" = "root" ]; then
+        HAS=$(pip3 show orchestratia-agent >/dev/null 2>&1 && echo y || echo n)
+    else
+        HAS=$(sudo -u "$ctx" pip3 show orchestratia-agent >/dev/null 2>&1 && echo y || echo n)
+    fi
+    if [ "$HAS" = "y" ]; then
+        EXISTING=true
+        if uninstall_pip "$ctx"; then
+            ok "Uninstalled pip package ($ctx)"
+        elif uninstall_pip "$ctx" "--break-system-packages"; then
+            ok "Uninstalled pip package ($ctx)"
+        else
+            warn "Could not uninstall ($ctx) — reinstall will overwrite"
+        fi
+    fi
+done
+
+# Remove any lingering entry-point scripts from either location. Safe
+# if they don't exist. This prevents a ghost `~/.local/bin/orchestratia-agent`
+# from winning PATH resolution after pip uninstall.
+for bin in orchestratia-agent orchestratia orchestratia-connect; do
+    rm -f "/usr/local/bin/$bin" 2>/dev/null || true
+    [ -n "$RUN_HOME" ] && rm -f "$RUN_HOME/.local/bin/$bin" 2>/dev/null || true
+done
 
 if [ "$EXISTING" = false ]; then
     ok "No existing installation found"
@@ -253,24 +288,21 @@ PIP_OUTPUT=""
 #                        version. This flag guarantees a fresh build.
 PIP_FLAGS="--upgrade --force-reinstall --no-cache-dir -q"
 
-# Try plain install first, then --user, then --break-system-packages (pip 23+/Python 3.11+)
+# Always install system-wide (under /usr/local) so the binary is on a
+# PATH the systemd service (which runs as $RUN_USER) can reach. We
+# deliberately skip --user here: when the script runs as root via sudo,
+# --user would put files in /root/.local, which is never what anyone
+# wants. If plain install fails due to PEP 668, fall back to
+# --break-system-packages (the same flag the uninstall step uses).
 if PIP_OUTPUT=$(pip3 install $PIP_FLAGS "$INSTALL_SOURCE" 2>&1); then
     ok "Package installed"
-elif PIP_OUTPUT=$(pip3 install $PIP_FLAGS --user "$INSTALL_SOURCE" 2>&1); then
-    ok "Package installed (--user)"
-    # Ensure ~/.local/bin is in PATH for this session and the service
-    USER_BIN="${RUN_HOME}/.local/bin"
-    if [ -d "$USER_BIN" ] && [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
-        export PATH="$USER_BIN:$PATH"
-        info "Added $USER_BIN to PATH"
-    fi
 elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
      PIP_OUTPUT=$(pip3 install $PIP_FLAGS --break-system-packages "$INSTALL_SOURCE" 2>&1); then
     ok "Package installed (--break-system-packages)"
 else
     fail "pip3 install failed:"
     echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
-    info "Try manually: pip3 install --user $INSTALL_SOURCE"
+    info "Try manually: sudo pip3 install --break-system-packages $INSTALL_SOURCE"
     fatal "Cannot proceed without the agent package."
 fi
 

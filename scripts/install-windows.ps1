@@ -93,25 +93,37 @@ function Write-Step($Num, $Total, $Title) {
 }
 
 function Write-Ok($Msg) {
-    Write-Host "     + " -ForegroundColor Green -NoNewline
+    Write-Host "     " -NoNewline
+    Write-Host "[OK] " -ForegroundColor Green -NoNewline
     Write-Host $Msg
 }
 
 function Write-Warn($Msg) {
-    Write-Host "     ! " -ForegroundColor Yellow -NoNewline
+    Write-Host "     " -NoNewline
+    Write-Host "[!]  " -ForegroundColor Yellow -NoNewline
     Write-Host $Msg -ForegroundColor Yellow
     $script:Errors++
 }
 
 function Write-Fail($Msg) {
-    Write-Host "     x " -ForegroundColor Red -NoNewline
+    Write-Host "     " -NoNewline
+    Write-Host "[X]  " -ForegroundColor Red -NoNewline
     Write-Host $Msg -ForegroundColor Red
     $script:Errors++
 }
 
 function Write-Info($Msg) {
-    Write-Host "     > " -ForegroundColor Cyan -NoNewline
-    Write-Host $Msg
+    Write-Host "     " -NoNewline
+    Write-Host "..   " -ForegroundColor DarkGray -NoNewline
+    Write-Host $Msg -ForegroundColor DarkGray
+}
+
+function Write-Note($Msg) {
+    # Neutral informational — not success, not warning. For "already present"
+    # type messages so users don't read them as problems.
+    Write-Host "     " -NoNewline
+    Write-Host "[-]  " -ForegroundColor DarkGray -NoNewline
+    Write-Host $Msg -ForegroundColor DarkGray
 }
 
 function Write-Fatal($Msg) {
@@ -158,7 +170,7 @@ if ($runningProcs) {
             $cmdLine = if ($wmiProc) { $wmiProc.CommandLine } else { "" }
             if ($cmdLine -match "--pty-host") {
                 $preserved++
-                Write-Info "Preserving pty-host process (PID $($p.Id)) — sessions stay alive"
+                Write-Note "Preserving session daemon — your terminals stay alive"
             } else {
                 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
                 $killed++
@@ -170,8 +182,8 @@ if ($runningProcs) {
         }
     }
     Start-Sleep -Seconds 1
-    if ($killed -gt 0) { Write-Ok "Killed $killed agent process(es)" }
-    if ($preserved -gt 0) { Write-Ok "Preserved $preserved pty-host process(es) (sessions intact)" }
+    if ($killed -gt 0) { Write-Ok "Stopped previous agent" }
+    if ($preserved -gt 0) { Write-Note "Live sessions preserved" }
 }
 
 # 1b. Also kill any python-based agent (pip install runs as python.exe)
@@ -285,7 +297,7 @@ try {
         Remove-Item $oldExe -Force -ErrorAction SilentlyContinue
         try {
             Rename-Item $AgentExePath $oldExe -Force -ErrorAction Stop
-            Write-Ok "Renamed old exe (pty-host keeps running with in-memory copy)"
+            Write-Note "Preparing to replace previous agent"
         } catch {
             # Can't rename — try direct overwrite (works if no pty-host running)
             Remove-Item $AgentExePath -Force -ErrorAction SilentlyContinue
@@ -460,16 +472,16 @@ try {
 
     # Start it now
     Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Write-Info "Waiting for agent + pty-host to initialize..."
+    Write-Info "Starting agent…"
     Start-Sleep -Seconds 5
 
     # Verify agent processes are running
     $agentProcs = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
     if ($agentProcs -and $agentProcs.Count -ge 2) {
-        Write-Ok "Agent is running ($($agentProcs.Count) processes — agent + pty-host)"
+        Write-Ok "Agent running"
     } elseif ($agentProcs) {
-        Write-Ok "Agent is running (PID: $($agentProcs[0].Id))"
-        Write-Warn "Only $($agentProcs.Count) process — pty-host may not have started yet"
+        Write-Ok "Agent running"
+        Write-Warn "Session daemon may still be starting"
     } else {
         Write-Warn "Agent may not be running — check logs"
     }
@@ -477,10 +489,9 @@ try {
     # Verify pty-host is listening on TCP
     $ptyHostUp = Test-NetConnection -ComputerName 127.0.0.1 -Port 19199 -InformationLevel Quiet -WarningAction SilentlyContinue
     if ($ptyHostUp) {
-        Write-Ok "PTY host listening on port 19199 (sessions will persist)"
+        Write-Ok "Session daemon ready"
     } else {
-        Write-Warn "PTY host not detected on port 19199"
-        Write-Info "Check logs: Get-Content $LogDir\pty-host.log -Tail 20"
+        Write-Warn "Session daemon not yet ready — logs: $LogDir\pty-host.log"
     }
 } catch {
     Write-Warn "Register-ScheduledTask failed: $_"
@@ -503,19 +514,19 @@ try {
 
             # Start it now
             schtasks.exe /Run /TN $TaskName 2>$null
-            Write-Info "Waiting for agent + pty-host to initialize..."
+            Write-Info "Starting agent…"
             Start-Sleep -Seconds 5
             $proc = Get-Process -Name "orchestratia-agent" -ErrorAction SilentlyContinue
             if ($proc) {
-                Write-Ok "Agent is running (PID: $($proc.Id))"
+                Write-Ok "Agent running"
             } else {
                 Write-Warn "Agent may not be running — check logs"
             }
             $ptyHostUp = Test-NetConnection -ComputerName 127.0.0.1 -Port 19199 -InformationLevel Quiet -WarningAction SilentlyContinue
             if ($ptyHostUp) {
-                Write-Ok "PTY host listening on port 19199 (sessions will persist)"
+                Write-Ok "Session daemon ready"
             } else {
-                Write-Warn "PTY host not detected on port 19199"
+                Write-Warn "Session daemon not yet ready"
             }
         } else {
             Write-Fail "schtasks.exe also failed: $result"
@@ -685,27 +696,17 @@ if ($CodexDetected) {
 
 # ── Agent detection summary ──
 Write-Host ""
-Write-Info "Agent Detection:"
-if ($ClaudeDetected) {
-    Write-Ok "Claude Code  - skill + hooks configured"
-} else {
-    Write-Host "     x " -ForegroundColor Red -NoNewline
-    Write-Host "Claude Code  - not found. Install it, then run: " -NoNewline
-    Write-Host "orchestratia setup --agent claude" -ForegroundColor Cyan
+$configured = @()
+$available = @()
+if ($ClaudeDetected) { $configured += "Claude Code" } else { $available += "Claude Code" }
+if ($GeminiDetected) { $configured += "Gemini CLI" }  else { $available += "Gemini CLI" }
+if ($CodexDetected)  { $configured += "Codex CLI" }   else { $available += "Codex CLI" }
+
+if ($configured.Count -gt 0) {
+    Write-Ok ("Configured: " + ($configured -join ", "))
 }
-if ($GeminiDetected) {
-    Write-Ok "Gemini CLI   - skill + hooks configured"
-} else {
-    Write-Host "     x " -ForegroundColor Red -NoNewline
-    Write-Host "Gemini CLI   - not found. Install it, then run: " -NoNewline
-    Write-Host "orchestratia setup --agent gemini" -ForegroundColor Cyan
-}
-if ($CodexDetected) {
-    Write-Ok "Codex CLI    - skill + hooks + feature flag configured"
-} else {
-    Write-Host "     x " -ForegroundColor Red -NoNewline
-    Write-Host "Codex CLI    - not found. Install it, then run: " -NoNewline
-    Write-Host "orchestratia setup --agent codex" -ForegroundColor Cyan
+if ($available.Count -gt 0) {
+    Write-Note ("Also supported (install separately if needed): " + ($available -join ", "))
 }
 
 # ── Summary ──────────────────────────────────────────────────────────
@@ -713,27 +714,18 @@ if ($CodexDetected) {
 Write-Host ""
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 if ($Errors -eq 0) {
-    Write-Host "  Installation complete — no errors" -ForegroundColor Green
+    Write-Host "  Installation complete" -ForegroundColor Green
 } else {
     Write-Host "  Installation finished with $Errors warning(s)" -ForegroundColor Yellow
 }
 Write-Host ""
-Write-Host "  Installed to: $AgentExePath" -ForegroundColor DarkGray
+Write-Host "  Next steps:" -ForegroundColor White
+Write-Host "    1. Open your dashboard at " -NoNewline -ForegroundColor DarkGray
+Write-Host "https://orchestratia.com" -ForegroundColor Cyan
+Write-Host "    2. Your agent is running and sessions will auto-persist" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "  Sessions persist across agent restarts and reinstalls." -ForegroundColor DarkGray
-Write-Host "  The pty-host process owns sessions independently." -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  Useful commands:" -ForegroundColor DarkGray
-Write-Host "    CLI:      orchestratia status"
-Write-Host "    Tasks:    orchestratia task check"
-Write-Host "    Skill:    /orchestratia (inside Claude Code)"
-Write-Host "    Version:  orchestratia-agent --version"
-Write-Host "    Test PTY: orchestratia-agent --test-pty"
-Write-Host "    Status:   schtasks /Query /TN OrchestratiAgent"
-Write-Host "    Start:    schtasks /Run /TN OrchestratiAgent"
-Write-Host "    Stop:     schtasks /End /TN OrchestratiAgent"
-Write-Host "    Logs:     Get-Content $LogDir\pty-host.log -Wait"
-Write-Host ""
+Write-Host "  Commands:  " -NoNewline -ForegroundColor DarkGray
+Write-Host "orchestratia status  |  orchestratia --help" -ForegroundColor Cyan
 Write-Host "──────────────────────────────────────────────────" -ForegroundColor White
 Write-Host ""
 

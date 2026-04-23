@@ -220,13 +220,28 @@ async def heartbeat_loop(client: httpx.AsyncClient, state: DaemonState):
 def _upload_dest_dir() -> "Path":
     """Return the per-OS directory for browser-initiated uploads.
 
-    Uses tempfile.gettempdir() so we get the right root on every OS:
-    - Linux: /tmp
-    - macOS: /var/folders/... (user-scoped)
-    - Windows: C:\\Users\\<user>\\AppData\\Local\\Temp
+    - Linux:   /tmp/orchestratia-uploads
+    - macOS:   /var/folders/.../orchestratia-uploads (tempfile.gettempdir())
+    - Windows: %USERPROFILE%\\Orchestratia\\uploads
+
+    On Windows we deliberately avoid %TEMP% because it lives under
+    AppData\\Local\\Temp (hidden by default in File Explorer, 8.3
+    short-names like ABHISH~1) which looks unfamiliar even though it's
+    the standard temp dir. %USERPROFILE%\\Orchestratia\\uploads is
+    visible in Explorer, has no short-names, and matches the "product
+    files in user profile" pattern used by apps like Discord/Slack.
     """
+    import sys
     import tempfile
     from pathlib import Path
+
+    if sys.platform == "win32":
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            return Path(user_profile) / "Orchestratia" / "uploads"
+        # Fallback if USERPROFILE isn't set (very unusual)
+        return Path(tempfile.gettempdir()) / "orchestratia-uploads"
+
     return Path(tempfile.gettempdir()) / "orchestratia-uploads"
 
 

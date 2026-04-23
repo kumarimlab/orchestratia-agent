@@ -212,17 +212,15 @@ fi
 echo ""
 echo -e "${BOLD}──────────────────────────────────────────────────${NC}"
 if [ "$ERRORS" -eq 0 ]; then
-    echo -e "  ${GREEN}${BOLD}✓ Installation complete — no errors${NC}"
+    echo -e "  ${GREEN}${BOLD}Installation complete${NC}"
 else
-    echo -e "  ${YELLOW}${BOLD}! Installation finished with ${ERRORS} warning(s)${NC}"
+    echo -e "  ${YELLOW}${BOLD}Installation finished with ${ERRORS} warning(s)${NC}"
 fi
 echo ""
-echo -e "  ${DIM}Useful commands:${NC}"
-echo -e "    Logs:     tail -f ${LOG_DIR}/agent.log"
-echo -e "    Errors:   tail -f ${LOG_DIR}/agent.err"
-echo -e "    Stop:     launchctl unload ${PLIST_PATH}"
-echo -e "    Start:    launchctl load ${PLIST_PATH}"
-echo -e "    Restart:  launchctl unload ${PLIST_PATH} && launchctl load ${PLIST_PATH}"
+echo -e "  ${BOLD}Next steps:${NC}"
+echo -e "    1. Open your dashboard at ${CYAN}https://orchestratia.com${NC}"
+echo -e "    2. Your agent is running and reporting to the hub"
 echo ""
+echo -e "  ${DIM}Commands:${NC}  ${CYAN}orchestratia status${NC}  ${DIM}|${NC}  ${CYAN}launchctl list | grep orchestratia${NC}"
 echo -e "${BOLD}──────────────────────────────────────────────────${NC}"
 echo ""

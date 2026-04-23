@@ -332,23 +332,17 @@ echo -e "${BOLD}─────────────────────�
 
 if [ "$ERRORS" -eq 0 ]; then
     echo ""
-    echo -e "  ${GREEN}${BOLD}✓ Installation complete — no errors${NC}"
-    echo ""
-    echo -e "  ${DIM}The agent is running and reporting to the hub.${NC}"
-    echo -e "  ${DIM}Check the dashboard to see it online.${NC}"
+    echo -e "  ${GREEN}${BOLD}Installation complete${NC}"
 else
     echo ""
-    echo -e "  ${YELLOW}${BOLD}! Installation finished with ${ERRORS} warning(s)${NC}"
-    echo ""
-    echo -e "  ${DIM}Review the warnings above. The agent may still work.${NC}"
+    echo -e "  ${YELLOW}${BOLD}Installation finished with ${ERRORS} warning(s)${NC}"
 fi
 
 echo ""
-echo -e "  ${DIM}Useful commands:${NC}"
-echo -e "    Status:   sudo systemctl status ${SERVICE_NAME}"
-echo -e "    Logs:     sudo journalctl -u ${SERVICE_NAME} -f"
-echo -e "    Restart:  sudo systemctl restart ${SERVICE_NAME}"
-echo -e "    Stop:     sudo systemctl stop ${SERVICE_NAME}"
+echo -e "  ${BOLD}Next steps:${NC}"
+echo -e "    1. Open your dashboard at ${CYAN}https://orchestratia.com${NC}"
+echo -e "    2. Your agent is running and reporting to the hub"
 echo ""
+echo -e "  ${DIM}Commands:${NC}  ${CYAN}orchestratia status${NC}  ${DIM}|${NC}  ${CYAN}sudo systemctl status ${SERVICE_NAME}${NC}"
 echo -e "${BOLD}──────────────────────────────────────────────────${NC}"
 echo ""

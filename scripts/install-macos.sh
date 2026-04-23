@@ -161,11 +161,19 @@ fi
 step 3 "Installing orchestratia-agent"
 
 info "Installing via pip..."
-# --upgrade --force-reinstall --no-cache-dir forces a fresh build from
-# git, bypassing pip's wheel cache. Without these, pip reuses a cached
-# wheel keyed by the git URL string, so re-installs never see new
-# versions pushed to main.
-if pip3 install --upgrade --force-reinstall --no-cache-dir -q "$INSTALL_SOURCE" 2>&1; then
+# Two-pass install:
+#   Pass 1 (upgrade, no force): installs/upgrades target + missing deps.
+#   Pass 2 (force-reinstall, no-deps): re-installs just our package from
+#     fresh git, leaving deps alone. Needed because pip caches wheels
+#     by git URL; without this, @main would reuse a stale wheel.
+#
+# --no-deps on Pass 2 is critical on platforms where some deps were
+# installed by the system package manager without pip RECORD metadata
+# (Debian apt, in certain Homebrew paths). --force-reinstall without
+# --no-deps tries to uninstall them and fails with
+# "Cannot uninstall <pkg>, RECORD file not found".
+if pip3 install --upgrade --no-cache-dir -q "$INSTALL_SOURCE" 2>&1 && \
+   pip3 install --force-reinstall --no-deps --no-cache-dir -q "$INSTALL_SOURCE" 2>&1; then
     ok "Package installed"
 else
     fail "pip install failed"

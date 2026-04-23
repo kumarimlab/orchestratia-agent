@@ -297,27 +297,52 @@ step 3 "Installing orchestratia-agent"
 
 info "Installing via pip..."
 PIP_OUTPUT=""
-# Flags:
-#   --upgrade          — replace an existing install with the new version
-#   --force-reinstall  — reinstall even if the version is already present
-#   --no-cache-dir     — never reuse a wheel from pip's cache. pip caches
-#                        wheels by git URL; if the URL string is the same
-#                        across releases (we use @main), the old wheel
-#                        would be reused and pip would never see the new
-#                        version. This flag guarantees a fresh build.
-PIP_FLAGS="--upgrade --force-reinstall --no-cache-dir -q"
+# Two-pass install to handle a specific Debian/Ubuntu gotcha:
+#
+#   Pass 1 (--upgrade, no force): installs/upgrades the target and any
+#     missing deps. If deps are already satisfied (including apt-provided
+#     ones like python3-yaml), pip happily leaves them alone.
+#
+#   Pass 2 (--force-reinstall --no-deps): reinstalls JUST our package
+#     from fresh git, leaving deps untouched. This is what we need on
+#     re-install — pip caches wheels by git URL so without
+#     --force-reinstall it would skip when the version string hasn't
+#     changed even though main has new commits.
+#
+# Why not --force-reinstall in one shot? Because --force-reinstall
+# cascades to deps. On Debian/Ubuntu where pip-visible metadata for
+# apt-installed packages lacks a RECORD file, the uninstall step of
+# --force-reinstall fails:
+#   "Cannot uninstall PyYAML 6.0.1, RECORD file not found.
+#    Hint: The package was installed by debian."
+# --no-deps on the force-reinstall pass sidesteps that entirely.
+#
+# --no-cache-dir on both passes because pip caches the built wheel by
+# git URL; without this flag, Pass 2 would reuse a stale cached wheel
+# and never see new commits to main.
 
-# Always install system-wide (under /usr/local) so the binary is on a
-# PATH the systemd service (which runs as $RUN_USER) can reach. We
-# deliberately skip --user here: when the script runs as root via sudo,
-# --user would put files in /root/.local, which is never what anyone
-# wants. If plain install fails due to PEP 668, fall back to
-# --break-system-packages (the same flag the uninstall step uses).
-if PIP_OUTPUT=$(pip3 install $PIP_FLAGS "$INSTALL_SOURCE" 2>&1); then
+PIP_BASE="--upgrade --no-cache-dir -q"
+PIP_FORCE="--force-reinstall --no-deps --no-cache-dir -q"
+
+# Always install system-wide. We deliberately skip --user here: when
+# the script runs as root via sudo, --user would put files in
+# /root/.local, which is never what anyone wants. If plain install
+# fails due to PEP 668, fall back to --break-system-packages.
+pip_install() {
+    # $1 = flag-group variable name; pass "$INSTALL_SOURCE" as the last arg
+    local flags="$1"
+    if PIP_OUTPUT=$(pip3 install $flags "$INSTALL_SOURCE" 2>&1); then
+        return 0
+    elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
+         PIP_OUTPUT=$(pip3 install $flags --break-system-packages "$INSTALL_SOURCE" 2>&1); then
+        return 0
+    else
+        return 1
+    fi
+}
+
+if pip_install "$PIP_BASE" && pip_install "$PIP_FORCE"; then
     ok "Package installed"
-elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
-     PIP_OUTPUT=$(pip3 install $PIP_FLAGS --break-system-packages "$INSTALL_SOURCE" 2>&1); then
-    ok "Package installed (--break-system-packages)"
 else
     fail "pip3 install failed:"
     echo -e "     ${DIM}${PIP_OUTPUT}${NC}"

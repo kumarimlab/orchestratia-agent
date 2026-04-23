@@ -138,6 +138,24 @@ step 1 "Removing existing installation (if any)"
 
 EXISTING=false
 
+# CRITICAL: Ensure KillMode=process is set on the live unit BEFORE
+# stopping the service. Default systemd KillMode=control-group kills
+# every process in the cgroup — including tmux sessions spawned by the
+# agent — so a plain `systemctl stop` destroys all live terminals.
+# Earlier versions of install-linux.sh (and some historical .service
+# files shipped outside this script) lacked KillMode=process, so this
+# patch-before-stop step rescues users migrating from those.
+LIVE_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+if [ -f "$LIVE_SERVICE_FILE" ] && ! grep -q "KillMode=process" "$LIVE_SERVICE_FILE" 2>/dev/null; then
+    # Patch the live unit: append KillMode=process into the [Service]
+    # block and reload. The upcoming stop will respect the new value.
+    if sudo grep -q "^\[Service\]" "$LIVE_SERVICE_FILE"; then
+        sudo sed -i '/^\[Service\]/a KillMode=process' "$LIVE_SERVICE_FILE" 2>/dev/null && \
+            sudo systemctl daemon-reload 2>/dev/null && \
+            info "Patched service unit (KillMode=process) to preserve tmux sessions"
+    fi
+fi
+
 if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     EXISTING=true
     sudo systemctl stop "$SERVICE_NAME" 2>/dev/null && ok "Stopped running service" || warn "Could not stop service"
@@ -357,6 +375,8 @@ sudo tee /etc/systemd/system/${SERVICE_NAME}.service >/dev/null <<SERVICEEOF
 Description=Orchestratia Agent Daemon
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -366,6 +386,13 @@ ExecStart=${AGENT_BIN} --config ${CONFIG_DIR}/config.yaml
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
+
+# Only kill the agent process on stop, not its children.
+# tmux sessions spawned by the agent live in the same cgroup but must
+# survive agent restarts — the agent's session-recovery loop re-attaches
+# to orphan tmux sessions on startup. Default KillMode=control-group
+# would kill tmux and destroy all live terminals on every restart.
+KillMode=process
 
 StandardOutput=journal
 StandardError=journal

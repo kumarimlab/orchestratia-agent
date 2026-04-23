@@ -40,8 +40,11 @@ SERVICE_NAME="orchestratia-agent"
 TOTAL_STEPS=5
 ERRORS=0
 
-# Optional: install from git URL instead of PyPI
-INSTALL_SOURCE="${ORCHESTRATIA_INSTALL_SOURCE:-orchestratia-agent}"
+# Install from the public GitHub repo by default (the package is not on
+# PyPI). Users can override with ORCHESTRATIA_INSTALL_SOURCE=<spec> for
+# a custom pip spec (e.g. a fork, a PR branch, a pinned tag, or a local
+# checkout path).
+INSTALL_SOURCE="${ORCHESTRATIA_INSTALL_SOURCE:-git+https://github.com/kumarimlab/orchestratia-agent.git@main}"
 
 # ── Helper functions ────────────────────────────────────────────────
 
@@ -191,6 +194,18 @@ else
         ok "pip3 installed"
     else
         fail "Could not install pip3. Install manually: sudo apt install python3-pip"
+    fi
+fi
+
+# Git is required for pip install from GitHub URL
+if check_command git; then
+    ok "git available"
+else
+    info "git not found, installing..."
+    if sudo apt-get install -y git >/dev/null 2>&1; then
+        ok "git installed"
+    else
+        fatal "Could not install git. Install manually: sudo apt install git"
     fi
 fi
 

@@ -38,7 +38,9 @@ LOG_DIR="$HOME/Library/Logs/Orchestratia"
 TOTAL_STEPS=5
 ERRORS=0
 
-INSTALL_SOURCE="${ORCHESTRATIA_INSTALL_SOURCE:-orchestratia-agent}"
+# Install from the public GitHub repo by default (the package is not on
+# PyPI). Override with ORCHESTRATIA_INSTALL_SOURCE for forks / pinned tags.
+INSTALL_SOURCE="${ORCHESTRATIA_INSTALL_SOURCE:-git+https://github.com/kumarimlab/orchestratia-agent.git@main}"
 
 # ── Helper functions ────────────────────────────────────────────────
 
@@ -116,6 +118,13 @@ if check_command pip3; then
     ok "pip3 available"
 else
     fatal "pip3 not found. Install Python from python.org (includes pip)"
+fi
+
+# Git is required for pip install from GitHub URL (ships with Xcode CLT on macOS)
+if check_command git; then
+    ok "git available"
+else
+    fatal "git not found. Install Xcode Command Line Tools: xcode-select --install"
 fi
 
 if check_command tmux; then

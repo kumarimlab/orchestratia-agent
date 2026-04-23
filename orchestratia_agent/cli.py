@@ -118,11 +118,15 @@ def _api_request(method: str, path: str, data: dict | None = None, base: str = "
     body = json.dumps(data).encode() if data else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
-    # Allow self-signed certs in development
-    ctx = ssl.create_default_context()
-    if HUB_URL.startswith("https://staging.") or HUB_URL.startswith("https://localhost"):
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    # Verify TLS certs against the OS trust store by default. Honor the
+    # shared ORCHESTRATIA_INSECURE_TLS env var. Auto-opt-out for
+    # localhost only (can't get a valid public cert for a loopback name).
+    from orchestratia_agent.tls import build_ssl_context
+    is_localhost = (
+        HUB_URL.startswith("https://localhost")
+        or HUB_URL.startswith("https://127.")
+    )
+    ctx = build_ssl_context(explicit_insecure=True) if is_localhost else build_ssl_context()
 
     try:
         resp = urllib.request.urlopen(req, context=ctx)
@@ -876,10 +880,11 @@ def cmd_agent_status(args):
         "Content-Type": "application/json",
     }
 
-    ctx = ssl.create_default_context()
-    if HUB_URL.startswith("https://staging.") or HUB_URL.startswith("https://localhost"):
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    from orchestratia_agent.tls import build_ssl_context
+    is_localhost = (
+        HUB_URL.startswith("https://localhost") or HUB_URL.startswith("https://127.")
+    )
+    ctx = build_ssl_context(explicit_insecure=True) if is_localhost else build_ssl_context()
 
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
@@ -945,10 +950,11 @@ def cmd_grants(args):
     url = f"{HUB_URL}/api/v1/server/access-grants"
     headers = {"X-API-Key": API_KEY}
 
-    ctx = ssl.create_default_context()
-    if HUB_URL.startswith("https://staging.") or HUB_URL.startswith("https://localhost"):
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    from orchestratia_agent.tls import build_ssl_context
+    is_localhost = (
+        HUB_URL.startswith("https://localhost") or HUB_URL.startswith("https://127.")
+    )
+    ctx = build_ssl_context(explicit_insecure=True) if is_localhost else build_ssl_context()
 
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")

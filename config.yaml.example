@@ -3,6 +3,14 @@
 
 hub_url: "https://staging.orchestratia.com"
 
+# TLS certificate verification. Default false (secure) — the agent
+# validates the hub's certificate against the OS CA trust store and
+# checks the hostname matches. Set to true ONLY for local dev hubs
+# using self-signed certs. When true, the agent logs a loud warning
+# at startup. Can also be toggled via env var:
+#   ORCHESTRATIA_INSECURE_TLS=1 orchestratia-agent --config ...
+# insecure_tls: false
+
 # Authentication - use ONE of the following:
 # 1. For first-time registration, get a token from the dashboard (Servers -> Register Server)
 registration_token: "orcreg_xxx"

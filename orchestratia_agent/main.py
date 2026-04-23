@@ -86,7 +86,8 @@ async def main():
             log.error("hub_url not set in config")
             sys.exit(1)
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        from orchestratia_agent.tls import httpx_verify
+        async with httpx.AsyncClient(timeout=30, verify=httpx_verify(state=state)) as client:
             key = await register_with_hub(client, state)
             if not key:
                 log.error("Registration failed.")
@@ -136,7 +137,8 @@ async def main():
     else:
         persist_label = "no"
     log.info(f"Persistence: {persist_label}")
-    async with httpx.AsyncClient(timeout=30) as client:
+    from orchestratia_agent.tls import httpx_verify
+    async with httpx.AsyncClient(timeout=30, verify=httpx_verify(state=state)) as client:
         key = await register_with_hub(client, state)
         if not key:
             log.error("Failed to obtain API key. Exiting.")

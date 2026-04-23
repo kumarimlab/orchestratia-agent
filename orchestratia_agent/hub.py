@@ -174,10 +174,9 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
 
 async def connect_ws(state: DaemonState):
     """Connect to the hub's agent WebSocket."""
+    from orchestratia_agent.tls import build_ssl_context
     ws_url = state.hub_url.replace("https://", "wss://").replace("http://", "ws://")
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+    ssl_ctx = build_ssl_context(state=state)
 
     target = f"{ws_url}/ws/server"
     log.debug(f"WebSocket connecting to {target}")
@@ -1160,12 +1159,9 @@ async def _restore_grants(state: DaemonState, sender):
     """Poll hub for active grants and restore SSH keys + listeners."""
     try:
         import httpx
+        from orchestratia_agent.tls import httpx_verify
 
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-
-        async with httpx.AsyncClient(verify=ssl_ctx) as client:
+        async with httpx.AsyncClient(verify=httpx_verify(state=state)) as client:
             resp = await client.get(
                 f"{state.hub_url}/api/v1/server/access-grants",
                 headers={"X-API-Key": state.api_key},
@@ -1243,7 +1239,8 @@ async def _refresh_rules_cache(state: DaemonState):
             hub_url = hub_url[: -len("/ws/server")]
         url = f"{hub_url}/api/v1/server/approval-rules"
 
-        async with httpx.AsyncClient(timeout=10) as client:
+        from orchestratia_agent.tls import httpx_verify
+        async with httpx.AsyncClient(timeout=10, verify=httpx_verify(state=state)) as client:
             resp = await client.get(url, headers={"X-API-Key": state.api_key})
             if resp.status_code == 200:
                 rules = resp.json()
@@ -1295,7 +1292,8 @@ async def permlog_flush_loop(state: DaemonState):
                 hub_url = hub_url[: -len("/ws/server")]
             url = f"{hub_url}/api/v1/server/permissions/log"
 
-            async with httpx.AsyncClient(timeout=10) as client:
+            from orchestratia_agent.tls import httpx_verify
+            async with httpx.AsyncClient(timeout=10, verify=httpx_verify(state=state)) as client:
                 resp = await client.post(
                     url,
                     headers={"X-API-Key": state.api_key, "Content-Type": "application/json"},

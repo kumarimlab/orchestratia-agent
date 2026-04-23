@@ -51,9 +51,8 @@ async def _listen_mode(token: str):
     ws_url = hub_url.replace("https://", "wss://").replace("http://", "ws://")
     target = f"{ws_url}/ws/tunnel"
 
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+    from orchestratia_agent.tls import build_ssl_context
+    ssl_ctx = build_ssl_context()
 
     print(f"\033[38;2;212;114;47m")
     print(f"  Orchestratia Connect")
@@ -166,9 +165,8 @@ async def _proxy_mode(token: str):
     ws_url = hub_url.replace("https://", "wss://").replace("http://", "ws://")
     target = f"{ws_url}/ws/tunnel"
 
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+    from orchestratia_agent.tls import build_ssl_context
+    ssl_ctx = build_ssl_context()
 
     ws = await websockets.connect(
         target,

@@ -1228,7 +1228,7 @@ def _agent_update_windows():
     """Windows update: re-run the PowerShell installer in upgrade mode (no token = upgrade)."""
     import subprocess
 
-    install_url = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1"
+    install_url = "https://install.orchestratia.com/windows"
 
     if JSON_MODE:
         results = {"platform": "windows", "steps": []}

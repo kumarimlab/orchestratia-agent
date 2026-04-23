@@ -9,19 +9,19 @@ Get a registration token from the Orchestratia dashboard (Servers > Register Ser
 **Linux:**
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-linux.sh) <TOKEN>
+bash <(curl -sL https://install.orchestratia.com/linux) <TOKEN>
 ```
 
 **macOS:**
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-macos.sh) <TOKEN>
+bash <(curl -sL https://install.orchestratia.com/macos) <TOKEN>
 ```
 
 **Windows (PowerShell as Administrator):**
 
 ```powershell
-irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 -OutFile install.ps1; .\install.ps1 <TOKEN>
+$env:ORC_TOKEN='<TOKEN>'; irm https://install.orchestratia.com/windows | iex
 ```
 
 ## Manual Install

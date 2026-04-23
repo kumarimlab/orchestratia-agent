@@ -6,10 +6,10 @@
 #
 # Two modes:
 #   FRESH INSTALL (with token):
-#     $env:ORC_TOKEN='orcreg_...'; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex
+#     $env:ORC_TOKEN='orcreg_...'; irm https://install.orchestratia.com/windows | iex
 #
 #   UPGRADE (no token — uses existing config, preserves sessions):
-#     irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex
+#     irm https://install.orchestratia.com/windows | iex
 #
 # What this does:
 #   1. Kills agent daemon (preserves pty-host so sessions stay alive)
@@ -38,10 +38,10 @@ if (-not $Token) {
         Write-Host "  Usage:" -ForegroundColor White
         Write-Host ""
         Write-Host '  Fresh install (one-liner):' -ForegroundColor DarkGray
-        Write-Host '    $env:ORC_TOKEN=''orcreg_...''; irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex' -ForegroundColor Cyan
+        Write-Host '    $env:ORC_TOKEN=''orcreg_...''; irm https://install.orchestratia.com/windows | iex' -ForegroundColor Cyan
         Write-Host ""
         Write-Host '  Upgrade (no token needed — uses existing config):' -ForegroundColor DarkGray
-        Write-Host '    irm https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/install-windows.ps1 | iex' -ForegroundColor Cyan
+        Write-Host '    irm https://install.orchestratia.com/windows | iex' -ForegroundColor Cyan
         Write-Host ""
         Write-Host '  No existing config found. Provide a registration token for fresh install.' -ForegroundColor Yellow
         Write-Host ""

@@ -235,60 +235,90 @@ else
 fi
 
 # Step 6: AI Agent integration (Claude Code, Gemini CLI, Codex CLI)
+#
+# Architecture: git-clone the repo to a stable location and symlink
+# SKILL.md files from ~/.{claude,gemini,codex}/skills/orchestratia/
+# into the cloned tree. Hooks point directly at scripts inside the
+# cloned tree. `git pull` in the install dir refreshes skill content
+# across the fleet without re-running the installer.
 step 6 "Setting up AI agent integrations"
 
-HOOK_DIR="$HOME/.orchestratia/agent-skills/hooks"
-REPO_BASE="https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/agent-skills"
+# /usr/local/share is the standard location for third-party shared
+# data on macOS and doesn't require sudo for the owning user if they
+# own it. We use it over /opt to match macOS conventions; the shape is
+# identical to Linux's /opt/orchestratia-agent.
+INSTALL_DIR="/usr/local/share/orchestratia-agent"
+REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 
-mkdir -p "$HOOK_DIR"
-if curl -fsSL "$REPO_BASE/hooks/orchestratia-context.sh" -o "$HOOK_DIR/orchestratia-context.sh" 2>/dev/null && \
-   curl -fsSL "$REPO_BASE/hooks/orchestratia-pretooluse.sh" -o "$HOOK_DIR/orchestratia-pretooluse.sh" 2>/dev/null; then
-    chmod +x "$HOOK_DIR/orchestratia-context.sh" "$HOOK_DIR/orchestratia-pretooluse.sh"
-    ok "Hook scripts downloaded"
+if [ -d "$INSTALL_DIR/.git" ]; then
+    if git -C "$INSTALL_DIR" fetch --depth 1 origin main >/dev/null 2>&1 && \
+       git -C "$INSTALL_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1; then
+        ok "Asset tree refreshed: $INSTALL_DIR"
+    else
+        warn "Could not refresh $INSTALL_DIR from remote"
+    fi
 else
-    warn "Could not download hook scripts"
+    sudo rm -rf "$INSTALL_DIR" 2>/dev/null || true
+    sudo mkdir -p "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
+    if sudo git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1; then
+        sudo chown -R "$(whoami):$(id -gn)" "$INSTALL_DIR" 2>/dev/null || true
+        ok "Asset tree cloned: $INSTALL_DIR"
+    else
+        fail "git clone failed for $REPO_URL"
+    fi
 fi
 
-CONTEXT_HOOK_CMD="bash \"$HOOK_DIR/orchestratia-context.sh\""
-PRETOOL_HOOK_CMD="bash \"$HOOK_DIR/orchestratia-pretooluse.sh\""
+HOOK_CONTEXT="$INSTALL_DIR/agent-skills/hooks/orchestratia-context.sh"
+HOOK_PRETOOLUSE="$INSTALL_DIR/agent-skills/hooks/orchestratia-pretooluse.sh"
 
+chmod +x "$INSTALL_DIR/agent-skills/hooks/"*.sh 2>/dev/null || true
+
+# Merge hook entries into a JSON settings file. Replaces any existing
+# orchestratia entries with fresh ones so stale paths get updated.
 merge_json_hooks() {
-    local path="$1" session_event="$2" pretool_event="$3" context_cmd="$4" pretool_cmd="$5"
-    python3 - "$path" "$session_event" "$pretool_event" "$context_cmd" "$pretool_cmd" <<'PYEOF' >/dev/null 2>&1
-import json, os, sys
-path, session_event, pretool_event, context_cmd, pretool_cmd = sys.argv[1:6]
+    local SETTINGS_PATH="$1"
+    local SESSION_EVENT="$2"
+    local PRETOOL_EVENT="$3"
+    local HOOK_CONTEXT_CMD="$4"
+    local HOOK_PRETOOL_CMD="$5"
+    python3 -c "
+import json, os
+path = '$SETTINGS_PATH'
 settings = {}
 if os.path.exists(path):
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path) as f:
             settings = json.load(f)
-    except Exception:
-        pass
+    except (json.JSONDecodeError, ValueError):
+        settings = {}
 hooks = settings.setdefault('hooks', {})
-for event, cmd in [(session_event, context_cmd), (pretool_event, pretool_cmd)]:
-    event_list = hooks.setdefault(event, [])
-    if not any('orchestratia' in str(e) for e in event_list):
-        event_list.append({'hooks': [{'type': 'command', 'command': cmd, 'timeout': 10000 if 'context' in cmd else 30000}]})
+session_list = hooks.setdefault('$SESSION_EVENT', [])
+hooks['$SESSION_EVENT'] = [e for e in session_list if 'orchestratia' not in str(e)]
+hooks['$SESSION_EVENT'].append({'hooks': [{'type': 'command', 'command': '$HOOK_CONTEXT_CMD', 'timeout': 10000}]})
+pretool_list = hooks.setdefault('$PRETOOL_EVENT', [])
+hooks['$PRETOOL_EVENT'] = [e for e in pretool_list if 'orchestratia' not in str(e)]
+hooks['$PRETOOL_EVENT'].append({'hooks': [{'type': 'command', 'command': '$HOOK_PRETOOL_CMD', 'timeout': 30000}]})
 os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w', encoding='utf-8') as f:
+with open(path, 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
-PYEOF
-    return $?
+print('ok')
+" 2>/dev/null
 }
 
 CLAUDE_DETECTED=false; GEMINI_DETECTED=false; CODEX_DETECTED=false
 
 if check_command claude; then
     CLAUDE_DETECTED=true
-    CLAUDE_SKILL_DIR="$HOME/.claude/skills/orchestratia"
-    mkdir -p "$CLAUDE_SKILL_DIR" "$HOME/.claude"
-    if curl -fsSL "$REPO_BASE/claude/SKILL.md" -o "$CLAUDE_SKILL_DIR/SKILL.md" 2>/dev/null; then
+    SKILL_DIR="$HOME/.claude/skills/orchestratia"
+    mkdir -p "$SKILL_DIR" "$HOME/.claude"
+    rm -f "$SKILL_DIR/SKILL.md" 2>/dev/null || true
+    if ln -sf "$INSTALL_DIR/agent-skills/claude/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
         ok "Claude Code skill installed"
     else
-        warn "Could not download Claude SKILL.md"
+        warn "Could not create Claude skill symlink"
     fi
-    if merge_json_hooks "$HOME/.claude/settings.json" "SessionStart" "PreToolUse" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD"; then
+    if merge_json_hooks "$HOME/.claude/settings.json" "SessionStart" "PreToolUse" "$HOOK_CONTEXT" "$HOOK_PRETOOLUSE" | grep -q "ok"; then
         ok "Claude Code hooks configured"
     else
         warn "Could not configure Claude Code hooks"
@@ -297,33 +327,36 @@ fi
 
 if check_command gemini; then
     GEMINI_DETECTED=true
-    GEMINI_SKILL_DIR="$HOME/.gemini/skills/orchestratia"
-    SHARED_SKILL_DIR="$HOME/.agents/skills/orchestratia"
-    mkdir -p "$GEMINI_SKILL_DIR" "$SHARED_SKILL_DIR" "$HOME/.gemini"
-    if curl -fsSL "$REPO_BASE/gemini/SKILL.md" -o "$GEMINI_SKILL_DIR/SKILL.md" 2>/dev/null; then
-        cp -f "$GEMINI_SKILL_DIR/SKILL.md" "$SHARED_SKILL_DIR/SKILL.md" 2>/dev/null || true
+    SKILL_DIR="$HOME/.gemini/skills/orchestratia"
+    SHARED_DIR="$HOME/.agents/skills/orchestratia"
+    mkdir -p "$SKILL_DIR" "$SHARED_DIR" "$HOME/.gemini"
+    rm -f "$SKILL_DIR/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
+    if ln -sf "$INSTALL_DIR/agent-skills/gemini/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        cp "$INSTALL_DIR/agent-skills/gemini/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
         ok "Gemini CLI skill installed"
     else
-        warn "Could not download Gemini SKILL.md"
+        warn "Could not create Gemini skill symlink"
     fi
-    merge_json_hooks "$HOME/.gemini/settings.json" "SessionStart" "BeforeTool" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD" \
-        && ok "Gemini CLI hooks configured" \
-        || warn "Could not configure Gemini CLI hooks"
+    if merge_json_hooks "$HOME/.gemini/settings.json" "SessionStart" "BeforeTool" "$HOOK_CONTEXT" "$HOOK_PRETOOLUSE" | grep -q "ok"; then
+        ok "Gemini CLI hooks configured"
+    else
+        warn "Could not configure Gemini CLI hooks"
+    fi
 fi
 
 if check_command codex; then
     CODEX_DETECTED=true
-    CODEX_SKILL_DIR="$HOME/.codex/skills/orchestratia"
-    SHARED_SKILL_DIR="$HOME/.agents/skills/orchestratia"
-    mkdir -p "$CODEX_SKILL_DIR" "$SHARED_SKILL_DIR" "$HOME/.codex"
-    if curl -fsSL "$REPO_BASE/codex/SKILL.md" -o "$CODEX_SKILL_DIR/SKILL.md" 2>/dev/null; then
-        cp -f "$CODEX_SKILL_DIR/SKILL.md" "$SHARED_SKILL_DIR/SKILL.md" 2>/dev/null || true
+    SKILL_DIR="$HOME/.codex/skills/orchestratia"
+    SHARED_DIR="$HOME/.agents/skills/orchestratia"
+    mkdir -p "$SKILL_DIR" "$SHARED_DIR" "$HOME/.codex"
+    rm -f "$SKILL_DIR/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
+    if ln -sf "$INSTALL_DIR/agent-skills/codex/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        cp "$INSTALL_DIR/agent-skills/codex/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
         ok "Codex CLI skill installed"
     else
-        warn "Could not download Codex SKILL.md"
+        warn "Could not create Codex skill symlink"
     fi
 
-    # Enable codex_hooks feature flag in config.toml (idempotent).
     CODEX_CONFIG="$HOME/.codex/config.toml"
     if [ -f "$CODEX_CONFIG" ]; then
         grep -q "codex_hooks" "$CODEX_CONFIG" 2>/dev/null || \
@@ -332,36 +365,20 @@ if check_command codex; then
         printf '[features]\ncodex_hooks = true\n' > "$CODEX_CONFIG"
     fi
 
-    # Write hooks.json (Codex uses a separate file, not settings.json).
-    # Idempotent: skip if orchestratia entries already exist.
     CODEX_HOOKS="$HOME/.codex/hooks.json"
-    if [ -f "$CODEX_HOOKS" ] && grep -q "orchestratia" "$CODEX_HOOKS" 2>/dev/null; then
-        ok "Codex CLI hooks already configured"
-    else
-        if python3 - "$CODEX_HOOKS" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD" <<'PYEOF' >/dev/null 2>&1
-import json, os, sys
-path, context_cmd, pretool_cmd = sys.argv[1:4]
-data = {
-    "hooks": {
-        "SessionStart": [
-            {"hooks": [{"type": "command", "command": context_cmd, "timeout": 10000}]}
-        ],
-        "PreToolUse": [
-            {"matcher": ".*", "hooks": [{"type": "command", "command": pretool_cmd, "timeout": 30000}]}
-        ]
-    }
+    tee "$CODEX_HOOKS" >/dev/null <<CODEXEOF
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "$HOOK_CONTEXT", "timeout": 10000}]}
+    ],
+    "PreToolUse": [
+      {"matcher": ".*", "hooks": [{"type": "command", "command": "$HOOK_PRETOOLUSE", "timeout": 30000}]}
+    ]
+  }
 }
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(data, f, indent=2)
-    f.write('\n')
-PYEOF
-        then
-            ok "Codex CLI hooks configured (feature flag enabled)"
-        else
-            warn "Could not configure Codex CLI hooks"
-        fi
-    fi
+CODEXEOF
+    ok "Codex CLI hooks configured (feature flag enabled)"
 fi
 
 CONFIGURED=""; AVAILABLE=""

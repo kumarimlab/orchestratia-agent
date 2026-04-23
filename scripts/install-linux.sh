@@ -172,11 +172,12 @@ if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
     sudo systemctl daemon-reload 2>/dev/null || true
 fi
 
-# Remove old git-based installation if present
-if [ -d "/opt/orchestratia-agent" ]; then
-    EXISTING=true
-    sudo rm -rf "/opt/orchestratia-agent" 2>/dev/null && ok "Removed legacy /opt/orchestratia-agent" || warn "Could not remove"
-fi
+# /opt/orchestratia-agent is intentionally preserved here — it's the
+# live source tree that provides agent-skills/ (SKILL.md files and hook
+# shell scripts). Step 6 refreshes it via `git pull` or `git clone` as
+# appropriate. Deleting it here would break any symlinks the previous
+# install created under ~/.claude/skills/ and ~/.gemini/skills/ until
+# the new clone finishes, which is pointless churn.
 
 # Uninstall pip package. Check BOTH locations:
 #   (1) System site-packages (what `sudo pip3` sees)
@@ -420,54 +421,81 @@ else
 fi
 
 # Step 6: AI Agent integration (Claude Code, Gemini CLI, Codex CLI)
+#
+# Architecture: git-clone the repo to /opt/orchestratia-agent and
+# symlink SKILL.md files from ~/.claude/skills/orchestratia/ (etc.)
+# into the cloned tree. Hooks in settings.json point directly at hook
+# scripts inside the cloned tree. This mirrors the design of the
+# top-level install.sh and lets `git pull` inside /opt refresh skill
+# content without a full re-install.
 step 6 "Setting up AI agent integrations"
 
-HOOK_DIR="${RUN_HOME}/.orchestratia/agent-skills/hooks"
-REPO_BASE="https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/agent-skills"
+INSTALL_DIR="/opt/orchestratia-agent"
+REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 
-# Download shared hook scripts into the user's home so they run as the user.
-sudo -u "$RUN_USER" mkdir -p "$HOOK_DIR"
-if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/hooks/orchestratia-context.sh" -o "$HOOK_DIR/orchestratia-context.sh" 2>/dev/null && \
-   sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/hooks/orchestratia-pretooluse.sh" -o "$HOOK_DIR/orchestratia-pretooluse.sh" 2>/dev/null; then
-    sudo -u "$RUN_USER" chmod +x "$HOOK_DIR/orchestratia-context.sh" "$HOOK_DIR/orchestratia-pretooluse.sh"
-    ok "Hook scripts downloaded"
+# Ensure the asset tree exists and is fresh at /opt/orchestratia-agent.
+# On a fresh box: clone. On an existing install: fetch + hard reset so
+# the tree matches origin/main regardless of local state.
+if [ -d "$INSTALL_DIR/.git" ]; then
+    if sudo git -C "$INSTALL_DIR" fetch --depth 1 origin main >/dev/null 2>&1 && \
+       sudo git -C "$INSTALL_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1; then
+        ok "Asset tree refreshed: $INSTALL_DIR"
+    else
+        warn "Could not refresh $INSTALL_DIR from remote"
+    fi
 else
-    warn "Could not download hook scripts"
+    sudo rm -rf "$INSTALL_DIR" 2>/dev/null || true
+    if sudo git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1; then
+        ok "Asset tree cloned: $INSTALL_DIR"
+    else
+        fail "git clone failed for $REPO_URL"
+    fi
 fi
 
-CONTEXT_HOOK_CMD="bash \"$HOOK_DIR/orchestratia-context.sh\""
-PRETOOL_HOOK_CMD="bash \"$HOOK_DIR/orchestratia-pretooluse.sh\""
+# Give the asset tree to RUN_USER so symlinks + reads work without sudo.
+sudo chown -R "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" 2>/dev/null || true
 
-# Merge hook entries into a JSON settings file. Idempotent — existing
-# orchestratia entries are left alone (detected by substring match).
-# Uses Python via sudo -u so the file is owned by the target user.
+HOOK_CONTEXT="$INSTALL_DIR/agent-skills/hooks/orchestratia-context.sh"
+HOOK_PRETOOLUSE="$INSTALL_DIR/agent-skills/hooks/orchestratia-pretooluse.sh"
+
+# Make hook scripts executable (git clone preserves the +x bit but
+# defensive chmod in case someone re-checked out without it).
+sudo chmod +x "$INSTALL_DIR/agent-skills/hooks/"*.sh 2>/dev/null || true
+
+# Merge hook entries into a JSON settings file.
+# REPLACES any existing orchestratia hook entries with fresh ones, so
+# stale paths from earlier installs (e.g. pointing at an old /opt dir
+# that was since re-cloned) get updated. Non-orchestratia hooks are
+# preserved untouched.
 merge_json_hooks() {
-    local path="$1"
-    local session_event="$2"
-    local pretool_event="$3"
-    local context_cmd="$4"
-    local pretool_cmd="$5"
-    sudo -u "$RUN_USER" python3 - "$path" "$session_event" "$pretool_event" "$context_cmd" "$pretool_cmd" <<'PYEOF' >/dev/null 2>&1
-import json, os, sys
-path, session_event, pretool_event, context_cmd, pretool_cmd = sys.argv[1:6]
+    local SETTINGS_PATH="$1"
+    local SESSION_EVENT="$2"
+    local PRETOOL_EVENT="$3"
+    local HOOK_CONTEXT_CMD="$4"
+    local HOOK_PRETOOL_CMD="$5"
+    sudo -u "$RUN_USER" python3 -c "
+import json, os
+path = '$SETTINGS_PATH'
 settings = {}
 if os.path.exists(path):
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path) as f:
             settings = json.load(f)
-    except Exception:
-        pass
+    except (json.JSONDecodeError, ValueError):
+        settings = {}
 hooks = settings.setdefault('hooks', {})
-for event, cmd in [(session_event, context_cmd), (pretool_event, pretool_cmd)]:
-    event_list = hooks.setdefault(event, [])
-    if not any('orchestratia' in str(e) for e in event_list):
-        event_list.append({'hooks': [{'type': 'command', 'command': cmd, 'timeout': 10000 if 'context' in cmd else 30000}]})
+session_list = hooks.setdefault('$SESSION_EVENT', [])
+hooks['$SESSION_EVENT'] = [e for e in session_list if 'orchestratia' not in str(e)]
+hooks['$SESSION_EVENT'].append({'hooks': [{'type': 'command', 'command': '$HOOK_CONTEXT_CMD', 'timeout': 10000}]})
+pretool_list = hooks.setdefault('$PRETOOL_EVENT', [])
+hooks['$PRETOOL_EVENT'] = [e for e in pretool_list if 'orchestratia' not in str(e)]
+hooks['$PRETOOL_EVENT'].append({'hooks': [{'type': 'command', 'command': '$HOOK_PRETOOL_CMD', 'timeout': 30000}]})
 os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w', encoding='utf-8') as f:
+with open(path, 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
-PYEOF
-    return $?
+print('ok')
+" 2>/dev/null
 }
 
 CLAUDE_DETECTED=false
@@ -477,14 +505,18 @@ CODEX_DETECTED=false
 # ── Claude Code ──
 if sudo -u "$RUN_USER" bash -lc 'command -v claude >/dev/null 2>&1'; then
     CLAUDE_DETECTED=true
-    CLAUDE_SKILL_DIR="${RUN_HOME}/.claude/skills/orchestratia"
-    sudo -u "$RUN_USER" mkdir -p "$CLAUDE_SKILL_DIR" "${RUN_HOME}/.claude"
-    if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/claude/SKILL.md" -o "$CLAUDE_SKILL_DIR/SKILL.md" 2>/dev/null; then
+    SKILL_DIR="${RUN_HOME}/.claude/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" "${RUN_HOME}/.claude" 2>/dev/null || true
+    # Remove any existing SKILL.md first so `ln -sf` replaces a stale
+    # symlink (including dangling ones pointing at a prior /opt dir
+    # that was deleted) or a copied file from the old curl-based path.
+    sudo -u "$RUN_USER" rm -f "$SKILL_DIR/SKILL.md" 2>/dev/null || true
+    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/agent-skills/claude/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
         ok "Claude Code skill installed"
     else
-        warn "Could not download Claude SKILL.md"
+        warn "Could not create Claude skill symlink"
     fi
-    if merge_json_hooks "${RUN_HOME}/.claude/settings.json" "SessionStart" "PreToolUse" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD"; then
+    if merge_json_hooks "${RUN_HOME}/.claude/settings.json" "SessionStart" "PreToolUse" "$HOOK_CONTEXT" "$HOOK_PRETOOLUSE" | grep -q "ok"; then
         ok "Claude Code hooks configured"
     else
         warn "Could not configure Claude Code hooks"
@@ -494,16 +526,17 @@ fi
 # ── Gemini CLI ──
 if sudo -u "$RUN_USER" bash -lc 'command -v gemini >/dev/null 2>&1'; then
     GEMINI_DETECTED=true
-    GEMINI_SKILL_DIR="${RUN_HOME}/.gemini/skills/orchestratia"
-    SHARED_SKILL_DIR="${RUN_HOME}/.agents/skills/orchestratia"
-    sudo -u "$RUN_USER" mkdir -p "$GEMINI_SKILL_DIR" "$SHARED_SKILL_DIR" "${RUN_HOME}/.gemini"
-    if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/gemini/SKILL.md" -o "$GEMINI_SKILL_DIR/SKILL.md" 2>/dev/null; then
-        sudo -u "$RUN_USER" cp -f "$GEMINI_SKILL_DIR/SKILL.md" "$SHARED_SKILL_DIR/SKILL.md" 2>/dev/null || true
+    SKILL_DIR="${RUN_HOME}/.gemini/skills/orchestratia"
+    SHARED_DIR="${RUN_HOME}/.agents/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" "$SHARED_DIR" "${RUN_HOME}/.gemini" 2>/dev/null || true
+    sudo -u "$RUN_USER" rm -f "$SKILL_DIR/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
+    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/agent-skills/gemini/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        sudo -u "$RUN_USER" cp "$INSTALL_DIR/agent-skills/gemini/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
         ok "Gemini CLI skill installed"
     else
-        warn "Could not download Gemini SKILL.md"
+        warn "Could not create Gemini skill symlink"
     fi
-    if merge_json_hooks "${RUN_HOME}/.gemini/settings.json" "SessionStart" "BeforeTool" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD"; then
+    if merge_json_hooks "${RUN_HOME}/.gemini/settings.json" "SessionStart" "BeforeTool" "$HOOK_CONTEXT" "$HOOK_PRETOOLUSE" | grep -q "ok"; then
         ok "Gemini CLI hooks configured"
     else
         warn "Could not configure Gemini CLI hooks"
@@ -517,56 +550,42 @@ fi
 # to actually fire.
 if sudo -u "$RUN_USER" bash -lc 'command -v codex >/dev/null 2>&1'; then
     CODEX_DETECTED=true
-    CODEX_SKILL_DIR="${RUN_HOME}/.codex/skills/orchestratia"
-    SHARED_SKILL_DIR="${RUN_HOME}/.agents/skills/orchestratia"
-    sudo -u "$RUN_USER" mkdir -p "$CODEX_SKILL_DIR" "$SHARED_SKILL_DIR" "${RUN_HOME}/.codex"
-    if sudo -u "$RUN_USER" curl -fsSL "$REPO_BASE/codex/SKILL.md" -o "$CODEX_SKILL_DIR/SKILL.md" 2>/dev/null; then
-        sudo -u "$RUN_USER" cp -f "$CODEX_SKILL_DIR/SKILL.md" "$SHARED_SKILL_DIR/SKILL.md" 2>/dev/null || true
+    SKILL_DIR="${RUN_HOME}/.codex/skills/orchestratia"
+    SHARED_DIR="${RUN_HOME}/.agents/skills/orchestratia"
+    sudo -u "$RUN_USER" mkdir -p "$SKILL_DIR" "$SHARED_DIR" "${RUN_HOME}/.codex" 2>/dev/null || true
+    sudo -u "$RUN_USER" rm -f "$SKILL_DIR/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
+    if sudo -u "$RUN_USER" ln -sf "$INSTALL_DIR/agent-skills/codex/SKILL.md" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+        sudo -u "$RUN_USER" cp "$INSTALL_DIR/agent-skills/codex/SKILL.md" "$SHARED_DIR/SKILL.md" 2>/dev/null || true
         ok "Codex CLI skill installed"
     else
-        warn "Could not download Codex SKILL.md"
+        warn "Could not create Codex skill symlink"
     fi
 
     # Enable codex_hooks feature flag in config.toml (idempotent).
     CODEX_CONFIG="${RUN_HOME}/.codex/config.toml"
-    if sudo -u "$RUN_USER" test -f "$CODEX_CONFIG"; then
-        if ! sudo -u "$RUN_USER" grep -q "codex_hooks" "$CODEX_CONFIG" 2>/dev/null; then
-            sudo -u "$RUN_USER" bash -c "printf '\n[features]\ncodex_hooks = true\n' >> '$CODEX_CONFIG'"
+    if [ -f "$CODEX_CONFIG" ]; then
+        if ! grep -q "codex_hooks" "$CODEX_CONFIG" 2>/dev/null; then
+            echo -e "\n[features]\ncodex_hooks = true" | sudo -u "$RUN_USER" tee -a "$CODEX_CONFIG" >/dev/null
         fi
     else
-        sudo -u "$RUN_USER" bash -c "printf '[features]\ncodex_hooks = true\n' > '$CODEX_CONFIG'"
+        echo -e "[features]\ncodex_hooks = true" | sudo -u "$RUN_USER" tee "$CODEX_CONFIG" >/dev/null
     fi
 
-    # Write hooks.json (Codex reads a separate file, not settings.json).
-    # Idempotent: skip the write if orchestratia entries already exist.
+    # Always rewrite hooks.json (cheap, guarantees fresh paths).
     CODEX_HOOKS="${RUN_HOME}/.codex/hooks.json"
-    if sudo -u "$RUN_USER" test -f "$CODEX_HOOKS" && sudo -u "$RUN_USER" grep -q "orchestratia" "$CODEX_HOOKS" 2>/dev/null; then
-        ok "Codex CLI hooks already configured"
-    else
-        if sudo -u "$RUN_USER" python3 - "$CODEX_HOOKS" "$CONTEXT_HOOK_CMD" "$PRETOOL_HOOK_CMD" <<'PYEOF' >/dev/null 2>&1
-import json, os, sys
-path, context_cmd, pretool_cmd = sys.argv[1:4]
-data = {
-    "hooks": {
-        "SessionStart": [
-            {"hooks": [{"type": "command", "command": context_cmd, "timeout": 10000}]}
-        ],
-        "PreToolUse": [
-            {"matcher": ".*", "hooks": [{"type": "command", "command": pretool_cmd, "timeout": 30000}]}
-        ]
-    }
+    sudo -u "$RUN_USER" tee "$CODEX_HOOKS" >/dev/null <<CODEXEOF
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "$HOOK_CONTEXT", "timeout": 10000}]}
+    ],
+    "PreToolUse": [
+      {"matcher": ".*", "hooks": [{"type": "command", "command": "$HOOK_PRETOOLUSE", "timeout": 30000}]}
+    ]
+  }
 }
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(data, f, indent=2)
-    f.write('\n')
-PYEOF
-        then
-            ok "Codex CLI hooks configured (feature flag enabled)"
-        else
-            warn "Could not configure Codex CLI hooks"
-        fi
-    fi
+CODEXEOF
+    ok "Codex CLI hooks configured (feature flag enabled)"
 fi
 
 # Summary of detected AI agents — single configured line + single note

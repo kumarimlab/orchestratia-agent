@@ -40,10 +40,10 @@ elif tool_name in ('Glob', 'Grep'):
 elif tool_name == 'Agent':
     param = tool_input.get('prompt', '')[:200] if tool_input.get('prompt') else ''
 
-# Load cached rules
-server_id_hash = hashlib.md5(os.environ.get('ORCHESTRATIA_API_KEY', 'default').encode()).hexdigest()[:12]
+# Load cached rules. Fixed filename (formerly keyed by md5(api_key)[:12])
+# so hook + daemon always agree regardless of API-key rotation.
 tmp_dir = os.environ.get('TEMP', os.environ.get('TMP', os.path.join(os.path.expanduser('~'), '.orchestratia')))
-rules_path = os.path.join(tmp_dir, f'orchestratia-rules-{server_id_hash}.json')
+rules_path = os.path.join(tmp_dir, 'orchestratia-rules.json')
 
 rules = []
 try:
@@ -83,7 +83,7 @@ for rule in rules:
     break
 
 # Append log entry
-log_path = os.path.join(tmp_dir, f'orchestratia-permlog-{server_id_hash}.jsonl')
+log_path = os.path.join(tmp_dir, 'orchestratia-permlog.jsonl')
 log_entry = {
     'session_id': session_id or None,
     'project_id': project_id or None,

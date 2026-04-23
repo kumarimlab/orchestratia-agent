@@ -1214,20 +1214,23 @@ async def _restore_grants(state: DaemonState, sender):
 # ── Approval rules cache + permission log flush ──────────────────
 
 
-def _get_rules_cache_path(state: DaemonState) -> str:
-    """Return path to the local rules cache file."""
-    import hashlib
-    api_hash = hashlib.md5(state.api_key.encode()).hexdigest()[:12]
+def _get_rules_cache_path(state: DaemonState = None) -> str:
+    """Return path to the local rules cache file.
+
+    Fixed filename — previously keyed by md5(api_key)[:12] which broke
+    on API-key rotation (e.g. re-registering via the installer): the
+    daemon loaded the new key, wrote its cache to a different filename
+    than the hook read from. Stable filename means hook and daemon
+    always agree regardless of rotation state.
+    """
     tmp_dir = os.environ.get("TMPDIR", os.environ.get("TEMP", os.environ.get("TMP", "/tmp")))
-    return os.path.join(tmp_dir, f"orchestratia-rules-{api_hash}.json")
+    return os.path.join(tmp_dir, "orchestratia-rules.json")
 
 
-def _get_permlog_path(state: DaemonState) -> str:
-    """Return path to the local permission log file."""
-    import hashlib
-    api_hash = hashlib.md5(state.api_key.encode()).hexdigest()[:12]
+def _get_permlog_path(state: DaemonState = None) -> str:
+    """Return path to the local permission log file. See _get_rules_cache_path."""
     tmp_dir = os.environ.get("TMPDIR", os.environ.get("TEMP", os.environ.get("TMP", "/tmp")))
-    return os.path.join(tmp_dir, f"orchestratia-permlog-{api_hash}.jsonl")
+    return os.path.join(tmp_dir, "orchestratia-permlog.jsonl")
 
 
 async def _refresh_rules_cache(state: DaemonState):

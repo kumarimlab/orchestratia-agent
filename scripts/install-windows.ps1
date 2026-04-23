@@ -342,6 +342,29 @@ try {
     Write-Warn "Could not create orchestratia.exe: $_"
 }
 
+# Fetch the CLI wrappers (.cmd/.ps1 shims). These route interactive
+# invocations like `orchestratia status` through Start-Process with
+# explicit stdout redirection so the windowed-subsystem exe's output
+# reaches the parent shell. Without them, bare `orchestratia-agent
+# --version` at a PowerShell prompt shows nothing.
+$BinDir = "$ConfigDir\bin"
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+$WrapperBase = "https://raw.githubusercontent.com/kumarimlab/orchestratia-agent/main/scripts/windows-wrappers"
+$wrappersFetched = 0
+foreach ($name in @("orchestratia.cmd", "orchestratia.ps1", "orchestratia-agent.cmd", "orchestratia-agent.ps1")) {
+    try {
+        Invoke-WebRequest -Uri "$WrapperBase/$name" -OutFile "$BinDir\$name" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        $wrappersFetched++
+    } catch {
+        Write-Warn "Could not download $name : $_"
+    }
+}
+if ($wrappersFetched -eq 4) {
+    Write-Ok "CLI wrappers installed in $BinDir"
+} elseif ($wrappersFetched -gt 0) {
+    Write-Warn "Only $wrappersFetched/4 CLI wrappers fetched — some commands may not display output"
+}
+
 # Step 3: Register (or verify existing config for upgrades)
 Write-Step 3 $TotalSteps "Registering with Orchestratia hub"
 
@@ -388,29 +411,48 @@ if ($UpgradeMode) {
 # Step 4: Add to user PATH
 Write-Step 4 $TotalSteps "Adding to user PATH"
 
+# Two entries go on PATH:
+#   1. $BinDir  — CLI wrappers (.cmd/.ps1). MUST be earlier in PATH than
+#                 $ConfigDir so `orchestratia-agent` resolves to the
+#                 .cmd wrapper (visible output) rather than the .exe
+#                 (silent because of the windowed subsystem).
+#   2. $ConfigDir — the exe dir, kept in PATH for backward compat and
+#                   for users who explicitly call orchestratia-agent.exe.
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -and $userPath.Split(";") -contains $ConfigDir) {
-    Write-Ok "Already in PATH: $ConfigDir"
-} else {
+$userPathEntries = if ($userPath) { $userPath.Split(";") | Where-Object { $_ } } else { @() }
+
+# Remove any existing entries to rewrite cleanly with the right order.
+$filtered = $userPathEntries | Where-Object { $_ -ne $BinDir -and $_ -ne $ConfigDir }
+
+# Prepend $BinDir, then $ConfigDir, then everything else. $BinDir first
+# ensures .cmd wrappers win resolution over the .exe files.
+$newEntries = @($BinDir, $ConfigDir) + @($filtered)
+$newPath = ($newEntries -join ";")
+
+if ($newPath -ne $userPath) {
     try {
-        $newPath = if ($userPath) { "$userPath;$ConfigDir" } else { $ConfigDir }
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-        # Also update current session so orchestratia-agent works immediately
-        $env:Path = "$env:Path;$ConfigDir"
-        Write-Ok "Added to user PATH: $ConfigDir"
+        # Update current session so wrappers resolve immediately
+        $sessionEntries = @($BinDir, $ConfigDir) + ($env:Path.Split(";") | Where-Object { $_ -and $_ -ne $BinDir -and $_ -ne $ConfigDir })
+        $env:Path = ($sessionEntries -join ";")
+        Write-Ok "PATH updated: $BinDir, $ConfigDir"
     } catch {
-        Write-Warn "Could not add to PATH: $_"
-        Write-Info "Run manually: [Environment]::SetEnvironmentVariable('Path', `"$userPath;$ConfigDir`", 'User')"
+        Write-Warn "Could not update PATH: $_"
+        Write-Info "Run manually: set Path to start with `"$BinDir;$ConfigDir;...`""
     }
+} else {
+    Write-Ok "PATH already ordered correctly"
 }
 
-# Verify that orchestratia-agent now resolves to our exe
+# Verify that orchestratia-agent resolves to the .cmd wrapper now
 $resolvedCmd = Get-Command "orchestratia-agent" -ErrorAction SilentlyContinue
-if ($resolvedCmd -and $resolvedCmd.Source -eq $AgentExePath) {
-    Write-Ok "Verified: 'orchestratia-agent' resolves to $AgentExePath"
+if ($resolvedCmd -and $resolvedCmd.Source -eq "$BinDir\orchestratia-agent.cmd") {
+    Write-Ok "Verified: 'orchestratia-agent' resolves to wrapper"
+} elseif ($resolvedCmd -and $resolvedCmd.Source -eq $AgentExePath) {
+    Write-Warn "'orchestratia-agent' still resolves to .exe (wrapper not on PATH)"
+    Write-Info "Open a new PowerShell window for PATH changes to take effect"
 } elseif ($resolvedCmd) {
-    Write-Warn "'orchestratia-agent' resolves to $($resolvedCmd.Source) instead of $AgentExePath"
-    Write-Info "An old installation may still be in PATH. Remove it or reorder PATH entries."
+    Write-Warn "'orchestratia-agent' resolves to $($resolvedCmd.Source)"
 } else {
     Write-Info "Open a new PowerShell window for PATH changes to take effect"
 }

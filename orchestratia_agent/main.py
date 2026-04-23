@@ -338,22 +338,20 @@ def _attach_parent_console():
         return
     import ctypes
     ATTACH_PARENT_PROCESS = 0xFFFFFFFF
+    # Note: this code path handles console attachment for the rare case
+    # where a user invokes the exe via `Start-Process -RedirectStandardOutput`
+    # or similar. The common case — a human typing `orchestratia-agent
+    # --version` at a PowerShell prompt — is handled by the .cmd/.ps1
+    # wrapper shipped alongside the exe (see scripts/windows-wrappers/),
+    # because PowerShell's default invocation of a windowed-subsystem exe
+    # does not display child stdout at the prompt regardless of what the
+    # child does with its handles.
     if ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
-        # Reopen stdout/stderr to the attached console.
-        # buffering=1 forces line buffering — without it, short output
-        # (e.g. argparse --version emits a single line) gets stuck in
-        # the block buffer and is lost when the process exits before
-        # Python flushes. --help appeared to work only because its
-        # output was long enough to trigger an implicit flush.
         try:
             sys.stdout = open("CONOUT$", "w", buffering=1)
             sys.stderr = open("CONOUT$", "w", buffering=1)
         except OSError:
             pass
-        # Defensive: flush on exit no matter what so any remaining
-        # buffered bytes reach the terminal.
-        import atexit
-        atexit.register(lambda: (sys.stdout.flush(), sys.stderr.flush()))
 
 
 def entry_point():

@@ -230,6 +230,15 @@ if (Test-Path $AgentExePath) {
     Write-Ok "Removed existing executable"
 }
 
+# 1e2. Clean old bin\ subdirectory (legacy PS1 wrapper installs)
+$oldBinDir = "$ConfigDir\bin"
+if (Test-Path $oldBinDir) {
+    $existing = $true
+    Remove-Item "$oldBinDir\*" -Force -ErrorAction SilentlyContinue
+    Remove-Item $oldBinDir -Force -ErrorAction SilentlyContinue
+    Write-Ok "Removed legacy bin\ directory"
+}
+
 # 1f. Detect and remove pip-installed version
 $pipAgent = Get-Command "orchestratia-agent" -ErrorAction SilentlyContinue
 if ($pipAgent -and $pipAgent.Source -ne $AgentExePath) {

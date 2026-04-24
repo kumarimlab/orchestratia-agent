@@ -635,13 +635,21 @@ function Merge-JsonHooks($SettingsPath, $SessionEvent, $PretoolEvent, $ContextCm
         Write-Warn "Python not found — cannot merge hooks into $SettingsPath"
         return $false
     }
+    # Pass commands via env vars to avoid PowerShell argument splitting on spaces
+    $env:_ORC_SETTINGS_PATH = $SettingsPath
+    $env:_ORC_SESSION_EVENT = $SessionEvent
+    $env:_ORC_PRETOOL_EVENT = $PretoolEvent
+    $env:_ORC_CONTEXT_CMD = $ContextCmd
+    $env:_ORC_PRETOOL_CMD = $PretoolCmd
+
     $pyScript = @"
-import json, os, sys
-path = sys.argv[1]
-session_event = sys.argv[2]
-pretool_event = sys.argv[3]
-context_cmd = sys.argv[4]
-pretool_cmd = sys.argv[5]
+import json, os
+
+path = os.environ['_ORC_SETTINGS_PATH']
+session_event = os.environ['_ORC_SESSION_EVENT']
+pretool_event = os.environ['_ORC_PRETOOL_EVENT']
+context_cmd = os.environ['_ORC_CONTEXT_CMD']
+pretool_cmd = os.environ['_ORC_PRETOOL_CMD']
 
 settings = {}
 if os.path.exists(path):
@@ -652,10 +660,11 @@ if os.path.exists(path):
 
 hooks = settings.setdefault('hooks', {})
 
-for event, cmd in [(session_event, context_cmd), (pretool_event, pretool_cmd)]:
-    event_list = hooks.setdefault(event, [])
-    if not any('orchestratia' in str(e) for e in event_list):
-        event_list.append({'hooks': [{'type': 'command', 'command': cmd, 'timeout': 10000 if 'context' in cmd else 30000}]})
+# Remove old orchestratia hooks first, then add fresh
+for event, cmd, timeout in [(session_event, context_cmd, 10000), (pretool_event, pretool_cmd, 30000)]:
+    event_list = hooks.get(event, [])
+    hooks[event] = [e for e in event_list if 'orchestratia' not in str(e)]
+    hooks[event].append({'hooks': [{'type': 'command', 'command': cmd, 'timeout': timeout}]})
 
 with open(path, 'w', encoding='utf-8', newline='\n') as f:
     json.dump(settings, f, indent=2)
@@ -664,8 +673,14 @@ with open(path, 'w', encoding='utf-8', newline='\n') as f:
     $pyTmp = "$env:TEMP\orc_merge_hooks.py"
     Set-Content -Path $pyTmp -Value $pyScript -Encoding ASCII
     try {
-        & $PythonExe $pyTmp $SettingsPath $SessionEvent $PretoolEvent $ContextCmd $PretoolCmd 2>&1 | Out-Null
+        & $PythonExe $pyTmp 2>&1 | Out-Null
         Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
+        # Clean up env vars
+        Remove-Item Env:\_ORC_SETTINGS_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:\_ORC_SESSION_EVENT -ErrorAction SilentlyContinue
+        Remove-Item Env:\_ORC_PRETOOL_EVENT -ErrorAction SilentlyContinue
+        Remove-Item Env:\_ORC_CONTEXT_CMD -ErrorAction SilentlyContinue
+        Remove-Item Env:\_ORC_PRETOOL_CMD -ErrorAction SilentlyContinue
         return ($LASTEXITCODE -eq 0)
     } catch {
         Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue

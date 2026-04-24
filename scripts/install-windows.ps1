@@ -629,20 +629,20 @@ $PretoolHookCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$HookDi
 $PythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $PythonExe) { $PythonExe = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
 
-# Helper: merge hooks into a JSON settings file
-function Merge-JsonHooks($SettingsPath, $SessionEvent, $PretoolEvent, $ContextCmd, $PretoolCmd) {
-    if (-not $PythonExe) {
-        Write-Warn "Python not found — cannot merge hooks into $SettingsPath"
-        return $false
-    }
-    # Pass commands via env vars to avoid PowerShell argument splitting on spaces
+# Helper: write hooks into an agent's settings file.
+# Reads existing settings, REPLACES all orchestratia hooks (no merge/append),
+# preserves any non-orchestratia hooks the user may have added.
+function Set-AgentHooks($SettingsPath, $SessionEvent, $PretoolEvent, $ContextCmd, $PretoolCmd) {
+    # Use env vars to avoid PowerShell splitting paths with spaces
     $env:_ORC_SETTINGS_PATH = $SettingsPath
     $env:_ORC_SESSION_EVENT = $SessionEvent
     $env:_ORC_PRETOOL_EVENT = $PretoolEvent
     $env:_ORC_CONTEXT_CMD = $ContextCmd
     $env:_ORC_PRETOOL_CMD = $PretoolCmd
 
-    $pyScript = @"
+    # Try Python first (reliable JSON handling)
+    if ($PythonExe) {
+        $pyScript = @"
 import json, os
 
 path = os.environ['_ORC_SETTINGS_PATH']
@@ -660,30 +660,53 @@ if os.path.exists(path):
 
 hooks = settings.setdefault('hooks', {})
 
-# Remove old orchestratia hooks first, then add fresh
-for event, cmd, timeout in [(session_event, context_cmd, 10000), (pretool_event, pretool_cmd, 30000)]:
-    event_list = hooks.get(event, [])
-    hooks[event] = [e for e in event_list if 'orchestratia' not in str(e)]
-    hooks[event].append({'hooks': [{'type': 'command', 'command': cmd, 'timeout': timeout}]})
+# Remove ALL hooks that look like ours (orchestratia, ExecutionPolicy Bypass, or broken fragments)
+def is_ours(entry):
+    s = str(entry).lower()
+    return 'orchestratia' in s or ('executionpolicy' in s and 'bypass' in s)
+
+for event in [session_event, pretool_event]:
+    hooks[event] = [e for e in hooks.get(event, []) if not is_ours(e)]
+
+# Add exactly one hook for each event
+hooks[session_event].append({'hooks': [{'type': 'command', 'command': context_cmd, 'timeout': 10000}]})
+hooks[pretool_event].append({'hooks': [{'type': 'command', 'command': pretool_cmd, 'timeout': 30000}]})
 
 with open(path, 'w', encoding='utf-8', newline='\n') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
 "@
-    $pyTmp = "$env:TEMP\orc_merge_hooks.py"
-    Set-Content -Path $pyTmp -Value $pyScript -Encoding ASCII
+        $pyTmp = "$env:TEMP\orc_merge_hooks.py"
+        Set-Content -Path $pyTmp -Value $pyScript -Encoding ASCII
+        try {
+            & $PythonExe $pyTmp 2>&1 | Out-Null
+            $ok = ($LASTEXITCODE -eq 0)
+            Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
+            Remove-Item Env:\_ORC_* -ErrorAction SilentlyContinue
+            return $ok
+        } catch {
+            Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Fallback: no Python — write settings directly with PowerShell.
+    # This overwrites the hooks section entirely (user's custom hooks are lost).
     try {
-        & $PythonExe $pyTmp 2>&1 | Out-Null
-        Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
-        # Clean up env vars
-        Remove-Item Env:\_ORC_SETTINGS_PATH -ErrorAction SilentlyContinue
-        Remove-Item Env:\_ORC_SESSION_EVENT -ErrorAction SilentlyContinue
-        Remove-Item Env:\_ORC_PRETOOL_EVENT -ErrorAction SilentlyContinue
-        Remove-Item Env:\_ORC_CONTEXT_CMD -ErrorAction SilentlyContinue
-        Remove-Item Env:\_ORC_PRETOOL_CMD -ErrorAction SilentlyContinue
-        return ($LASTEXITCODE -eq 0)
+        $settings = @{}
+        if (Test-Path $SettingsPath) {
+            try { $settings = Get-Content $SettingsPath -Raw | ConvertFrom-Json -AsHashtable } catch { $settings = @{} }
+        }
+        $settings['hooks'] = @{
+            $SessionEvent = @(
+                @{ hooks = @( @{ type = 'command'; command = $ContextCmd; timeout = 10000 } ) }
+            )
+            $PretoolEvent = @(
+                @{ hooks = @( @{ type = 'command'; command = $PretoolCmd; timeout = 30000 } ) }
+            )
+        }
+        $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsPath -Encoding UTF8
+        return $true
     } catch {
-        Remove-Item $pyTmp -Force -ErrorAction SilentlyContinue
         return $false
     }
 }
@@ -700,7 +723,7 @@ if ($ClaudeDetected) {
 
     $ClaudeSettings = "$env:USERPROFILE\.claude\settings.json"
     New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.claude" | Out-Null
-    if (Merge-JsonHooks $ClaudeSettings "SessionStart" "PreToolUse" $ContextHookCmd $PretoolHookCmd) {
+    if (Set-AgentHooks $ClaudeSettings "SessionStart" "PreToolUse" $ContextHookCmd $PretoolHookCmd) {
         Write-Ok "Claude Code hooks configured"
     } else { Write-Warn "Could not configure Claude Code hooks" }
 }
@@ -720,7 +743,7 @@ if ($GeminiDetected) {
 
     $GeminiSettings = "$env:USERPROFILE\.gemini\settings.json"
     New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.gemini" | Out-Null
-    if (Merge-JsonHooks $GeminiSettings "SessionStart" "BeforeTool" $ContextHookCmd $PretoolHookCmd) {
+    if (Set-AgentHooks $GeminiSettings "SessionStart" "BeforeTool" $ContextHookCmd $PretoolHookCmd) {
         Write-Ok "Gemini CLI hooks configured"
     } else { Write-Warn "Could not configure Gemini CLI hooks" }
 }

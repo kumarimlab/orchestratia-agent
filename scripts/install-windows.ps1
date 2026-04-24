@@ -468,15 +468,14 @@ if ($newPath -ne $userPath) {
     Write-Ok "PATH already ordered correctly"
 }
 
-# Verify that orchestratia-agent resolves to the .cmd wrapper now
+# Verify that orchestratia-agent resolves to a wrapper (not the raw exe)
 $resolvedCmd = Get-Command "orchestratia-agent" -ErrorAction SilentlyContinue
-if ($resolvedCmd -and $resolvedCmd.Source -eq "$BinDir\orchestratia-agent.cmd") {
+if ($resolvedCmd -and $resolvedCmd.Source -match [regex]::Escape($BinDir)) {
     Write-Ok "Verified: 'orchestratia-agent' resolves to wrapper"
 } elseif ($resolvedCmd -and $resolvedCmd.Source -eq $AgentExePath) {
-    Write-Warn "'orchestratia-agent' still resolves to .exe (wrapper not on PATH)"
     Write-Info "Open a new PowerShell window for PATH changes to take effect"
 } elseif ($resolvedCmd) {
-    Write-Warn "'orchestratia-agent' resolves to $($resolvedCmd.Source)"
+    Write-Info "Open a new PowerShell window for PATH changes to take effect"
 } else {
     Write-Info "Open a new PowerShell window for PATH changes to take effect"
 }

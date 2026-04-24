@@ -237,7 +237,7 @@ if ($pipAgent -and $pipAgent.Source -ne $AgentExePath) {
     $pipPath = $pipAgent.Source
     Write-Info "Found existing installation at: $pipPath"
 
-    # Check if it's a pip-installed script (lives in a Python Scripts directory)
+    # Check if it's a pip-installed or Orchestratia's own old install
     if ($pipPath -match "Python.*Scripts" -or $pipPath -match "site-packages" -or $pipPath -match "anaconda.*Scripts" -or $pipPath -match "conda.*Scripts" -or $pipPath -match "envs.*Scripts") {
         Write-Info "Detected pip-installed version, removing..."
         # Try pip uninstall
@@ -257,16 +257,31 @@ if ($pipAgent -and $pipAgent.Source -ne $AgentExePath) {
         # Verify removal — delete script files directly if pip uninstall missed them
         if (Test-Path $pipPath) {
             Remove-Item $pipPath -Force -ErrorAction SilentlyContinue
-            # Also remove the -script.py and .exe.manifest variants
             $pipDir = Split-Path $pipPath
             Remove-Item "$pipDir\orchestratia-agent-script.py" -Force -ErrorAction SilentlyContinue
             Remove-Item "$pipDir\orchestratia.exe" -Force -ErrorAction SilentlyContinue
             Remove-Item "$pipDir\orchestratia-script.py" -Force -ErrorAction SilentlyContinue
             Write-Ok "Cleaned up leftover pip script files"
         }
+    } elseif ($pipPath -match "Orchestratia") {
+        # Previous Orchestratia install (old PS1 wrapper or bin directory)
+        Write-Info "Detected previous Orchestratia installation, cleaning up..."
+        $pipDir = Split-Path $pipPath
+        Remove-Item $pipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item "$pipDir\orchestratia-agent.ps1" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$pipDir\orchestratia.ps1" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$pipDir\orchestratia-agent.exe" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$pipDir\orchestratia.exe" -Force -ErrorAction SilentlyContinue
+        # Clean the bin directory if it's now empty
+        if ((Test-Path $pipDir) -and (Get-ChildItem $pipDir -ErrorAction SilentlyContinue).Count -eq 0) {
+            Remove-Item $pipDir -Force -ErrorAction SilentlyContinue
+        }
+        Write-Ok "Removed previous Orchestratia installation"
     } else {
-        # It's some other installation (manual copy, etc.)
-        Write-Warn "Found unknown installation at: $pipPath — remove it manually if needed"
+        # Unknown installation — remove it anyway since we're doing a fresh install
+        Write-Info "Removing previous installation at: $pipPath"
+        Remove-Item $pipPath -Force -ErrorAction SilentlyContinue
+        Write-Ok "Removed old installation"
     }
 }
 

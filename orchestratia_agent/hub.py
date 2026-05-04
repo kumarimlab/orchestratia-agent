@@ -547,7 +547,13 @@ async def ws_receive_loop(ws, state: DaemonState):
         return sender
 
     def _on_session_close(session_id: str):
-        state.active_sessions.pop(session_id, None)
+        session = state.active_sessions.pop(session_id, None)
+        # Trigger architecture scan if session had a working directory
+        if session and hasattr(session, 'working_directory') and session.working_directory:
+            project_id = getattr(session, 'project_id', '') or ''
+            asyncio.create_task(_run_architecture_scan(
+                state, session.working_directory, session_id, project_id, "session_closed",
+            ))
 
     sender = _make_ws_sender(state)
 
@@ -1003,6 +1009,16 @@ async def ws_receive_loop(ws, state: DaemonState):
                 log.info("Approval rules updated by hub, refreshing cache")
                 asyncio.create_task(_refresh_rules_cache(state))
 
+            elif msg_type == "scan_architecture":
+                # On-demand scan requested by hub
+                working_dir = msg.get("working_directory", "")
+                session_id = msg.get("session_id", "")
+                project_id = msg.get("project_id", "")
+                if working_dir:
+                    asyncio.create_task(_run_architecture_scan(
+                        state, working_dir, session_id, project_id, "on_demand",
+                    ))
+
             elif msg_type == "pong":
                 pass
 
@@ -1401,3 +1417,47 @@ async def cleanup_sessions(state: DaemonState):
             log.info(f"Closing plain session {session_id[:8]}")
             session.close_graceful()
     state.active_sessions.clear()
+
+
+async def _run_architecture_scan(
+    state,
+    working_directory: str,
+    session_id: str,
+    project_id: str,
+    triggered_by: str,
+):
+    """Run codebase scanner in executor thread and send results to hub."""
+    try:
+        from orchestratia_agent.codebase_scanner import CodebaseScanner
+        import os
+
+        if not os.path.isdir(working_directory):
+            log.warning(f"Scanner: working directory not found: {working_directory}")
+            return
+
+        log.info(f"Scanner: starting {triggered_by} scan of {working_directory}")
+
+        loop = asyncio.get_event_loop()
+        scanner = CodebaseScanner(working_directory)
+        snapshot = await loop.run_in_executor(None, scanner.scan)
+
+        # Add context
+        snapshot["triggered_by"] = triggered_by
+        snapshot["session_id"] = session_id
+        snapshot["project_id"] = project_id
+
+        # Send to hub
+        await ws_send(state, {
+            "type": "architecture_snapshot",
+            "session_id": session_id,
+            "project_id": project_id,
+            "snapshot": snapshot,
+        })
+
+        log.info(
+            f"Scanner: {triggered_by} scan complete — "
+            f"score={snapshot['health']['score']} ({snapshot['health']['grade']}), "
+            f"sent to hub"
+        )
+    except Exception as e:
+        log.warning(f"Scanner: scan failed — {e}")

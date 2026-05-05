@@ -6,17 +6,16 @@ import os
 def generate_module_diagram(modules: list[dict], edges: list[dict], max_nodes: int = 20) -> str:
     """Generate a Mermaid flowchart showing module-level dependencies.
 
-    Groups files into high-level modules (max 2 directory levels deep) and
-    shows dependency arrows between them. Limited to max_nodes to keep
-    the diagram readable.
+    Groups files into modules (max 3 directory levels deep) and shows
+    dependency arrows between them. Limited to max_nodes to keep readable.
     """
     if not modules:
         return "graph TD\n  empty[No modules detected]"
 
-    # Aggregate modules to max 2 levels deep
+    # Aggregate modules to max 3 levels deep (keeps api/services/models separate)
     aggregated = {}
     for m in modules:
-        key = _collapse_path(m["path"], max_depth=2)
+        key = _collapse_path(m["path"], max_depth=3)
         if key not in aggregated:
             aggregated[key] = {"path": key, "files": 0, "lines": 0, "complexity": 0, "functions": 0, "count": 0}
         agg = aggregated[key]
@@ -33,8 +32,8 @@ def generate_module_diagram(modules: list[dict], edges: list[dict], max_nodes: i
     # Aggregate edges at the same level
     module_edges = set()
     for edge in edges:
-        src_mod = _collapse_path(os.path.dirname(edge["from"]) or ".", max_depth=2)
-        tgt_mod = _collapse_path(os.path.dirname(edge["to"]) or ".", max_depth=2)
+        src_mod = _collapse_path(os.path.dirname(edge["from"]) or ".", max_depth=3)
+        tgt_mod = _collapse_path(os.path.dirname(edge["to"]) or ".", max_depth=3)
         if src_mod != tgt_mod and src_mod in aggregated and tgt_mod in aggregated:
             module_edges.add((src_mod, tgt_mod))
 

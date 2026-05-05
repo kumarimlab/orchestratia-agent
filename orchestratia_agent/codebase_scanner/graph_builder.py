@@ -4,6 +4,8 @@ from collections import defaultdict
 
 
 def build_dependency_graph(files: list[dict], repo_path: str) -> dict:
+    global _prefix_cache
+    _prefix_cache = None  # Reset cache for each scan
     """Build a module dependency graph from file analysis results.
 
     Args:
@@ -83,6 +85,13 @@ def _resolve_import(imp: str, source_path: str, known_paths: set, repo_path: str
         if candidate in known_paths:
             return candidate
 
+    # Try with common prefixes (Python projects often have source in a subdirectory)
+    # e.g., import "app.services.task_service" → file at "backend/app/services/task_service.py"
+    for prefix in _guess_prefixes(known_paths):
+        for candidate in [f"{prefix}/{parts}.py", f"{prefix}/{parts}/__init__.py"]:
+            if candidate in known_paths:
+                return candidate
+
     # For relative JS/TS imports (starting with ./ or ../)
     if imp.startswith("./") or imp.startswith("../"):
         import os
@@ -93,7 +102,45 @@ def _resolve_import(imp: str, source_path: str, known_paths: set, repo_path: str
             if candidate in known_paths:
                 return candidate
 
+    # Try relative to source file's package root
+    # e.g., source is "backend/app/api/v1/tasks.py", import is "app.services..."
+    # → try "backend/app/services/..."
+    source_parts = source_path.replace("\\", "/").split("/")
+    for i in range(len(source_parts)):
+        prefix = "/".join(source_parts[:i])
+        candidate = f"{prefix}/{parts}.py" if prefix else f"{parts}.py"
+        if candidate in known_paths:
+            return candidate
+
     return None
+
+
+_prefix_cache: list[str] | None = None
+
+
+def _guess_prefixes(known_paths: set) -> list[str]:
+    """Guess common path prefixes from known file paths."""
+    global _prefix_cache
+    if _prefix_cache is not None:
+        return _prefix_cache
+
+    # Find directories that contain __init__.py (Python package roots)
+    prefixes = set()
+    for p in known_paths:
+        if p.endswith("__init__.py"):
+            parts = p.replace("\\", "/").split("/")
+            # The parent of the package root directory
+            if len(parts) >= 3:
+                prefixes.add("/".join(parts[:-2]))  # e.g., "backend" from "backend/app/__init__.py"
+
+    # Also try common patterns
+    for p in known_paths:
+        parts = p.replace("\\", "/").split("/")
+        if len(parts) >= 2:
+            prefixes.add(parts[0])  # top-level dirs like "backend", "frontend"
+
+    _prefix_cache = sorted(prefixes)
+    return _prefix_cache
 
 
 def _find_cycles(adj: dict[str, set]) -> list[list[str]]:

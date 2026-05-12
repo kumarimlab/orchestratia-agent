@@ -1106,24 +1106,30 @@ async def report_alive_sessions(state: DaemonState):
             if s.tmux_name and s.tmux_name in surviving_ids:
                 handle = backend.reattach(sid, s.tmux_name, 120, 40, env_vars=recovery_env)
                 if handle:
+                    # Recover working_dir for editor fs.* operations:
+                    # prefer tmux pane cwd, fall back to /proc/{pid}/cwd.
+                    rec_cwd = _tmux_pane_cwd(s.tmux_name) or _proc_cwd(handle.pid)
                     new_session = ManagedSession(
                         sid, handle, backend, sender,
                         on_close=_on_session_close,
+                        working_dir=rec_cwd,
                     )
                     state.active_sessions[sid] = new_session
                     await new_session.start_reader()
-                    log.info(f"Reattached to surviving tmux session {s.tmux_name} for {sid[:8]}")
+                    log.info(f"Reattached to surviving tmux session {s.tmux_name} for {sid[:8]} (cwd={rec_cwd or 'unknown'})")
                     continue
             elif is_pty_host and sid in surviving_ids:
                 handle = backend.reattach(sid, sid, 120, 40, env_vars=recovery_env)
                 if handle:
+                    rec_cwd = _proc_cwd(handle.pid)
                     new_session = ManagedSession(
                         sid, handle, backend, sender,
                         on_close=_on_session_close,
+                        working_dir=rec_cwd,
                     )
                     state.active_sessions[sid] = new_session
                     await new_session.start_reader()
-                    log.info(f"Reattached to surviving pty-host session {sid[:8]}")
+                    log.info(f"Reattached to surviving pty-host session {sid[:8]} (cwd={rec_cwd or 'unknown'})")
                     continue
             dead.append(sid)
 
@@ -1145,9 +1151,11 @@ async def report_alive_sessions(state: DaemonState):
                 log.info(f"Found orphaned pty-host session: {surviving_id[:8]}")
                 handle = backend.reattach(surviving_id, surviving_id, 120, 40, env_vars=recovery_env)
                 if handle:
+                    rec_cwd = _proc_cwd(handle.pid)
                     new_session = ManagedSession(
                         surviving_id, handle, backend, sender,
                         on_close=_on_session_close,
+                        working_dir=rec_cwd,
                     )
                     state.active_sessions[surviving_id] = new_session
                     # pty-host sessions already have UUID IDs — start reader immediately
@@ -1166,9 +1174,11 @@ async def report_alive_sessions(state: DaemonState):
                 log.info(f"Found orphaned tmux session: {surviving_id}")
                 handle = backend.reattach(surviving_id, surviving_id, 120, 40, env_vars=recovery_env)
                 if handle:
+                    rec_cwd = _tmux_pane_cwd(surviving_id) or _proc_cwd(handle.pid)
                     new_session = ManagedSession(
                         surviving_id, handle, backend, sender,
                         on_close=_on_session_close,
+                        working_dir=rec_cwd,
                     )
                     state.active_sessions[surviving_id] = new_session
                     # Don't start reader yet — it would send output with tmux_name
@@ -1388,6 +1398,49 @@ async def ws_connection_loop(state: DaemonState):
 
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 30)
+
+
+def _tmux_pane_cwd(tmux_name: str) -> str:
+    """Query tmux for the active pane's current working directory.
+
+    Recovered sessions don't carry their original spawn-time cwd through
+    a daemon restart. Without it, the editor's fs.* operations fail with
+    session_not_found. tmux tracks pane cwd in its own state, so we can
+    pull it back at reattach time. Returns "" on any failure.
+    """
+    if not tmux_name:
+        return ""
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", tmux_name, "#{pane_current_path}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            cwd = result.stdout.strip()
+            if cwd and os.path.isdir(cwd):
+                return cwd
+    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        pass
+    return ""
+
+
+def _proc_cwd(pid: int) -> str:
+    """Read /proc/{pid}/cwd on Linux — fallback for non-tmux recoveries.
+
+    Works for both POSIX backend (when not using tmux) and pty-host children.
+    Returns "" on Windows or any failure.
+    """
+    if not pid or pid <= 0:
+        return ""
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+        if cwd and os.path.isdir(cwd):
+            return cwd
+    except (OSError, FileNotFoundError):
+        pass
+    return ""
 
 
 async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_id: str, session_id: str, msg: dict):

@@ -827,6 +827,30 @@ async def ws_receive_loop(ws, state: DaemonState):
                     asyncio.create_task(_plan_revision_inject(session, feedback))
                     log.info(f"Plan revision injected into session {session_id[:8]}")
 
+            elif msg_type == "code_review_fix_request":
+                session_id = msg.get("session_id")
+                task_id = msg.get("task_id", "")
+                prompt = msg.get("prompt", "")
+                attempt = msg.get("attempt", 1)
+                max_retries = msg.get("max_retries", 2)
+                score = msg.get("score", 0)
+                session = state.active_sessions.get(session_id) if session_id else None
+                if session and not session.closed:
+                    async def _review_fix_inject(s, p):
+                        _inject_escape(s)
+                        await asyncio.sleep(2)
+                        _inject_text(s, p, send_enter=True)
+                    asyncio.create_task(_review_fix_inject(session, prompt))
+                    log.info(
+                        f"Code review fix request injected into session {session_id[:8]} "
+                        f"(attempt {attempt}/{max_retries}, score={score})"
+                    )
+                else:
+                    log.warning(
+                        f"Code review fix request for task {task_id[:8]}: "
+                        f"session {(session_id or 'none')[:8]} not found or closed"
+                    )
+
             elif msg_type == "task_status_update":
                 session_id = msg.get("session_id")
                 task_id = msg.get("task_id", "")

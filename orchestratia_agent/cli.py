@@ -362,9 +362,21 @@ def cmd_complete(args):
     except (json.JSONDecodeError, TypeError):
         pass  # plain string is fine
 
-    task = _api_request("POST", f"/{args.task_id}/complete", {
-        "result": result_value,
-    })
+    # Capture git diff stats for code review (best-effort)
+    git_diff_stats = None
+    try:
+        from orchestratia_agent.codebase_scanner.git_analyzer import capture_diff_stats
+        stats = capture_diff_stats(os.getcwd())
+        if stats.get("files_changed", 0) > 0:
+            git_diff_stats = stats
+    except Exception:
+        pass
+
+    payload = {"result": result_value}
+    if git_diff_stats:
+        payload["git_diff_stats"] = git_diff_stats
+
+    task = _api_request("POST", f"/{args.task_id}/complete", payload)
 
     if JSON_MODE:
         _json_output(task)

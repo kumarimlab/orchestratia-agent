@@ -47,6 +47,9 @@ def calculate_health_score(
 
     hotspots = sorted(hotspot_scores, key=hotspot_scores.get, reverse=True)[:10]
 
+    # Tech debt estimation
+    tech_debt = _estimate_tech_debt(files, graph, git_data)
+
     return {
         "score": max(0, min(100, overall)),
         "grade": _score_to_grade(overall),
@@ -57,6 +60,7 @@ def calculate_health_score(
             "structure": structure_score,
         },
         "hotspots": hotspots,
+        "tech_debt": tech_debt,
     }
 
 
@@ -191,6 +195,85 @@ def _score_structure(files: list[dict], modules: list[dict]) -> dict:
         details.append("Consistent module structure")
 
     return {"score": max(0, score), "details": "; ".join(details)}
+
+
+def _estimate_tech_debt(files: list[dict], graph: dict, git_data: dict) -> dict:
+    """Estimate technical debt in hours per file and total.
+
+    Rule-based estimation:
+    - Function complexity > 20: ~2h to decompose
+    - File > 500 lines: ~1h to split
+    - High churn + high complexity: ~4h to stabilize
+    - Circular dependency: ~3h to resolve per cycle
+    - Deep nesting (>20 functions): ~1.5h to flatten
+    """
+    churn = git_data.get("file_churn", {})
+    file_debts: list[dict] = []
+    total_hours = 0.0
+
+    for f in files:
+        path = f["path"]
+        lines = f.get("lines", 0)
+        complexity = f.get("complexity", 0)
+        func_count = f.get("function_count", 0)
+        file_churn = churn.get(path, 0)
+        hours = 0.0
+        reasons = []
+
+        # Large file
+        if lines > 800:
+            hours += 2.0
+            reasons.append("split large file (2h)")
+        elif lines > 500:
+            hours += 1.0
+            reasons.append("split oversized file (1h)")
+
+        # High complexity
+        if complexity > 30:
+            hours += 3.0
+            reasons.append("reduce high complexity (3h)")
+        elif complexity > 20:
+            hours += 2.0
+            reasons.append("decompose complex functions (2h)")
+
+        # Many functions (deep file)
+        if func_count > 25:
+            hours += 1.5
+            reasons.append("extract functions to modules (1.5h)")
+        elif func_count > 20:
+            hours += 1.0
+            reasons.append("organize functions (1h)")
+
+        # High churn + complexity = hotspot debt
+        if file_churn > 10 and complexity > 15:
+            hours += 4.0
+            reasons.append("stabilize high-churn hotspot (4h)")
+        elif file_churn > 10:
+            hours += 1.0
+            reasons.append("reduce churn (1h)")
+
+        if hours > 0:
+            file_debts.append({
+                "path": path,
+                "hours": round(hours, 1),
+                "reasons": reasons,
+            })
+            total_hours += hours
+
+    # Circular dependencies
+    circular = graph.get("circular_deps", [])
+    circular_hours = len(circular) * 3.0
+    total_hours += circular_hours
+
+    # Sort by debt descending
+    file_debts.sort(key=lambda x: x["hours"], reverse=True)
+
+    return {
+        "total_hours": round(total_hours, 1),
+        "file_count": len(file_debts),
+        "circular_dep_hours": round(circular_hours, 1),
+        "files": file_debts[:30],  # Top 30 debtors
+    }
 
 
 def _score_to_grade(score: int) -> str:

@@ -110,6 +110,12 @@ class CodebaseScanner:
         # Count all files (including non-analyzed ones like YAML, MD, etc.)
         all_files = self._count_all_files()
 
+        # Build tech debt lookup for per-file data
+        debt_lookup = {}
+        tech_debt = health.get("tech_debt", {})
+        for fd in tech_debt.get("files", []):
+            debt_lookup[fd["path"]] = fd["hours"]
+
         snapshot = {
             "repo_path": self.repo_path,
             "git_commit": git_data.get("current_commit"),
@@ -133,6 +139,7 @@ class CodebaseScanner:
                     "class_count": f.get("class_count", 0),
                     "complexity": f.get("complexity", 0),
                     "churn": f.get("churn", 0),
+                    "tech_debt_hours": debt_lookup.get(f["path"], 0),
                 }
                 for f in analyzed
             ],

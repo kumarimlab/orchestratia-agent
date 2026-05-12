@@ -29,6 +29,10 @@ Usage:
   orchestratia pipeline create --file pipeline.json [--json]
   orchestratia file send <path> --to <session-name> [--timeout 300]
   orchestratia file status <transfer-id>
+  orchestratia code health                    # Codebase health score & factors
+  orchestratia code debt                      # Tech debt summary
+  orchestratia code priorities                # Top files to fix
+  orchestratia code review <task_id>          # Code review findings for a task
   orchestratia grants [--json]
   orchestratia init [--print]
 
@@ -1597,6 +1601,156 @@ def cmd_file_status(args):
         print(f"  Error: {RED}{result['error']}{RESET}")
 
 
+# ── CodeLens: self-vetting commands ────────────────────────────
+
+def cmd_code_health(args):
+    """Show codebase health for the current project."""
+    if not PROJECT_ID:
+        _error_exit("ORCHESTRATIA_PROJECT_ID not set")
+
+    result = _api_request("GET", f"/health/{PROJECT_ID}", base="/api/v1/server/architecture")
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    if result.get("status") == "no_data":
+        print(f"{YELLOW}No architecture scan found. Run a scan first.{RESET}")
+        return
+
+    score = result.get("health_score", 0)
+    grade = result.get("health_grade", "?")
+    color = GREEN if score >= 70 else YELLOW if score >= 50 else RED
+
+    print(f"\n{BOLD}Codebase Health{RESET}")
+    print(f"  Score: {color}{score}/100 ({grade}){RESET}")
+    print(f"  Files: {result.get('total_files', 0)}  Lines: {result.get('total_lines', 0)}")
+
+    factors = result.get("factors", {})
+    if factors:
+        print(f"\n  {BOLD}Factors:{RESET}")
+        for name, data in factors.items():
+            s = data.get("score", 0)
+            c = GREEN if s >= 70 else YELLOW if s >= 50 else RED
+            print(f"    {name.capitalize():15s} {c}{s}/100{RESET}  {data.get('details', '')}")
+
+    debt = result.get("tech_debt_total_hours", 0)
+    if debt:
+        print(f"\n  {BOLD}Tech Debt:{RESET} {RED}{debt}h{RESET}")
+        for f in result.get("tech_debt_top_files", []):
+            print(f"    {f['path']:50s} {RED}{f['hours']}h{RESET}  {', '.join(f.get('reasons', []))}")
+
+    hotspots = result.get("hotspots", [])
+    if hotspots:
+        print(f"\n  {BOLD}Hotspots:{RESET}")
+        for h in hotspots[:5]:
+            print(f"    {RED}●{RESET} {h}")
+
+    print(f"\n  Scanned: {result.get('scanned_at', 'unknown')}")
+
+
+def cmd_code_debt(args):
+    """Show tech debt summary."""
+    if not PROJECT_ID:
+        _error_exit("ORCHESTRATIA_PROJECT_ID not set")
+
+    result = _api_request("GET", f"/health/{PROJECT_ID}", base="/api/v1/server/architecture")
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    if result.get("status") == "no_data":
+        print(f"{YELLOW}No architecture scan found. Run a scan first.{RESET}")
+        return
+
+    debt = result.get("tech_debt_total_hours", 0)
+    files = result.get("tech_debt_top_files", [])
+
+    print(f"\n{BOLD}Tech Debt Summary{RESET}")
+    print(f"  Total: {RED}{debt}h{RESET}")
+
+    if files:
+        print(f"\n  {BOLD}Top files to fix:{RESET}")
+        for i, f in enumerate(files, 1):
+            print(f"    {i}. {f['path']}")
+            print(f"       {RED}{f['hours']}h{RESET} — {', '.join(f.get('reasons', []))}")
+    else:
+        print(f"  {GREEN}No significant tech debt detected.{RESET}")
+
+
+def cmd_code_review_check(args):
+    """Check code review findings for a task."""
+    task_id = _resolve_task_id(args.task_id)
+
+    result = _api_request("GET", f"/reviews/{task_id}", base="/api/v1/server/architecture")
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    if result.get("status") == "no_review":
+        print(f"{YELLOW}No code review found for this task.{RESET}")
+        return
+
+    score = result.get("score", 0)
+    status = result.get("status", "?")
+    color = GREEN if status == "pass" else YELLOW if status == "warn" else RED
+
+    print(f"\n{BOLD}Code Review — Attempt {result.get('attempt_number', 1)}{RESET}")
+    print(f"  Score: {color}{score}/100 ({status.upper()}){RESET}")
+    print(f"  Summary: {result.get('summary', '')}")
+
+    findings = result.get("findings", [])
+    errors = [f for f in findings if f.get("severity") == "error"]
+    warnings = [f for f in findings if f.get("severity") == "warning"]
+
+    if errors:
+        print(f"\n  {RED}{BOLD}Errors ({len(errors)}):{RESET}")
+        for f in errors:
+            print(f"    {RED}✗{RESET} {f['title']}")
+            print(f"      {f.get('detail', '')}")
+
+    if warnings:
+        print(f"\n  {YELLOW}{BOLD}Warnings ({len(warnings)}):{RESET}")
+        for f in warnings:
+            print(f"    {YELLOW}⚠{RESET} {f['title']}")
+            print(f"      {f.get('detail', '')}")
+
+    diff = result.get("git_diff_stats")
+    if diff:
+        print(f"\n  {BOLD}Changes:{RESET} {diff.get('files_changed', 0)} files, +{diff.get('insertions', 0)}/-{diff.get('deletions', 0)}")
+
+
+def cmd_code_priorities(args):
+    """Show top files to fix for maximum impact."""
+    if not PROJECT_ID:
+        _error_exit("ORCHESTRATIA_PROJECT_ID not set")
+
+    result = _api_request("GET", f"/health/{PROJECT_ID}", base="/api/v1/server/architecture")
+
+    if JSON_MODE:
+        _json_output(result)
+        return
+
+    if result.get("status") == "no_data":
+        print(f"{YELLOW}No architecture scan found. Run a scan first.{RESET}")
+        return
+
+    files = result.get("tech_debt_top_files", [])
+    if not files:
+        print(f"{GREEN}No priority fixes needed — codebase is healthy!{RESET}")
+        return
+
+    print(f"\n{BOLD}Top Priorities — Fix These for Maximum Impact{RESET}")
+    for i, f in enumerate(files, 1):
+        color = RED if i <= 2 else YELLOW if i <= 3 else RESET
+        print(f"\n  {color}{BOLD}{i}. {f['path']}{RESET}")
+        print(f"     Debt: {RED}{f['hours']}h{RESET}")
+        for r in f.get("reasons", []):
+            print(f"     • {r}")
+
+
 def main():
     global JSON_MODE
 
@@ -1812,6 +1966,17 @@ def main():
     # ── update subcommand ──
     subparsers.add_parser("update", help="Update agent: pull latest code, reinstall package, refresh skill")
 
+    # ── code subcommand (CodeLens self-vetting) ──
+    code_parser = subparsers.add_parser("code", help="Code quality & architecture commands")
+    code_sub = code_parser.add_subparsers(dest="action")
+
+    code_sub.add_parser("health", help="Show codebase health score and factors")
+    code_sub.add_parser("debt", help="Show tech debt summary")
+    code_sub.add_parser("priorities", help="Show top files to fix for maximum impact")
+
+    code_review_p = code_sub.add_parser("review", help="Check code review findings for a task")
+    code_review_p.add_argument("task_id", help="Task ID to check review for")
+
     # ── init subcommand ──
     init_parser = subparsers.add_parser("init", help="Generate ORCHESTRATIA.md for this repo")
     init_parser.add_argument("--print", dest="print_only", action="store_true",
@@ -1931,6 +2096,19 @@ def main():
 
     elif args.command == "update":
         cmd_agent_update(args)
+
+    elif args.command == "code":
+        if not args.action:
+            code_parser.print_help()
+            sys.exit(1)
+
+        code_actions = {
+            "health": cmd_code_health,
+            "debt": cmd_code_debt,
+            "review": cmd_code_review_check,
+            "priorities": cmd_code_priorities,
+        }
+        code_actions[args.action](args)
 
     elif args.command == "init":
         cmd_init(args)

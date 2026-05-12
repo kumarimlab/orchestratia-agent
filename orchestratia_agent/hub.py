@@ -583,9 +583,16 @@ async def ws_receive_loop(ws, state: DaemonState):
                         env_vars=env_vars, project_id=project_id,
                     )
                     if handle:
+                        # Compute the resolved working_dir so fs operations
+                        # sandbox correctly. backend.spawn may have fallen
+                        # back to $HOME if the requested dir didn't exist.
+                        resolved_cwd = working_dir or os.path.expanduser("~")
+                        if not os.path.isdir(resolved_cwd):
+                            resolved_cwd = os.path.expanduser("~")
                         session = ManagedSession(
                             session_id, handle, backend, sender,
                             on_close=_on_session_close,
+                            working_dir=resolved_cwd,
                         )
                         state.active_sessions[session_id] = session
                         await session.start_reader()
@@ -971,6 +978,14 @@ async def ws_receive_loop(ws, state: DaemonState):
                 command = msg.get("command", "")
                 if request_id and command:
                     asyncio.create_task(_handle_remote_exec(sender, request_id, command))
+
+            elif msg_type in ("fs_list_dir", "fs_read_file", "fs_write_file", "fs_stat"):
+                # Editor side-panel filesystem ops. All scoped to the
+                # session's working_dir via fs_handler safety checks.
+                request_id = msg.get("request_id")
+                session_id = msg.get("session_id")
+                if request_id and session_id:
+                    asyncio.create_task(_handle_fs_request(state, sender, msg_type, request_id, session_id, msg))
 
             # ── File Transfer Messages ──
             elif msg_type == "file_offer":
@@ -1373,6 +1388,55 @@ async def ws_connection_loop(state: DaemonState):
 
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 30)
+
+
+async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_id: str, session_id: str, msg: dict):
+    """Dispatch a filesystem operation for the editor side panel.
+
+    Looks up the session's working_dir from local state (never trusts a
+    cwd supplied by the hub), runs the matching fs_handler operation in a
+    thread (IO-bound), and replies with type + "_result" carrying the
+    original request_id.
+    """
+    from orchestratia_agent import fs_handler
+
+    result_type = f"{msg_type}_result"
+    session = state.active_sessions.get(session_id)
+
+    if not session or not getattr(session, "working_dir", ""):
+        await sender({
+            "type": result_type,
+            "request_id": request_id,
+            "ok": False,
+            "error": "session_not_found",
+        })
+        return
+
+    root = session.working_dir
+    rel_path = msg.get("path", "")
+
+    try:
+        loop = asyncio.get_running_loop()
+        if msg_type == "fs_list_dir":
+            result = await loop.run_in_executor(None, fs_handler.list_dir, root, rel_path)
+        elif msg_type == "fs_read_file":
+            result = await loop.run_in_executor(None, fs_handler.read_file, root, rel_path)
+        elif msg_type == "fs_write_file":
+            content = msg.get("content", "")
+            expected_sha256 = msg.get("expected_sha256")
+            result = await loop.run_in_executor(
+                None, fs_handler.write_file, root, rel_path, content, expected_sha256,
+            )
+        elif msg_type == "fs_stat":
+            result = await loop.run_in_executor(None, fs_handler.stat, root, rel_path)
+        else:
+            result = {"ok": False, "error": "unknown_op"}
+    except Exception as e:
+        log.error(f"fs_handler {msg_type} crashed: {e}", exc_info=True)
+        result = {"ok": False, "error": "internal_error"}
+
+    response = {"type": result_type, "request_id": request_id, **result}
+    await sender(response)
 
 
 async def _handle_remote_exec(sender, request_id: str, command: str):

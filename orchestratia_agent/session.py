@@ -95,12 +95,17 @@ class ManagedSession:
         backend: SessionBackend,
         ws_send: Callable[[dict], Awaitable[bool]],
         on_close: Callable[[str], None] | None = None,
+        working_dir: str | None = None,
     ):
         self.session_id = session_id
         self.handle = handle
         self.backend = backend
         self._ws_send = ws_send
         self._on_close = on_close
+        # Filesystem root for this session. Used by fs_handler to sandbox
+        # editor read/write operations. Falls back to home dir on recovery
+        # when the original cwd wasn't preserved through the daemon restart.
+        self.working_dir: str = working_dir or ""
         self.reader_task: asyncio.Task | None = None
         self.capture_task: asyncio.Task | None = None
         self._last_screen: list[str] = []

@@ -29,6 +29,7 @@ Usage:
   orchestratia pipeline create --file pipeline.json [--json]
   orchestratia file send <path> --to <session-name> [--timeout 300]
   orchestratia file status <transfer-id>
+  orchestratia code scan [path]                # Run scan and submit to hub
   orchestratia code health                    # Codebase health score & factors
   orchestratia code debt                      # Tech debt summary
   orchestratia code priorities                # Top files to fix
@@ -1603,6 +1604,53 @@ def cmd_file_status(args):
 
 # ── CodeLens: self-vetting commands ────────────────────────────
 
+def cmd_code_scan(args):
+    """Run a codebase scan and submit results to the hub."""
+    if not PROJECT_ID:
+        _error_exit("ORCHESTRATIA_PROJECT_ID not set")
+
+    scan_path = args.path or os.getcwd()
+    if not os.path.isdir(scan_path):
+        _error_exit(f"Directory not found: {scan_path}")
+
+    if not JSON_MODE:
+        print(f"{YELLOW}[ORCHESTRATIA]{RESET} Scanning {scan_path}...")
+
+    try:
+        from orchestratia_agent.codebase_scanner import CodebaseScanner
+        snapshot = CodebaseScanner(scan_path).scan()
+    except Exception as e:
+        _error_exit(f"Scan failed: {e}")
+
+    health = snapshot.get("health", {})
+    score = health.get("score", 0)
+    grade = health.get("grade", "?")
+    tech_debt = health.get("tech_debt", {})
+
+    if not JSON_MODE:
+        print(f"  Score: {score}/100 ({grade})")
+        print(f"  Files: {snapshot['stats']['total_files']}  Lines: {snapshot['stats']['total_lines']}")
+        if tech_debt.get("total_hours"):
+            print(f"  Tech Debt: {tech_debt['total_hours']}h")
+        print(f"  Submitting to hub...")
+
+    try:
+        result = _api_request("POST", "/snapshot", {
+            "project_id": PROJECT_ID,
+            "snapshot": snapshot,
+        }, base="/api/v1/server/architecture")
+
+        if JSON_MODE:
+            _json_output(result)
+        else:
+            print(f"{GREEN}[ORCHESTRATIA]{RESET} Scan submitted: score={result.get('health_score', score)} ({result.get('health_grade', grade)})")
+    except SystemExit:
+        # _api_request calls _error_exit on failure, which raises SystemExit
+        raise
+    except Exception as e:
+        _error_exit(f"Failed to submit scan: {e}")
+
+
 def cmd_code_health(args):
     """Show codebase health for the current project."""
     if not PROJECT_ID:
@@ -1970,6 +2018,9 @@ def main():
     code_parser = subparsers.add_parser("code", help="Code quality & architecture commands")
     code_sub = code_parser.add_subparsers(dest="action")
 
+    code_scan_p = code_sub.add_parser("scan", help="Run codebase scan and submit to hub")
+    code_scan_p.add_argument("path", nargs="?", default=None, help="Path to scan (defaults to current directory)")
+
     code_sub.add_parser("health", help="Show codebase health score and factors")
     code_sub.add_parser("debt", help="Show tech debt summary")
     code_sub.add_parser("priorities", help="Show top files to fix for maximum impact")
@@ -2103,6 +2154,7 @@ def main():
             sys.exit(1)
 
         code_actions = {
+            "scan": cmd_code_scan,
             "health": cmd_code_health,
             "debt": cmd_code_debt,
             "review": cmd_code_review_check,

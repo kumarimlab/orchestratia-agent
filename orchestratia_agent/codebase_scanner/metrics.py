@@ -65,37 +65,35 @@ def calculate_health_score(
 
 
 def _score_complexity(files: list[dict]) -> dict:
-    """Score based on file sizes and function counts."""
+    """Score based on percentage of files exceeding complexity thresholds."""
     if not files:
         return {"score": 100, "details": "No files to analyze"}
 
-    penalties = 0
+    total = len(files)
     large_files = 0
     complex_files = 0
+    high_complexity = 0
 
     for f in files:
-        lines = f.get("lines", 0)
-        funcs = f.get("function_count", 0)
-        complexity = f.get("complexity", 0)
-
-        if lines > 800:
-            penalties += 5
+        if f.get("lines", 0) > 500:
             large_files += 1
-        elif lines > 500:
-            penalties += 2
-            large_files += 1
-
-        if funcs > 20:
-            penalties += 5
+        if f.get("function_count", 0) > 15:
             complex_files += 1
-        elif funcs > 15:
-            penalties += 2
-            complex_files += 1
+        if f.get("complexity", 0) > 30:
+            high_complexity += 1
 
-        if complexity > 30:
-            penalties += 3
+    # Percentage-based scoring: what proportion of files are problematic?
+    large_pct = large_files / total * 100
+    complex_pct = complex_files / total * 100
+    high_cx_pct = high_complexity / total * 100
 
-    score = max(0, 100 - penalties)
+    # Deduct based on percentages (scaled so 25%+ problematic files = 0)
+    score = 100
+    score -= min(40, large_pct * 1.6)      # 25% large files → -40
+    score -= min(35, complex_pct * 1.75)    # 20% complex files → -35
+    score -= min(25, high_cx_pct * 2.5)     # 10% high complexity → -25
+
+    score = max(0, min(100, round(score)))
     details = []
     if large_files:
         details.append(f"{large_files} large files (>500 lines)")

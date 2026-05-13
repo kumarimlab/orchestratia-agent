@@ -7,6 +7,8 @@ import sys
 
 import psutil
 
+from orchestratia_agent import __version__ as AGENT_VERSION
+
 
 def get_system_info() -> dict:
     """Gather current system stats (cross-platform)."""
@@ -39,6 +41,10 @@ def get_system_info() -> dict:
         "python_version": platform.python_version(),
         "uptime_seconds": int(psutil.boot_time()),
         "os_username": os_username,
+        # Reported on every heartbeat so the hub can show version
+        # distribution across the fleet and nudge stale agents. Phase 1
+        # of the agent auto-update plan — see docs/internal/agent-auto-update-plan.md.
+        "agent_version": AGENT_VERSION,
     }
 
 

@@ -174,25 +174,37 @@ info "Installing via pip..."
 # "Cannot uninstall <pkg>, RECORD file not found".
 # Modern Python installs on macOS (Homebrew 3.11+, system Python 3.14+)
 # are PEP-668 "externally managed" — they refuse pip install without an
-# explicit override. Try the clean invocation first; if PEP 668 blocks
-# it, retry with --break-system-packages.
-do_install() {
-    local extra="$1"
-    pip3 install --upgrade --no-cache-dir -q $extra "$INSTALL_SOURCE" 2>&1 && \
-    pip3 install --force-reinstall --no-deps --no-cache-dir -q $extra "$INSTALL_SOURCE" 2>&1
+# explicit override. Strategy: capture output, detect the PEP 668 marker
+# in stderr, and automatically retry with --break-system-packages. Show
+# what's happening so users aren't confused by silent retries.
+do_install_pass() {
+    local label="$1"; shift
+    local pip_out
+    info "${label}..."
+    if pip_out=$(pip3 install --upgrade --no-cache-dir "$@" "$INSTALL_SOURCE" 2>&1) && \
+       pip_out=$(pip3 install --force-reinstall --no-deps --no-cache-dir "$@" "$INSTALL_SOURCE" 2>&1); then
+        return 0
+    fi
+    # On failure, print the last pip output so the user sees the real cause
+    echo "$pip_out" | tail -25
+    return 1
 }
 
-if do_install ""; then
+if do_install_pass "Trying standard pip install"; then
     ok "Package installed"
-elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
-     do_install "--break-system-packages"; then
-    ok "Package installed (PEP 668 override applied)"
-    info "Note: this Python is externally-managed; --break-system-packages was needed."
 else
-    fail "pip install failed"
-    info "If you see 'externally-managed-environment', re-run with:"
-    info "  sudo pip3 install --break-system-packages $INSTALL_SOURCE"
-    fatal "Cannot proceed without the agent package."
+    warn "Standard install failed — retrying with --break-system-packages (PEP 668)"
+    if do_install_pass "Retrying with PEP 668 override" --break-system-packages; then
+        ok "Package installed"
+        info "Note: this Python is externally-managed; --break-system-packages was needed."
+    else
+        fail "pip install failed even with --break-system-packages"
+        info "Manual fallback:"
+        info "  sudo pip3 install --break-system-packages $INSTALL_SOURCE"
+        info "Or via pipx:"
+        info "  brew install pipx && pipx install $INSTALL_SOURCE"
+        fatal "Cannot proceed without the agent package."
+    fi
 fi
 
 AGENT_BIN=$(which orchestratia-agent 2>/dev/null || echo "")

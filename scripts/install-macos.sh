@@ -172,11 +172,26 @@ info "Installing via pip..."
 # (Debian apt, in certain Homebrew paths). --force-reinstall without
 # --no-deps tries to uninstall them and fails with
 # "Cannot uninstall <pkg>, RECORD file not found".
-if pip3 install --upgrade --no-cache-dir -q "$INSTALL_SOURCE" 2>&1 && \
-   pip3 install --force-reinstall --no-deps --no-cache-dir -q "$INSTALL_SOURCE" 2>&1; then
+# Modern Python installs on macOS (Homebrew 3.11+, system Python 3.14+)
+# are PEP-668 "externally managed" — they refuse pip install without an
+# explicit override. Try the clean invocation first; if PEP 668 blocks
+# it, retry with --break-system-packages.
+do_install() {
+    local extra="$1"
+    pip3 install --upgrade --no-cache-dir -q $extra "$INSTALL_SOURCE" 2>&1 && \
+    pip3 install --force-reinstall --no-deps --no-cache-dir -q $extra "$INSTALL_SOURCE" 2>&1
+}
+
+if do_install ""; then
     ok "Package installed"
+elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
+     do_install "--break-system-packages"; then
+    ok "Package installed (PEP 668 override applied)"
+    info "Note: this Python is externally-managed; --break-system-packages was needed."
 else
     fail "pip install failed"
+    info "If you see 'externally-managed-environment', re-run with:"
+    info "  sudo pip3 install --break-system-packages $INSTALL_SOURCE"
     fatal "Cannot proceed without the agent package."
 fi
 

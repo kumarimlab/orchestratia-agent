@@ -601,6 +601,10 @@ async def ws_receive_loop(ws, state: DaemonState):
                             "session_id": session_id,
                             "pid": handle.pid,
                             "tmux_name": handle.tmux_name or "",
+                            # Report the actual cwd the agent spawned with so
+                            # the hub can populate sessions.working_directory
+                            # if it was empty. Source of truth for the editor.
+                            "working_dir": resolved_cwd,
                         })
                     else:
                         await ws_send(state, {
@@ -1166,6 +1170,7 @@ async def report_alive_sessions(state: DaemonState):
                         "pid": handle.pid,
                         "recovered": True,
                         "tmux_name": "",
+                        "working_dir": rec_cwd,
                     })
                     orphaned.add(surviving_id)
         else:
@@ -1189,6 +1194,7 @@ async def report_alive_sessions(state: DaemonState):
                         "type": "session_recovered",
                         "tmux_name": surviving_id,
                         "pid": handle.pid,
+                        "working_dir": rec_cwd,
                     })
                     orphaned.add(surviving_id)
 
@@ -1204,6 +1210,7 @@ async def report_alive_sessions(state: DaemonState):
                 "pid": session.pid,
                 "recovered": True,
                 "tmux_name": session.tmux_name or "",
+                "working_dir": getattr(session, "working_dir", ""),
             })
     # Ensure readers are running and trigger redraw for all recovered sessions.
     # Skip tmux orphans — their reader will start when session_recovered_ack
@@ -1446,17 +1453,26 @@ def _proc_cwd(pid: int) -> str:
 async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_id: str, session_id: str, msg: dict):
     """Dispatch a filesystem operation for the editor side panel.
 
-    Looks up the session's working_dir from local state (never trusts a
-    cwd supplied by the hub), runs the matching fs_handler operation in a
-    thread (IO-bound), and replies with type + "_result" carrying the
-    original request_id.
+    Resolution order for the filesystem sandbox root:
+      1. msg["working_dir"]  — the hub's stored sessions.working_directory.
+         This is the source of truth: bulletproof across daemon restarts,
+         machine reboots, and platform differences (no /proc, no tmux
+         needed on Windows).
+      2. session.working_dir — agent's local state, populated at spawn
+         time or recovered from tmux pane info / /proc. Only used as a
+         fallback for sessions where the hub hasn't backfilled yet.
+
+    The agent still independently validates the path exists and is a
+    directory before any operation — a malicious hub message cannot
+    list / unless / actually exists as a real dir (which it always
+    does, so this is more about catching bugs than security).
     """
     from orchestratia_agent import fs_handler
 
     result_type = f"{msg_type}_result"
     session = state.active_sessions.get(session_id)
 
-    if not session or not getattr(session, "working_dir", ""):
+    if not session:
         await sender({
             "type": result_type,
             "request_id": request_id,
@@ -1465,7 +1481,31 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
         })
         return
 
-    root = session.working_dir
+    hub_cwd = (msg.get("working_dir") or "").strip()
+    local_cwd = getattr(session, "working_dir", "") or ""
+
+    if hub_cwd and os.path.isdir(hub_cwd):
+        root = hub_cwd
+    elif local_cwd and os.path.isdir(local_cwd):
+        root = local_cwd
+    else:
+        await sender({
+            "type": result_type,
+            "request_id": request_id,
+            "ok": False,
+            "error": "working_dir_unset",
+        })
+        return
+
+    # If the hub didn't have a cwd yet but we resolved one locally, mirror
+    # it back so the hub can backfill sessions.working_directory.
+    if not hub_cwd and root == local_cwd:
+        asyncio.create_task(sender({
+            "type": "session_working_dir",
+            "session_id": session_id,
+            "working_dir": local_cwd,
+        }))
+
     rel_path = msg.get("path", "")
 
     try:

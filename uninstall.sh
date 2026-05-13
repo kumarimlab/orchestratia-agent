@@ -120,10 +120,32 @@ fi
 echo ""
 
 if [ "$FORCE" = false ]; then
-    echo -ne "  ${YELLOW}${BOLD}Continue? [y/N]${NC} "
-    read -r REPLY
-    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+    # When piped (curl ... | bash), stdin is the script content itself,
+    # so `read` returns immediately with an empty REPLY and we'd silently
+    # default to N. Read from /dev/tty when available so the prompt
+    # actually works in the typical install one-liner. Fall back to a
+    # helpful error if no tty at all (e.g. genuine CI invocation).
+    REPLY=""
+    if [ -t 0 ]; then
+        # Interactive shell — stdin is a terminal
+        echo -ne "  ${YELLOW}${BOLD}Continue? [y/N]${NC} "
+        read -r REPLY
+    elif [ -r /dev/tty ]; then
+        # Piped (curl | bash) — borrow the controlling terminal
+        echo -ne "  ${YELLOW}${BOLD}Continue? [y/N]${NC} "
+        read -r REPLY < /dev/tty
+    else
+        # No terminal available at all — refuse rather than nuke silently
         echo ""
+        echo -e "  ${WARN} ${YELLOW}Non-interactive context detected (no terminal available for prompt).${NC}"
+        echo -e "  ${DIM}Re-run with --force to skip the confirmation:${NC}"
+        echo ""
+        echo -e "    ${CYAN}curl -fsSL https://install.orchestratia.com/uninstall | bash -s -- --force${NC}"
+        echo ""
+        exit 1
+    fi
+    echo ""
+    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         echo -e "  ${DIM}Uninstall cancelled.${NC}"
         echo ""
         exit 0

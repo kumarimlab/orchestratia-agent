@@ -1,0 +1,78 @@
+name: Bump Homebrew Tap
+
+# Triggered when a new agent version is tagged. Updates the Formula in
+# orchestratiahq/homebrew-tap with the new URL + sha256, then commits.
+# Mac users running `brew upgrade orchestratia-agent` get the new version
+# on their next `brew update`.
+#
+# Requires repo secret HOMEBREW_TAP_PAT — a fine-grained PAT (or classic
+# PAT with `repo` scope) that has write access to orchestratiahq/homebrew-tap.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to bump to (without v prefix). Leave blank to use latest tag.'
+        required: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Download release tarball + compute sha256
+        id: sha
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          URL="https://github.com/kumarimlab/orchestratia-agent/archive/refs/tags/v${VERSION}.tar.gz"
+          echo "Downloading $URL"
+          curl -fsSL "$URL" -o /tmp/agent.tar.gz
+          SHA=$(sha256sum /tmp/agent.tar.gz | awk '{print $1}')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha256: $SHA"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: orchestratiahq/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_PAT }}
+          path: tap
+
+      - name: Update Formula
+        run: |
+          cd tap
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+          FORMULA="Formula/orchestratia-agent.rb"
+          # Replace the URL line (matches any vX.Y.Z in the URL)
+          sed -i -E "s|archive/refs/tags/v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz|archive/refs/tags/v${VERSION}.tar.gz|" "$FORMULA"
+          # Replace the sha256 line (matches the first occurrence — the main URL's sha)
+          sed -i -E "0,/sha256 \"[a-f0-9]{64}\"/s||sha256 \"${SHA}\"|" "$FORMULA"
+          echo "--- updated Formula ---"
+          head -10 "$FORMULA"
+
+      - name: Commit + push
+        run: |
+          cd tap
+          VERSION="${{ steps.version.outputs.version }}"
+          git config user.name "Orchestratia Bot"
+          git config user.email "bot@orchestratia.com"
+          if git diff --quiet; then
+            echo "No changes to Formula — already at v${VERSION}"
+            exit 0
+          fi
+          git add Formula/orchestratia-agent.rb
+          git commit -m "orchestratia-agent ${VERSION}"
+          git push

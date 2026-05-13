@@ -1481,10 +1481,20 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
         })
         return
 
+    explicit_root = (msg.get("root") or "").strip()
     hub_cwd = (msg.get("working_dir") or "").strip()
     local_cwd = getattr(session, "working_dir", "") or ""
 
-    if hub_cwd and os.path.isdir(hub_cwd):
+    # Resolution order:
+    #   1. msg["root"] — user explicitly navigated outside working_dir
+    #      (e.g. browsing /tmp). Must be absolute + an existing directory.
+    #      OS user permissions enforce the actual access boundary; we just
+    #      validate it's a real path before handing it to fs_handler.
+    #   2. msg["working_dir"] — hub-authoritative session root
+    #   3. session.working_dir — agent-local fallback
+    if explicit_root and os.path.isabs(explicit_root) and os.path.isdir(explicit_root):
+        root = explicit_root
+    elif hub_cwd and os.path.isdir(hub_cwd):
         root = hub_cwd
     elif local_cwd and os.path.isdir(local_cwd):
         root = local_cwd
@@ -1498,8 +1508,10 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
         return
 
     # If the hub didn't have a cwd yet but we resolved one locally, mirror
-    # it back so the hub can backfill sessions.working_directory.
-    if not hub_cwd and root == local_cwd:
+    # it back so the hub can backfill sessions.working_directory. Only do
+    # this for project-scope requests (no explicit_root) so user navigation
+    # away from the project doesn't accidentally re-root the session.
+    if not explicit_root and not hub_cwd and root == local_cwd:
         asyncio.create_task(sender({
             "type": "session_working_dir",
             "session_id": session_id,

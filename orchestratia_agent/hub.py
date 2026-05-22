@@ -87,6 +87,32 @@ async def ws_send(state: DaemonState, msg: dict) -> bool:
     return False
 
 
+async def _report_mcp_status(state: DaemonState, session_id: str, status: str) -> None:
+    """PATCH the session's `mcp_status` on the hub. Best-effort.
+
+    Used after `write_mcp_config` so the dashboard can render an MCP-status
+    pip (green for `written`/`merged`, amber for `workspace_readonly`, grey
+    for `skipped`/`unsupported`). Pre-1.5 hubs return 404; we log+continue.
+    """
+    if not state.hub_url or not state.api_key:
+        return
+    url = f"{state.hub_url}/api/v1/server/sessions/{session_id}/mcp-status"
+    try:
+        from orchestratia_agent.tls import httpx_verify
+        async with httpx.AsyncClient(timeout=10, verify=httpx_verify(state=state)) as client:
+            resp = await client.patch(
+                url,
+                headers={"X-API-Key": state.api_key},
+                json={"mcp_status": status},
+            )
+            if resp.status_code == 404:
+                log.debug(f"mcp_status: hub does not yet support PATCH {url} (pre-1.5)")
+            elif resp.status_code >= 400:
+                log.warning(f"mcp_status: hub {resp.status_code} for {session_id[:8]}: {resp.text[:200]}")
+    except Exception:
+        log.debug(f"mcp_status: failed to report for {session_id[:8]}", exc_info=True)
+
+
 async def register_with_hub(
     client: httpx.AsyncClient,
     state: DaemonState,
@@ -572,7 +598,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                 cols = msg.get("cols", 120)
                 rows = msg.get("rows", 40)
                 project_id = msg.get("project_id")
-                log.info(f"Hub requests session start: {session_id[:8]}")
+                # Hub may supply explicit agent_type; if absent the daemon
+                # falls back to workspace-marker detection inside
+                # write_mcp_config. Cross-agent support per Phase 1.5.
+                agent_type = msg.get("agent_type")
+                log.info(f"Hub requests session start: {session_id[:8]} (agent_type={agent_type or 'auto'})")
 
                 try:
                     env_vars = {
@@ -600,22 +630,40 @@ async def ws_receive_loop(ws, state: DaemonState):
                         state.active_sessions[session_id] = session
                         await session.start_reader()
 
-                        # Register session with MCP server, write .mcp.json
-                        # into workspace so Claude Code picks up the local
-                        # endpoint on its next launch. task_id is unknown at
-                        # spawn time; the task_assigned handler fills it in.
+                        # Register session with MCP server, write the right
+                        # per-agent config into the workspace so the chosen
+                        # CLI picks up our endpoint on its next launch.
+                        # task_id is unknown at spawn; task_assigned fills it
+                        # in later. Status is reported back so the dashboard
+                        # can show green/amber pips.
+                        mcp_status_value: str | None = None
                         if state.mcp_manager and state.mcp_enabled:
                             try:
                                 await state.mcp_manager.register_session(session_id, task_id=None)
                                 from orchestratia_agent.mcp_server import write_mcp_config
-                                write_mcp_config(
+                                mcp_status_value, written_path = write_mcp_config(
                                     resolved_cwd,
                                     "127.0.0.1",
                                     state.mcp_port,
                                     session_id,
+                                    agent_type=agent_type,
                                 )
+                                if written_path:
+                                    log.info(
+                                        f"mcp: {mcp_status_value} {written_path} "
+                                        f"(session={session_id[:8]}, agent_type={agent_type or 'auto'})"
+                                    )
                             except Exception:
                                 log.exception(f"mcp: register/config failed for {session_id[:8]}")
+                                mcp_status_value = "unsupported"
+                        # Best-effort report to the hub so the dashboard
+                        # can show MCP-status pips. The endpoint is added
+                        # in the hub-side Phase 1.5 change; pre-1.5 hubs
+                        # will return 404 and we log+continue.
+                        if mcp_status_value:
+                            asyncio.create_task(
+                                _report_mcp_status(state, session_id, mcp_status_value)
+                            )
 
                         await ws_send(state, {
                             "type": "session_started",

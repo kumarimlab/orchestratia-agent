@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -395,41 +396,49 @@ class MCPServerManager:
 
 
 def mcp_url_for_session(host: str, port: int, session_id: str) -> str:
-    """Return the URL a Claude session's .mcp.json should point at."""
+    """Return the URL a session's MCP config should point at."""
     return f"http://{host}:{port}/mcp/sessions/{session_id}/mcp"
 
 
-def write_mcp_config(working_dir: str, host: str, port: int, session_id: str) -> str | None:
-    """Write `.mcp.json` into the session workspace pointing at this daemon.
+def write_mcp_config(
+    working_dir: str,
+    host: str,
+    port: int,
+    session_id: str,
+    agent_type: str | None = None,
+) -> tuple[str, str | None]:
+    """Write the MCP config file appropriate to the session's agent type.
 
-    Returns the path written, or None if the workspace dir is missing.
+    Dispatches to the per-format mergers in `agent_registry`. Foreign keys
+    in any existing config file are preserved — only the `orchestratia`
+    entry is upserted.
+
+    Returns `(status, path)` where status ∈
+    {written, merged, workspace_readonly, unsupported, skipped}, matching
+    the `mcp_status` value the hub records on the session row. `path` is
+    the file we wrote (or attempted to write) or None if the workspace dir
+    didn't exist at all.
     """
-    import os
+    from orchestratia_agent.agent_registry import (
+        AgentType,
+        WriteStatus,
+        coerce_agent_type,
+        detect_from_workspace,
+        merge_config,
+    )
+
     if not working_dir or not os.path.isdir(working_dir):
-        log.debug(f"mcp: skipping .mcp.json (workspace not a dir: {working_dir!r})")
-        return None
-    config_path = os.path.join(working_dir, ".mcp.json")
-    # Don't clobber a user-provided .mcp.json with custom servers — merge by
-    # inserting/overwriting only the 'orchestratia' key, leaving the rest alone.
-    existing: dict[str, Any] = {}
-    if os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                existing = json.load(f) or {}
-        except Exception:
-            log.warning(f"mcp: existing {config_path} unreadable; overwriting")
-            existing = {}
-    servers = existing.get("mcpServers", {})
-    servers["orchestratia"] = {
-        "type": "http",
-        "url": mcp_url_for_session(host, port, session_id),
-    }
-    existing["mcpServers"] = servers
-    try:
-        with open(config_path, "w") as f:
-            json.dump(existing, f, indent=2)
-        log.info(f"mcp: wrote {config_path}")
-        return config_path
-    except OSError as e:
-        log.warning(f"mcp: failed to write {config_path}: {e}")
-        return None
+        log.debug(f"mcp: skipping config (workspace not a dir: {working_dir!r})")
+        return (WriteStatus.SKIPPED.value, None)
+
+    # Resolve the agent: explicit hub-supplied type wins, otherwise detect
+    # from workspace markers (.gemini/, .codex/, CLAUDE.md, …), otherwise
+    # fall back to the registry default (claude_code).
+    if agent_type:
+        agent = coerce_agent_type(agent_type)
+    else:
+        agent = detect_from_workspace(working_dir) or AgentType.CLAUDE_CODE
+
+    url = mcp_url_for_session(host, port, session_id)
+    status, path = merge_config(working_dir, agent, url)
+    return (status.value, str(path) if path else None)

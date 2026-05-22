@@ -174,6 +174,18 @@ async def main():
             signal.signal(signal.SIGBREAK, handle_signal)
         else:
             signal.signal(signal.SIGTERM, handle_signal)
+            # SIGHUP rescans every configured repo and rewrites MCP configs.
+            # Useful after the user edits config.yaml (`repos:`) without
+            # wanting a full daemon restart. POSIX-only.
+            def _sighup_rescan(sig, frame):
+                from orchestratia_agent.workspace_scan import scan_and_write
+                log.info("SIGHUP received — rescanning configured repos for MCP configs")
+                try:
+                    scan_and_write(state)
+                except Exception:
+                    log.exception("workspace-scan on SIGHUP failed")
+            if hasattr(signal, "SIGHUP"):
+                signal.signal(signal.SIGHUP, _sighup_rescan)
 
         log.info("Agent daemon running. Heartbeats every 30s, WS auto-reconnect enabled.")
 
@@ -193,6 +205,15 @@ async def main():
             state.mcp_manager = MCPServerManager(state)
             background_tasks.append(state.mcp_manager.serve(host="127.0.0.1", port=state.mcp_port))
             log.info(f"MCP server enabled on http://127.0.0.1:{state.mcp_port}/mcp/sessions/")
+
+            # Phase 1.5: ensure every configured repo has an MCP config file
+            # pointing at us, even for agents started outside the daemon
+            # (e.g. user-launched `claude` in their own tmux). Idempotent.
+            try:
+                from orchestratia_agent.workspace_scan import scan_and_write
+                scan_and_write(state)
+            except Exception:
+                log.exception("workspace-scan at startup failed (continuing without it)")
         else:
             log.info("MCP server disabled by config (mcp.enabled = false)")
 

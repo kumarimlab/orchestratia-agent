@@ -5,3 +5,9 @@ psutil>=6.0
 pyte>=0.8.2
 mcp>=1.2.0
 uvicorn>=0.30.0
+# Phase 1.5 cross-agent MCP config writers.
+# ruamel.yaml preserves comments + key order in Aider's .aider.conf.yml.
+# tomli_w writes TOML for Codex CLI's .codex/config.toml; tomllib is stdlib on 3.11+.
+ruamel.yaml>=0.17.0
+tomli_w>=1.0.0
+tomli>=2.0.0; python_version < "3.11"

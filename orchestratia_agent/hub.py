@@ -905,6 +905,58 @@ async def ws_receive_loop(ws, state: DaemonState):
                         pending.append({"content": content, "author": author})
                         log.info(f"Non-urgent note queued (mcp+pty) for session {session_id[:8]}")
 
+            # Phase 3a: push-on-mention via the dependency graph. Same MCP
+            # delivery semantics as `task_note` but flagged so the agent
+            # can tell "upstream changed" from "new work for me".
+            elif msg_type == "note_for_session":
+                target_session_id = msg.get("target_session_id")
+                content = msg.get("content", "")
+                author = msg.get("author", "")
+                mentioned_via = msg.get("mentioned_via", "")
+                if state.mcp_manager and target_session_id and state.mcp_enabled:
+                    asyncio.create_task(state.mcp_manager.notify_note_inbox(target_session_id))
+                # Non-urgent PTY fallback for pre-MCP sessions. Prefix the
+                # body so the receiving agent can tell context apart.
+                session = state.active_sessions.get(target_session_id) if target_session_id else None
+                if session and not session.closed:
+                    pending = state.pending_notes.setdefault(target_session_id, [])
+                    pending.append({
+                        "content": (
+                            f"[upstream] {content}" if mentioned_via == "dependency" else content
+                        ),
+                        "author": author or "hub",
+                    })
+                    log.info(
+                        f"note_for_session queued for {target_session_id[:8]} "
+                        f"(via={mentioned_via or 'direct'})"
+                    )
+
+            # Phase 3a: ask_agent → target session receives the question via
+            # MCP. The intervention is already in the hub DB; the target
+            # agent reads its inbox and replies via existing intervention
+            # response tool, which the asker sees in its inbox.
+            elif msg_type == "intervention_for_session":
+                target_session_id = msg.get("target_session_id")
+                question = msg.get("question", "")
+                source = msg.get("source", "")
+                if state.mcp_manager and target_session_id and state.mcp_enabled:
+                    # Surface as a note in the target's inbox — same channel.
+                    # The note content carries enough metadata that the agent
+                    # can decide to respond (or escalate to human).
+                    asyncio.create_task(state.mcp_manager.notify_note_inbox(target_session_id))
+                # PTY fallback: surface the ask inline so non-MCP agents still see it.
+                session = state.active_sessions.get(target_session_id) if target_session_id else None
+                if session and not session.closed:
+                    pending = state.pending_notes.setdefault(target_session_id, [])
+                    pending.append({
+                        "content": f"[ask from {source or 'agent'}] {question}",
+                        "author": "hub",
+                    })
+                    log.info(
+                        f"intervention_for_session queued for {target_session_id[:8]} "
+                        f"(source={source})"
+                    )
+
             elif msg_type == "task_updated":
                 session_id = msg.get("session_id")
                 task_id = msg.get("task_id", "")

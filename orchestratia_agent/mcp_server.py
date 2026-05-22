@@ -258,6 +258,40 @@ class _SessionMCP:
             return "ok" if r is not None else "error: hub rejected the failure"
 
         @self.mcp.tool()
+        async def ask_agent(
+            target_session_id: str,
+            question: str,
+            context: str = "",
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Ask another agent in this project a blocking clarifying question.
+
+            Same project only (cross-project asks are rejected with 403).
+            Cross-agent by default — works homogeneously (Claude→Claude) and
+            heterogeneously (Claude→Gemini, Codex→Aider, any combo). The
+            target agent sees the question in its `notes://inbox` flagged
+            `mentioned_via='ask'`. Their response arrives in your inbox.
+
+            Returns the intervention id; poll `notes://inbox` for the reply.
+            """
+            if not self.task_id:
+                return "error: this session has no assigned task to attach the ask to"
+            if not target_session_id:
+                return "error: target_session_id required"
+            r = await self._hub_post(
+                f"/api/v1/server/tasks/{self.task_id}/help",
+                {
+                    "question": question,
+                    "context": context,
+                    "intervention_type": "question",
+                    "target_session_id": target_session_id,
+                },
+            )
+            if r is None:
+                return "error: hub rejected the ask (target session may be in a different project or closed)"
+            return f"ok intervention_id={r.get('intervention_id', '?')}"
+
+        @self.mcp.tool()
         async def request_intervention(
             question: str,
             context: str = "",

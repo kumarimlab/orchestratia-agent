@@ -48,6 +48,12 @@ class DaemonState:
     active_sessions: dict[str, ManagedSession] = field(default_factory=dict)
     backend: SessionBackend | None = None
     pending_notes: dict[str, list] = field(default_factory=dict)
+    # MCP server hosted on loopback for local Claude sessions. None until the
+    # daemon starts the bootstrap task in main(). mcp_port/enabled mirror the
+    # config knobs so call-sites don't have to dig through state.config.
+    mcp_manager: object | None = None
+    mcp_port: int = 8765
+    mcp_enabled: bool = True
 
 
 async def main():
@@ -115,6 +121,13 @@ async def main():
         log.error("hub_url not set in config")
         sys.exit(1)
 
+    # MCP server config (loopback Claude-facing plane). Disable with
+    # `mcp_enabled: false` in config to fall back to PTY-only delivery
+    # for compliance/debug, or to free the port.
+    mcp_cfg = state.config.get("mcp", {}) or {}
+    state.mcp_enabled = bool(mcp_cfg.get("enabled", True))
+    state.mcp_port = int(mcp_cfg.get("port", 8765))
+
     # Set up session backend (pty-host on Windows, tmux on Linux)
     state.backend = get_session_backend()
     if hasattr(state.backend, "connect"):
@@ -164,15 +177,27 @@ async def main():
 
         log.info("Agent daemon running. Heartbeats every 30s, WS auto-reconnect enabled.")
 
+        # Start MCP server (loopback only). Attaching the manager to state
+        # makes it visible to hub.py's session_start handler — that's where
+        # per-session MCPs are registered and .mcp.json is written.
+        background_tasks = [
+            heartbeat_loop(client, state),
+            ws_connection_loop(state),
+            idle_note_flush_loop(state),
+            permlog_flush_loop(state),
+            pending_uploads_loop(client, state),
+            pending_pulls_loop(client, state),
+        ]
+        if state.mcp_enabled:
+            from orchestratia_agent.mcp_server import MCPServerManager
+            state.mcp_manager = MCPServerManager(state)
+            background_tasks.append(state.mcp_manager.serve(host="127.0.0.1", port=state.mcp_port))
+            log.info(f"MCP server enabled on http://127.0.0.1:{state.mcp_port}/mcp/sessions/")
+        else:
+            log.info("MCP server disabled by config (mcp.enabled = false)")
+
         try:
-            await asyncio.gather(
-                heartbeat_loop(client, state),
-                ws_connection_loop(state),
-                idle_note_flush_loop(state),
-                permlog_flush_loop(state),
-                pending_uploads_loop(client, state),
-                pending_pulls_loop(client, state),
-            )
+            await asyncio.gather(*background_tasks)
         finally:
             await cleanup_sessions(state)
 

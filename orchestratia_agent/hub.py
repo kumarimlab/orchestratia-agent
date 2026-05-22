@@ -548,6 +548,9 @@ async def ws_receive_loop(ws, state: DaemonState):
 
     def _on_session_close(session_id: str):
         session = state.active_sessions.pop(session_id, None)
+        # Drop the per-session MCP instance so the URL stops resolving.
+        if state.mcp_manager:
+            state.mcp_manager.unregister_session(session_id)
         # Trigger architecture scan if session had a working directory
         if session and hasattr(session, 'working_directory') and session.working_directory:
             project_id = getattr(session, 'project_id', '') or ''
@@ -596,6 +599,24 @@ async def ws_receive_loop(ws, state: DaemonState):
                         )
                         state.active_sessions[session_id] = session
                         await session.start_reader()
+
+                        # Register session with MCP server, write .mcp.json
+                        # into workspace so Claude Code picks up the local
+                        # endpoint on its next launch. task_id is unknown at
+                        # spawn time; the task_assigned handler fills it in.
+                        if state.mcp_manager and state.mcp_enabled:
+                            try:
+                                await state.mcp_manager.register_session(session_id, task_id=None)
+                                from orchestratia_agent.mcp_server import write_mcp_config
+                                write_mcp_config(
+                                    resolved_cwd,
+                                    "127.0.0.1",
+                                    state.mcp_port,
+                                    session_id,
+                                )
+                            except Exception:
+                                log.exception(f"mcp: register/config failed for {session_id[:8]}")
+
                         await ws_send(state, {
                             "type": "session_started",
                             "session_id": session_id,
@@ -706,6 +727,12 @@ async def ws_receive_loop(ws, state: DaemonState):
                 pending_approval = msg.get("pending_approval", False)
                 require_plan = msg.get("require_plan", False)
 
+                # Bind this task to the MCP session so its resources reflect it.
+                if state.mcp_manager and target_session_id and task_id:
+                    mcp_sess = state.mcp_manager._sessions.get(target_session_id)
+                    if mcp_sess:
+                        mcp_sess.task_id = task_id
+
                 session = state.active_sessions.get(target_session_id)
                 if session and not session.closed:
                     if pending_approval:
@@ -776,10 +803,20 @@ async def ws_receive_loop(ws, state: DaemonState):
                 urgent = msg.get("urgent", False)
                 author = msg.get("author", "")
                 task_id = msg.get("task_id", "")
+
+                # MCP push — fires regardless of session liveness in the
+                # daemon's PTY map, because Claude consumes via MCP rather
+                # than via injection. The notification tells Claude to
+                # re-read `notes://inbox` on its next reasoning step.
+                if state.mcp_manager and session_id and state.mcp_enabled:
+                    asyncio.create_task(state.mcp_manager.notify_note_inbox(session_id))
+
                 session = state.active_sessions.get(session_id) if session_id else None
                 if session and not session.closed:
                     if urgent:
-                        # Urgent: Esc + delay + inject
+                        # Urgent: Esc + delay + inject (still PTY for now —
+                        # MCP push is async on Claude's reasoning cadence,
+                        # urgent notes want to interrupt the current TUI loop)
                         async def _urgent_note(s, c, a):
                             _inject_escape(s)
                             await asyncio.sleep(2)
@@ -788,10 +825,12 @@ async def ws_receive_loop(ws, state: DaemonState):
                         asyncio.create_task(_urgent_note(session, content, author))
                         log.info(f"Urgent note injected into session {session_id[:8]}")
                     else:
-                        # Non-urgent: queue for idle delivery
+                        # Non-urgent: MCP push above is now the primary path.
+                        # Keep PTY queue as fallback for older Claude Code
+                        # sessions that don't yet have .mcp.json wired.
                         pending = state.pending_notes.setdefault(session_id, [])
                         pending.append({"content": content, "author": author})
-                        log.info(f"Non-urgent note queued for session {session_id[:8]}")
+                        log.info(f"Non-urgent note queued (mcp+pty) for session {session_id[:8]}")
 
             elif msg_type == "task_updated":
                 session_id = msg.get("session_id")

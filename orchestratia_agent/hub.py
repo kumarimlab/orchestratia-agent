@@ -602,7 +602,14 @@ async def ws_receive_loop(ws, state: DaemonState):
                 # falls back to workspace-marker detection inside
                 # write_mcp_config. Cross-agent support per Phase 1.5.
                 agent_type = msg.get("agent_type")
-                log.info(f"Hub requests session start: {session_id[:8]} (agent_type={agent_type or 'auto'})")
+                # Phase 2 governance: 'worker' (default) or 'orchestrator'.
+                # Orchestrator sessions get the governance MCP toolset +
+                # the orchestrator system prompt written to the workspace.
+                role = msg.get("role") or "worker"
+                log.info(
+                    f"Hub requests session start: {session_id[:8]} "
+                    f"(agent_type={agent_type or 'auto'}, role={role})"
+                )
 
                 try:
                     env_vars = {
@@ -639,7 +646,9 @@ async def ws_receive_loop(ws, state: DaemonState):
                         mcp_status_value: str | None = None
                         if state.mcp_manager and state.mcp_enabled:
                             try:
-                                await state.mcp_manager.register_session(session_id, task_id=None)
+                                await state.mcp_manager.register_session(
+                                    session_id, task_id=None, role=role,
+                                )
                                 from orchestratia_agent.mcp_server import write_mcp_config
                                 mcp_status_value, written_path = write_mcp_config(
                                     resolved_cwd,
@@ -651,8 +660,24 @@ async def ws_receive_loop(ws, state: DaemonState):
                                 if written_path:
                                     log.info(
                                         f"mcp: {mcp_status_value} {written_path} "
-                                        f"(session={session_id[:8]}, agent_type={agent_type or 'auto'})"
+                                        f"(session={session_id[:8]}, agent_type={agent_type or 'auto'}, role={role})"
                                     )
+                                # Phase 2: orchestrator sessions get a
+                                # system-prompt file written to whatever
+                                # location the chosen agent reads (CLAUDE.md,
+                                # GEMINI.md, AGENTS.md, etc.). Idempotent.
+                                if role == "orchestrator" and resolved_cwd:
+                                    try:
+                                        from orchestratia_agent.governance_hook import (
+                                            write_orchestrator_system_prompt,
+                                        )
+                                        write_orchestrator_system_prompt(
+                                            resolved_cwd, agent_type
+                                        )
+                                    except Exception:
+                                        log.exception(
+                                            f"governance: failed to write orchestrator prompt for {session_id[:8]}"
+                                        )
                             except Exception:
                                 log.exception(f"mcp: register/config failed for {session_id[:8]}")
                                 mcp_status_value = "unsupported"
@@ -1138,6 +1163,25 @@ async def ws_receive_loop(ws, state: DaemonState):
             elif msg_type == "approval_rules_updated":
                 log.info("Approval rules updated by hub, refreshing cache")
                 asyncio.create_task(_refresh_rules_cache(state))
+
+            # ── Phase 2 governance routing ─────────────────────────
+            elif msg_type == "governance_decision_response_to_worker":
+                mgr = getattr(state, "governance_manager", None)
+                if mgr is not None:
+                    mgr.handle_worker_response(msg)
+
+            elif msg_type == "governance_decision_request_to_orchestrator":
+                mgr = getattr(state, "governance_manager", None)
+                if mgr is not None:
+                    mgr.handle_orchestrator_request(msg)
+
+            elif msg_type == "orchestrator_pointer_changed":
+                # Hub tells us a project's orchestrator pointer changed —
+                # drop the cache so the next decision call refetches.
+                project_id = msg.get("project_id") or ""
+                mgr = getattr(state, "governance_manager", None)
+                if mgr is not None and project_id:
+                    mgr.invalidate_pointer(project_id)
 
             elif msg_type == "scan_architecture":
                 # On-demand scan requested by hub

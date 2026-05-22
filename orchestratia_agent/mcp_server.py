@@ -53,12 +53,24 @@ _HUB_TIMEOUT = 30.0
 
 
 class _SessionMCP:
-    """One FastMCP instance scoped to a single Orchestratia session."""
+    """One FastMCP instance scoped to a single Orchestratia session.
 
-    def __init__(self, state: DaemonState, session_id: str, task_id: str | None):
+    `role` selects the toolset: 'worker' (default) gets the existing
+    task/note/intervention tools; 'orchestrator' adds the Phase 2
+    governance plane (`governance://inbox` + `evaluate_tool_call`).
+    """
+
+    def __init__(
+        self,
+        state: DaemonState,
+        session_id: str,
+        task_id: str | None,
+        role: str = "worker",
+    ):
         self.state = state
         self.session_id = session_id
         self.task_id = task_id
+        self.role = role
         self.mcp = FastMCP(
             name=f"orchestratia-session-{session_id[:8]}",
             instructions=(
@@ -66,6 +78,15 @@ class _SessionMCP:
                 "Use `task://current` to inspect your assigned task, "
                 "`notes://inbox` to see pending notes, and the post_note / "
                 "complete_task / request_intervention tools to act."
+                if role == "worker"
+                else (
+                    "You are an Orchestrator. Read `governance://inbox` for "
+                    "permission decisions awaiting your verdict, then call "
+                    "`evaluate_tool_call(request_id, decision, reason)` with "
+                    "`allow`, `deny`, or `escalate`. Static rules already ran; "
+                    "you only see calls those missed. The static deny list "
+                    "still overrides anything you approve."
+                )
             ),
             host="127.0.0.1",
             # Stateful streamable HTTP — the MCP protocol session persists
@@ -76,8 +97,12 @@ class _SessionMCP:
             stateless_http=False,
         )
         self._inbox_version = 0  # bumps when a new note arrives — Claude re-reads
+        self._governance_version = 0  # bumps when an evaluate request arrives
         self._register_resources()
         self._register_tools()
+        if role == "orchestrator":
+            self._register_orchestrator_resources()
+            self._register_orchestrator_tools()
         # Materialize the streamable HTTP app once so the underlying
         # StreamableHTTPSessionManager is created and reachable for the
         # lifespan we manage ourselves (start/stop below).
@@ -249,7 +274,73 @@ class _SessionMCP:
             )
             return "ok" if r is not None else "error: hub rejected the intervention"
 
+    # ── Orchestrator resources + tools (Phase 2) ─────────────────────
+
+    def _register_orchestrator_resources(self):
+        @self.mcp.resource("governance://inbox")
+        async def governance_inbox() -> str:
+            """Pending permission-decision requests addressed to this
+            orchestrator. Each entry includes the request_id you must pass
+            back via `evaluate_tool_call`. Re-read this resource after a
+            `notifications/resources/list_changed` arrives.
+            """
+            mgr = getattr(self.state, "governance_manager", None)
+            if mgr is None:
+                return json.dumps({"requests": [], "version": self._governance_version})
+            items = mgr.pop_inbox_for_session(self.session_id)
+            return json.dumps(
+                {"requests": items, "version": self._governance_version},
+                default=str,
+            )
+
+    def _register_orchestrator_tools(self):
+        @self.mcp.tool()
+        async def evaluate_tool_call(
+            request_id: str,
+            decision: str,
+            reason: str = "",
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Decide on a worker's tool call. `decision` ∈ allow/deny/escalate.
+
+            `allow` lets the worker proceed. `deny` blocks it. `escalate`
+            hands the decision to a human (an intervention is created).
+            The static deny list still overrides `allow` — patterns like
+            `rm -rf /` can never be approved by this tool.
+            """
+            mgr = getattr(self.state, "governance_manager", None)
+            if mgr is None:
+                return "error: governance manager not initialised"
+            ok, info = await mgr.respond_to_request(request_id, decision, reason)
+            return "ok" if ok else f"error: {info}"
+
+        @self.mcp.tool()
+        async def escalate_to_human(
+            request_id: str,
+            reason: str,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Shorthand for `evaluate_tool_call(request_id, 'escalate', reason)`.
+
+            Use when the policy says "always escalate" or the call is
+            ambiguous enough that a human should weigh in.
+            """
+            mgr = getattr(self.state, "governance_manager", None)
+            if mgr is None:
+                return "error: governance manager not initialised"
+            ok, info = await mgr.respond_to_request(request_id, "escalate", reason)
+            return "ok" if ok else f"error: {info}"
+
     # ── Notifications ────────────────────────────────────────────────
+
+    async def notify_governance_inbox(self):
+        """Tell connected MCP clients that `governance://inbox` has changed."""
+        self._governance_version += 1
+        try:
+            server = self.mcp._mcp_server  # type: ignore[attr-defined]
+            await server.request_context.session.send_resource_list_changed()
+        except Exception:
+            log.debug("notify_governance_inbox: no active mcp session to push to")
 
     async def notify_note_inbox(self):
         """Tell connected MCP clients that `notes://inbox` has new content.
@@ -277,14 +368,22 @@ class MCPServerManager:
         self.state = state
         self._sessions: dict[str, _SessionMCP] = {}
 
-    async def register_session(self, session_id: str, task_id: str | None) -> _SessionMCP:
+    async def register_session(
+        self,
+        session_id: str,
+        task_id: str | None,
+        role: str = "worker",
+    ) -> _SessionMCP:
         if session_id in self._sessions:
             log.debug(f"mcp: session {session_id[:8]} already registered")
             return self._sessions[session_id]
-        sess = _SessionMCP(self.state, session_id, task_id)
+        sess = _SessionMCP(self.state, session_id, task_id, role=role)
         await sess.start()
         self._sessions[session_id] = sess
-        log.info(f"mcp: registered session {session_id[:8]} (task={task_id[:8] if task_id else 'none'})")
+        log.info(
+            f"mcp: registered session {session_id[:8]} "
+            f"(role={role}, task={task_id[:8] if task_id else 'none'})"
+        )
         return sess
 
     def unregister_session(self, session_id: str):
@@ -299,6 +398,15 @@ class MCPServerManager:
         if not sess:
             return
         await sess.notify_note_inbox()
+
+    async def notify_governance_inbox(self, session_id: str):
+        """Phase 2: tell an orchestrator session a new evaluate_tool_call
+        request is waiting. Mirrors notify_note_inbox but addresses
+        `governance://inbox`, which only orchestrator-role sessions expose."""
+        sess = self._sessions.get(session_id)
+        if not sess:
+            return
+        await sess.notify_governance_inbox()
 
     def _build_app(self):
         """Build the ASGI app that routes per-session MCP URLs.
@@ -339,6 +447,12 @@ class MCPServerManager:
             if path == "/health":
                 resp = PlainTextResponse("ok")
                 await resp(scope, receive, send)
+                return
+
+            # Phase 2: governance evaluate endpoint for the PreToolUse hook.
+            # Loopback-only (the whole MCP server binds 127.0.0.1).
+            if path == "/governance/evaluate" and scope["method"] == "POST":
+                await _governance_evaluate_asgi(manager.state, scope, receive, send)
                 return
 
             # /mcp/sessions/<session_id>/<anything>
@@ -393,6 +507,59 @@ class MCPServerManager:
             log.info("mcp: shutting down")
             server.should_exit = True
             raise
+
+
+async def _governance_evaluate_asgi(state, scope, receive, send) -> None:
+    """Raw-ASGI shim for POST /governance/evaluate.
+
+    Bypasses Starlette's routing layer because the surrounding dispatcher
+    in `_build_app` already operates at the ASGI scope level. Reads the
+    JSON body, dispatches to `GovernanceManager.evaluate`, returns JSON.
+    """
+    # Body
+    body = b""
+    while True:
+        msg = await receive()
+        if msg["type"] != "http.request":
+            continue
+        body += msg.get("body", b"")
+        if not msg.get("more_body"):
+            break
+
+    try:
+        payload = json.loads(body or b"{}")
+    except Exception:
+        payload = {}
+
+    mgr = getattr(state, "governance_manager", None)
+    if mgr is None:
+        result = {"decision": "escalate", "reason": "governance_not_initialized"}
+        status = 503
+    else:
+        try:
+            result = await mgr.evaluate(
+                session_id=payload.get("session_id", ""),
+                project_id=payload.get("project_id"),
+                tool=payload.get("tool", ""),
+                tool_input=payload.get("tool_input", {}),
+                agent_name=payload.get("agent_name"),
+            )
+            status = 200
+        except Exception as e:
+            log.exception("governance: evaluate failed")
+            result = {"decision": "escalate", "reason": f"governance_error: {e}"}
+            status = 500
+
+    response = json.dumps(result).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(response)).encode("ascii")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": response})
 
 
 def mcp_url_for_session(host: str, port: int, session_id: str) -> str:

@@ -54,6 +54,10 @@ class DaemonState:
     mcp_manager: object | None = None
     mcp_port: int = 8765
     mcp_enabled: bool = True
+    # Phase 2 governance: orchestrates the PreToolUse hook ↔ hub ↔ orchestrator
+    # MCP session round trip. Initialized alongside mcp_manager. None when
+    # MCP is disabled.
+    governance_manager: object | None = None
 
 
 async def main():
@@ -202,7 +206,11 @@ async def main():
         ]
         if state.mcp_enabled:
             from orchestratia_agent.mcp_server import MCPServerManager
+            from orchestratia_agent.governance_hook import GovernanceManager
             state.mcp_manager = MCPServerManager(state)
+            # Phase 2: governance routing manager — must exist before any
+            # session registers, so the orchestrator MCP tools can find it.
+            state.governance_manager = GovernanceManager(state)
             background_tasks.append(state.mcp_manager.serve(host="127.0.0.1", port=state.mcp_port))
             log.info(f"MCP server enabled on http://127.0.0.1:{state.mcp_port}/mcp/sessions/")
 

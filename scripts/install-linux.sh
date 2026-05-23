@@ -339,6 +339,66 @@ if ! python3 -c "import ensurepip" >/dev/null 2>&1 \
    || ! python3 -m venv --help >/dev/null 2>&1; then
     info "Python venv/ensurepip support missing — installing..."
 
+    # Detect distro — universe-enable logic is Ubuntu-only. On Debian,
+    # python3-venv lives in `main` so the fallback path doesn't apply.
+    IS_UBUNTU=false
+    if [ -f /etc/os-release ] && grep -q '^ID=ubuntu' /etc/os-release; then
+        IS_UBUNTU=true
+    fi
+
+    # Some minimal Ubuntu cloud images (custom AMIs, container bases,
+    # stripped-down provisioning) ship with the `universe` repo disabled,
+    # which is where every pythonX.Y-venv package lives. If our first
+    # apt install fails with "no installation candidate" / "Unable to
+    # locate", try enabling universe and retry once. Universe is a stock
+    # Canonical component, not a third-party PPA — enabling it has the
+    # same trust footprint as `apt install` itself.
+    enable_universe() {
+        info "Enabling Ubuntu universe repository (Canonical component, not a third-party PPA)..."
+        if command -v add-apt-repository >/dev/null 2>&1; then
+            sudo add-apt-repository -y universe >/dev/null 2>&1 || return 1
+        else
+            # add-apt-repository isn't always installed on minimal images.
+            # Write the source list ourselves; named so the operator can
+            # see/revert what we added (rm /etc/apt/sources.list.d/orchestratia-universe.list).
+            local CODENAME=""
+            CODENAME=$(lsb_release -cs 2>/dev/null || \
+                       (. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"))
+            if [ -z "$CODENAME" ]; then
+                warn "Could not determine Ubuntu codename to enable universe"
+                return 1
+            fi
+            echo "deb http://archive.ubuntu.com/ubuntu/ ${CODENAME} universe" | \
+                sudo tee /etc/apt/sources.list.d/orchestratia-universe.list >/dev/null
+            sudo tee -a /etc/apt/sources.list.d/orchestratia-universe.list >/dev/null <<UNIV_EOF
+deb http://archive.ubuntu.com/ubuntu/ ${CODENAME}-updates universe
+deb http://security.ubuntu.com/ubuntu/ ${CODENAME}-security universe
+UNIV_EOF
+        fi
+        sudo apt-get update -qq >/dev/null 2>&1
+        return 0
+    }
+
+    # apt_install_with_universe_fallback <pkg> -> 0/1, sets INSTALL_OUT
+    apt_install_with_universe_fallback() {
+        local pkg="$1"
+        if INSTALL_OUT=$(sudo apt-get install -y "$pkg" 2>&1); then
+            return 0
+        fi
+        # Recognise the "package not available" failure mode that the
+        # universe fix is for. Other failures (held package, conflict)
+        # would not benefit from enabling universe.
+        if echo "$INSTALL_OUT" | grep -qE 'no installation candidate|Unable to locate package' \
+           && [ "$IS_UBUNTU" = true ]; then
+            if enable_universe; then
+                if INSTALL_OUT=$(sudo apt-get install -y "$pkg" 2>&1); then
+                    return 0
+                fi
+            fi
+        fi
+        return 1
+    }
+
     # apt-get update first — stale package lists are the #1 reason
     # `apt install <pkg>` fails on a freshly-provisioned box. Cheap to
     # run on a machine that's already current; mandatory on one that
@@ -354,10 +414,10 @@ if ! python3 -c "import ensurepip" >/dev/null 2>&1 \
     # virtual package that may resolve to the wrong version).
     INSTALL_OUT=""
     PYVENV_PKG="python${PYTHON_VER}-venv"
-    if ! INSTALL_OUT=$(sudo apt-get install -y "$PYVENV_PKG" 2>&1); then
+    if ! apt_install_with_universe_fallback "$PYVENV_PKG"; then
         # Fall back to the generic name (Debian-style).
         PYVENV_PKG="python3-venv"
-        if ! INSTALL_OUT=$(sudo apt-get install -y "$PYVENV_PKG" 2>&1); then
+        if ! apt_install_with_universe_fallback "$PYVENV_PKG"; then
             fail "Could not install $PYVENV_PKG:"
             # Show the last 10 lines of apt's output — usually contains
             # the actual reason (missing repo, held package, etc).

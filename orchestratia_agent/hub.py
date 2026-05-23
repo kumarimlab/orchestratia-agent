@@ -1097,6 +1097,15 @@ async def ws_receive_loop(ws, state: DaemonState):
                         close_tunnel(tunnel_id)
 
             # ── SSH Access Grant Messages ──
+            # All ssh_setup helpers are synchronous and shell out to
+            # `sudo`. Calling them directly from this async receive loop
+            # blocks the event loop, which causes `subprocess.run(...,
+            # timeout=10)` inside them to time out spuriously even when
+            # the underlying sudo command finished in milliseconds (the
+            # pipe-reader threads and the asyncio selector compete for
+            # event-loop time and the wait deadlocks). The fix is to run
+            # them on the default thread executor — subprocess.run inside
+            # a worker thread is the standard Python pattern.
             elif msg_type == "setup_ssh_access":
                 # Target role: add public key to orchestratia user
                 from orchestratia_agent.ssh_setup import setup_authorized_key, setup_sudoers
@@ -1104,18 +1113,22 @@ async def ws_receive_loop(ws, state: DaemonState):
                 pub_key = msg.get("ssh_public_key", "")
                 priv_level = msg.get("privilege_level", "standard")
                 if grant_id and pub_key:
-                    setup_authorized_key(pub_key, grant_id, priv_level)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None, setup_authorized_key, pub_key, grant_id, priv_level,
+                    )
                     if priv_level == "elevated":
-                        setup_sudoers(priv_level)
+                        await loop.run_in_executor(None, setup_sudoers, priv_level)
 
             elif msg_type == "revoke_ssh_access":
                 # Target role: remove public key
                 from orchestratia_agent.ssh_setup import remove_authorized_key, remove_sudoers
                 grant_id = msg.get("grant_id", "")
                 if grant_id:
-                    remove_authorized_key(grant_id)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, remove_authorized_key, grant_id)
                     # Check if any elevated grants remain before removing sudoers
-                    remove_sudoers()
+                    await loop.run_in_executor(None, remove_sudoers)
 
             elif msg_type == "grant_ssh_access":
                 # Source role: store private key + start TCP listener
@@ -1126,8 +1139,9 @@ async def ws_receive_loop(ws, state: DaemonState):
                 bind_port = msg.get("local_bind_port", 0)
                 target_port = msg.get("target_port", 22)
                 if grant_id and priv_key and bind_port:
-                    store_private_key(grant_id, priv_key)
-                    clean_known_hosts(bind_port)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, store_private_key, grant_id, priv_key)
+                    await loop.run_in_executor(None, clean_known_hosts, bind_port)
                     asyncio.create_task(
                         s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
                     )
@@ -1138,7 +1152,8 @@ async def ws_receive_loop(ws, state: DaemonState):
                 from orchestratia_agent import s2s_tunnel
                 grant_id = msg.get("grant_id", "")
                 if grant_id:
-                    remove_private_key(grant_id)
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, remove_private_key, grant_id)
                     asyncio.create_task(s2s_tunnel.teardown_grant(grant_id))
 
             elif msg_type == "remote_exec":
@@ -1436,6 +1451,13 @@ async def _restore_grants(state: DaemonState, sender):
             )
             from orchestratia_agent import s2s_tunnel
 
+            # Run blocking ssh_setup calls in the default executor — see
+            # the matching comment in ws_receive_loop. Calling them
+            # synchronously here would block the WS handshake completion
+            # and cause subprocess.run(timeout=10) inside them to
+            # deadlock spuriously.
+            loop = asyncio.get_running_loop()
+
             source_count = target_count = 0
             for g in grants:
                 grant_id = g["grant_id"]
@@ -1446,7 +1468,7 @@ async def _restore_grants(state: DaemonState, sender):
                     bind_port = g.get("local_bind_port", 0)
                     target_port = g.get("target_port", 22)
                     if priv_key and bind_port:
-                        store_private_key(grant_id, priv_key)
+                        await loop.run_in_executor(None, store_private_key, grant_id, priv_key)
                         await s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
                         source_count += 1
 
@@ -1454,9 +1476,11 @@ async def _restore_grants(state: DaemonState, sender):
                     pub_key = g.get("ssh_public_key", "")
                     priv_level = g.get("privilege_level", "standard")
                     if pub_key:
-                        setup_authorized_key(pub_key, grant_id, priv_level)
+                        await loop.run_in_executor(
+                            None, setup_authorized_key, pub_key, grant_id, priv_level,
+                        )
                         if priv_level == "elevated":
-                            setup_sudoers(priv_level)
+                            await loop.run_in_executor(None, setup_sudoers, priv_level)
                         target_count += 1
 
             if source_count or target_count:

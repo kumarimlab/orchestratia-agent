@@ -295,6 +295,61 @@ def _sudo_run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     )
 
 
+def _posix_ensure_orchestratia_user() -> bool:
+    """Create the `orchestratia` system user on first grant, if missing.
+
+    The install script doesn't create this user — it's only needed when a
+    server becomes the *target* of an access grant, which most installs
+    never do. Earlier versions of `_posix_setup_authorized_key` assumed
+    the user already existed and silently failed (chown to a non-existent
+    user is a no-op) — sshd then rejected the grant's key because there
+    was no user to authenticate as.
+
+    Created as a system account with a real shell so SSH login works.
+    `--system` reserves a UID below 1000 (out of the way of human users)
+    and the home dir gets created with sensible defaults.
+
+    Returns True if the user exists (or was created), False if creation
+    failed — caller should not proceed with key install in that case.
+    """
+    # Fast path: user already exists.
+    if subprocess.run(["id", _ORCHESTRATIA_USER], capture_output=True).returncode == 0:
+        return True
+
+    log.info(f"Creating system user '{_ORCHESTRATIA_USER}' for SSH access grants")
+    if sys.platform == "darwin":
+        log.error(
+            f"macOS user creation not yet automated — create manually: "
+            f"sudo sysadminctl -addUser {_ORCHESTRATIA_USER}"
+        )
+        return False
+
+    # Linux: useradd with explicit shell. Default --system would pick
+    # /bin/false which prevents SSH login — opposite of what we want.
+    result = _sudo_run([
+        "useradd",
+        "--system",
+        "--create-home",
+        "--shell", "/bin/bash",
+        _ORCHESTRATIA_USER,
+    ])
+    if result.returncode == 0:
+        log.info(f"Created system user '{_ORCHESTRATIA_USER}'")
+        return True
+    # Race-safe: another grant install may have just created the user;
+    # re-check before treating this as a failure.
+    if subprocess.run(["id", _ORCHESTRATIA_USER], capture_output=True).returncode == 0:
+        return True
+    log.error(
+        f"Failed to create user '{_ORCHESTRATIA_USER}': "
+        f"{(result.stderr or '').strip() or 'unknown error'} "
+        f"(rc={result.returncode}). "
+        f"If sudo NOPASSWD isn't configured for useradd, run manually: "
+        f"sudo useradd --system --create-home --shell /bin/bash {_ORCHESTRATIA_USER}"
+    )
+    return False
+
+
 def setup_authorized_key(public_key: str, grant_id: str,
                          privilege_level: str = "standard") -> bool:
     """Add a public key to authorized_keys with grant tag.
@@ -376,6 +431,13 @@ def _win_setup_authorized_key(tagged_key: str, grant_id: str,
 def _posix_setup_authorized_key(tagged_key: str, grant_id: str) -> bool:
     """Linux/macOS: add public key to orchestratia user's authorized_keys."""
     try:
+        # Ensure the orchestratia user exists before we touch its home
+        # directory. Pre-v0.13.4 the install script assumed the user
+        # existed and the agent silently no-op'd the chown — leaving a
+        # file owned by root that sshd couldn't use, with no diagnostic.
+        if not _posix_ensure_orchestratia_user():
+            return False
+
         ssh_dir = _ORCHESTRATIA_HOME / ".ssh"
         _sudo_run(["mkdir", "-p", str(ssh_dir)])
         _sudo_run(["chmod", "700", str(ssh_dir)])
@@ -540,6 +602,11 @@ def _win_setup_elevated() -> bool:
 def _posix_setup_sudoers() -> bool:
     """Linux/macOS: create sudoers drop-in for orchestratia user."""
     try:
+        # Defensive — sudoers for a user that doesn't exist is a no-op
+        # waiting to confuse the next debugger. If install order ever
+        # changes, this catches it.
+        if not _posix_ensure_orchestratia_user():
+            return False
         content = f"{_ORCHESTRATIA_USER} ALL=(ALL) NOPASSWD: ALL\n"
         proc = subprocess.run(
             ["sudo", "-n", "tee", str(_SUDOERS_PATH)],

@@ -101,7 +101,7 @@ def _win_ensure_sshd() -> bool:
                 log.error(f"Failed to start sshd: {result.stderr}")
                 return False
         except Exception as e:
-            log.error(f"Failed to start sshd: {e}")
+            log.exception(f"Failed to start sshd")
             return False
 
     # Not installed — try Add-WindowsCapability first (requires Windows Update)
@@ -199,7 +199,7 @@ def _win_install_sshd_from_github() -> bool:
         return False
 
     except Exception as e:
-        log.error(f"Failed to install OpenSSH from GitHub: {e}")
+        log.exception(f"Failed to install OpenSSH from GitHub")
         return False
 
 
@@ -243,7 +243,7 @@ def _win_set_auth_keys_acl(path: Path, admin_keys: bool = False) -> bool:
 
         return True
     except Exception as e:
-        log.error(f"Failed to set ACLs on {path}: {e}")
+        log.exception(f"Failed to set ACLs on {path}")
         return False
 
 
@@ -424,7 +424,7 @@ def _win_setup_authorized_key(tagged_key: str, grant_id: str,
         return True
 
     except Exception as e:
-        log.error(f"Failed to setup authorized key for grant {grant_id[:8]}: {e}")
+        log.exception(f"Failed to setup authorized key for grant {grant_id[:8]}")
         return False
 
 
@@ -468,8 +468,12 @@ def _posix_setup_authorized_key(tagged_key: str, grant_id: str) -> bool:
         log.info(f"Grant {grant_id[:8]}: SSH access configured (key added)")
         return True
 
-    except Exception as e:
-        log.error(f"Failed to setup authorized key for grant {grant_id[:8]}: {e}")
+    except Exception:
+        # log.exception (not log.error) captures the full traceback in
+        # journalctl. Critical for debugging — pre-v0.13.5 the only
+        # diagnostic on failure was the exception's str(), which hides
+        # *where* in the function the error happened.
+        log.exception(f"Failed to setup authorized key for grant {grant_id[:8]}")
         return False
 
 
@@ -517,7 +521,7 @@ def _win_remove_authorized_key(grant_id: str) -> bool:
 
         return True
     except Exception as e:
-        log.error(f"Failed to remove authorized key for grant {grant_id[:8]}: {e}")
+        log.exception(f"Failed to remove authorized key for grant {grant_id[:8]}")
         return False
 
 
@@ -547,7 +551,7 @@ def _posix_remove_authorized_key(grant_id: str) -> bool:
         return True
 
     except Exception as e:
-        log.error(f"Failed to remove authorized key for grant {grant_id[:8]}: {e}")
+        log.exception(f"Failed to remove authorized key for grant {grant_id[:8]}")
         return False
 
 
@@ -595,7 +599,7 @@ def _win_setup_elevated() -> bool:
         return True
 
     except Exception as e:
-        log.error(f"Failed to setup elevated access: {e}")
+        log.exception(f"Failed to setup elevated access")
         return False
 
 
@@ -621,7 +625,7 @@ def _posix_setup_sudoers() -> bool:
         return True
 
     except Exception as e:
-        log.error(f"Failed to setup sudoers: {e}")
+        log.exception(f"Failed to setup sudoers")
         return False
 
 
@@ -644,7 +648,7 @@ def remove_sudoers() -> bool:
             log.info("Removed orchestratia sudoers")
         return result.returncode == 0
     except Exception as e:
-        log.error(f"Failed to remove sudoers: {e}")
+        log.exception(f"Failed to remove sudoers")
         return False
 
 
@@ -713,5 +717,5 @@ def remove_private_key(grant_id: str) -> bool:
             log.info(f"Grant {grant_id[:8]}: private key removed")
         return True
     except Exception as e:
-        log.error(f"Failed to remove private key for grant {grant_id[:8]}: {e}")
+        log.exception(f"Failed to remove private key for grant {grant_id[:8]}")
         return False

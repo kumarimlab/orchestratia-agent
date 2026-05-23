@@ -37,6 +37,39 @@ STEP_COLOR="${BLUE}"
 CONFIG_DIR="/etc/orchestratia"
 LOG_DIR="/var/log/orchestratia"
 SERVICE_NAME="orchestratia-agent"
+
+# Install log — every step gets a timestamped entry here so users can
+# share a single file when something fails, instead of copy-pasting
+# terminal output. Created early; if we can't write to /var/log/, fall
+# back to /tmp so a non-root invocation doesn't break the install.
+INSTALL_LOG_DIR="/var/log/orchestratia"
+INSTALL_LOG=""
+if sudo mkdir -p "$INSTALL_LOG_DIR" 2>/dev/null; then
+    INSTALL_LOG="$INSTALL_LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log"
+    sudo touch "$INSTALL_LOG" 2>/dev/null && sudo chmod 0640 "$INSTALL_LOG" 2>/dev/null
+fi
+if [ -z "$INSTALL_LOG" ] || [ ! -w "$INSTALL_LOG" ] && ! sudo test -w "$INSTALL_LOG" 2>/dev/null; then
+    INSTALL_LOG="/tmp/orchestratia-install-$(date +%Y%m%d-%H%M%S).log"
+    touch "$INSTALL_LOG" 2>/dev/null || INSTALL_LOG=""
+fi
+
+# Helper — append a line to the install log, never fails (so log
+# writes can't break the installer). Strips ANSI escapes so the log
+# is plain text suitable for pasting/grepping.
+_log_to_file() {
+    if [ -n "$INSTALL_LOG" ]; then
+        local line="$1"
+        # Strip ANSI color codes for the log copy.
+        line=$(echo "$line" | sed -E 's/\x1b\[[0-9;]*[mK]//g')
+        local stamp
+        stamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        if [ -w "$INSTALL_LOG" ]; then
+            echo "[$stamp] $line" >> "$INSTALL_LOG" 2>/dev/null || true
+        else
+            echo "[$stamp] $line" | sudo tee -a "$INSTALL_LOG" >/dev/null 2>&1 || true
+        fi
+    fi
+}
 # Isolated venv for the agent. Keeps us out of system Python — no PEP 668
 # collisions, no Debian-managed-dep RECORD-not-found errors, no
 # --user-vs-system entry-point guessing, and `orchestratia update` runs
@@ -67,16 +100,25 @@ step() {
     local title=$2
     echo ""
     echo -e "${STEP_COLOR}[${num}/${TOTAL_STEPS}]${NC} ${BOLD}${title}${NC}"
+    _log_to_file "── [${num}/${TOTAL_STEPS}] ${title} ──"
 }
 
-info() { echo -e "     ${ARROW} $1"; }
-ok()   { echo -e "     ${PASS} $1"; }
-warn() { echo -e "     ${WARN} ${YELLOW}$1${NC}"; }
-fail() { echo -e "     ${FAIL} ${RED}$1${NC}"; ERRORS=$((ERRORS + 1)); }
+info() { echo -e "     ${ARROW} $1"; _log_to_file "INFO: $1"; }
+ok()   { echo -e "     ${PASS} $1"; _log_to_file "OK:   $1"; }
+warn() { echo -e "     ${WARN} ${YELLOW}$1${NC}"; _log_to_file "WARN: $1"; }
+fail() { echo -e "     ${FAIL} ${RED}$1${NC}"; ERRORS=$((ERRORS + 1)); _log_to_file "FAIL: $1"; }
 
 fatal() {
     echo ""
     echo -e "  ${FAIL} ${RED}${BOLD}FATAL: $1${NC}"
+    _log_to_file "FATAL: $1"
+    if [ -n "$INSTALL_LOG" ]; then
+        echo ""
+        echo -e "     ${DIM}Install log saved to: ${BOLD}${INSTALL_LOG}${NC}"
+        echo -e "     ${DIM}Share this file when reporting the failure:${NC}"
+        echo -e "       ${CYAN}cat ${INSTALL_LOG}${NC}"
+    fi
+    echo ""
     echo -e "     ${DIM}Installation aborted.${NC}"
     echo ""
     exit 1
@@ -137,7 +179,25 @@ RUN_HOME=$(eval echo "~${RUN_USER}")
 
 print_header
 
+# Log system context at the top of every install log so failures don't
+# require a second round-trip to ask "what OS / Python / pip version".
+_log_to_file "=== Orchestratia Agent install start ==="
+_log_to_file "Installer version: 0.13.5"
+_log_to_file "Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+_log_to_file "Hostname: $(hostname 2>/dev/null || echo unknown)"
+_log_to_file "uname: $(uname -a 2>/dev/null || echo unknown)"
+if [ -f /etc/os-release ]; then
+    _log_to_file "OS: $(. /etc/os-release; echo "${PRETTY_NAME:-unknown} (${ID:-?} ${VERSION_ID:-?})")"
+fi
+_log_to_file "RUN_USER: ${RUN_USER}"
+_log_to_file "RUN_HOME: ${RUN_HOME}"
+_log_to_file "INSTALL_SOURCE: ${INSTALL_SOURCE}"
+_log_to_file "VENV_DIR: ${VENV_DIR}"
+
 info "Service will run as user: ${BOLD}${RUN_USER}${NC} (home: ${RUN_HOME})"
+if [ -n "$INSTALL_LOG" ]; then
+    info "Install log: ${INSTALL_LOG}"
+fi
 
 # Step 1: Clean up existing installation
 step 1 "Removing existing installation (if any)"

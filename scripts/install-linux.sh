@@ -338,15 +338,36 @@ step 3 "Installing orchestratia-agent"
 if ! python3 -c "import ensurepip" >/dev/null 2>&1 \
    || ! python3 -m venv --help >/dev/null 2>&1; then
     info "Python venv/ensurepip support missing — installing..."
+
+    # apt-get update first — stale package lists are the #1 reason
+    # `apt install <pkg>` fails on a freshly-provisioned box. Cheap to
+    # run on a machine that's already current; mandatory on one that
+    # isn't.
+    APT_UPDATE_OUT=""
+    if ! APT_UPDATE_OUT=$(sudo apt-get update -qq 2>&1); then
+        warn "apt-get update reported errors:"
+        echo -e "     ${DIM}${APT_UPDATE_OUT}${NC}"
+    fi
+
     # Try the version-specific name first (Ubuntu 22.04 needs
     # python3.10-venv specifically; the generic python3-venv is a
     # virtual package that may resolve to the wrong version).
+    INSTALL_OUT=""
     PYVENV_PKG="python${PYTHON_VER}-venv"
-    if ! sudo apt-get install -y "$PYVENV_PKG" >/dev/null 2>&1; then
+    if ! INSTALL_OUT=$(sudo apt-get install -y "$PYVENV_PKG" 2>&1); then
         # Fall back to the generic name (Debian-style).
         PYVENV_PKG="python3-venv"
-        sudo apt-get install -y "$PYVENV_PKG" >/dev/null 2>&1 || \
-            fatal "Could not install python3-venv. Run manually: sudo apt install python3-venv"
+        if ! INSTALL_OUT=$(sudo apt-get install -y "$PYVENV_PKG" 2>&1); then
+            fail "Could not install $PYVENV_PKG:"
+            # Show the last 10 lines of apt's output — usually contains
+            # the actual reason (missing repo, held package, etc).
+            echo "$INSTALL_OUT" | tail -10 | while IFS= read -r line; do
+                echo -e "     ${DIM}${line}${NC}"
+            done
+            info "Run manually to see the full error:"
+            info "  sudo apt-get update && sudo apt-get install -y $PYVENV_PKG"
+            fatal "Cannot proceed without venv support."
+        fi
     fi
     ok "Installed $PYVENV_PKG"
 
@@ -354,7 +375,9 @@ if ! python3 -c "import ensurepip" >/dev/null 2>&1 \
     # than letting the venv create step report the same error one
     # screen later.
     if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
-        fatal "ensurepip still unavailable after installing $PYVENV_PKG. Run manually: sudo apt install python3-venv ensurepip"
+        fail "ensurepip still unavailable after installing $PYVENV_PKG"
+        info "Try manually: sudo apt-get install -y python3-venv python3-pip-whl"
+        fatal "Python venv support is broken on this system."
     fi
 fi
 

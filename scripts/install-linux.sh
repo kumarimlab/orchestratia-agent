@@ -323,20 +323,39 @@ step 3 "Installing orchestratia-agent"
 #   - --user vs system entry-point landing-spot guessing
 #   - "orchestratia update" needing sudo (venv is owned by RUN_USER)
 
-# Ensure python3-venv module is present. Ubuntu 22.04 ships python3
-# without `venv` unless `python3-venv` (or the version-specific variant
-# like python3.10-venv) is also installed. Try the generic name first,
-# then the python-version-specific one as fallback.
-if ! python3 -m venv --help >/dev/null 2>&1; then
-    info "python3-venv module missing — installing..."
-    PYVENV_PKG="python3-venv"
+# Ensure python3-venv + ensurepip are present. Ubuntu/Debian splits venv
+# into multiple pieces:
+#   - `python3-venv` (or `python${ver}-venv`) installs the venv module
+#   - ensurepip is bundled with python3.X but Debian sometimes ships
+#     python3 *without* it (most common on Ubuntu 22.04 with stock
+#     python3.10) — `python3 -m venv --help` then succeeds while
+#     `python3 -m venv <path>` fails at create-time with
+#     "ensurepip is not available".
+#
+# We test the actual breaking condition (`import ensurepip`) instead of
+# `--help`, then install both the version-specific and generic venv
+# packages so any apt-shipped layout works.
+if ! python3 -c "import ensurepip" >/dev/null 2>&1 \
+   || ! python3 -m venv --help >/dev/null 2>&1; then
+    info "Python venv/ensurepip support missing — installing..."
+    # Try the version-specific name first (Ubuntu 22.04 needs
+    # python3.10-venv specifically; the generic python3-venv is a
+    # virtual package that may resolve to the wrong version).
+    PYVENV_PKG="python${PYTHON_VER}-venv"
     if ! sudo apt-get install -y "$PYVENV_PKG" >/dev/null 2>&1; then
-        # Fall back to the version-specific name (e.g. python3.10-venv).
-        PYVENV_PKG="python${PYTHON_VER}-venv"
+        # Fall back to the generic name (Debian-style).
+        PYVENV_PKG="python3-venv"
         sudo apt-get install -y "$PYVENV_PKG" >/dev/null 2>&1 || \
             fatal "Could not install python3-venv. Run manually: sudo apt install python3-venv"
     fi
     ok "Installed $PYVENV_PKG"
+
+    # Re-verify after install. If still broken, fail loudly here rather
+    # than letting the venv create step report the same error one
+    # screen later.
+    if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+        fatal "ensurepip still unavailable after installing $PYVENV_PKG. Run manually: sudo apt install python3-venv ensurepip"
+    fi
 fi
 
 info "Creating venv at $VENV_DIR..."

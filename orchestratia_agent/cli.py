@@ -1057,7 +1057,20 @@ def cmd_agent_update(args):
     # Git safe.directory flag to handle root-owned repos run by non-root user
     _git_safe = ["git", "-c", f"safe.directory={install_dir}"]
 
-    # Helper: run a command, use sudo if it fails with permission error
+    # Helper: run a command, retry under sudo if it fails with any of git's
+    # several permission-related stderr signatures. Git doesn't have a
+    # canonical "permission" exit code — it surfaces ownership/uid mismatches
+    # via different strings depending on the operation (fetch unpacks objects,
+    # reset writes to refs, etc.), so the detection list grew empirically.
+    _PERM_HINTS = (
+        "Permission denied",
+        "unable to create",
+        "insufficient permission",        # `git fetch`: insufficient permission for adding an object…
+        "failed to write object",         # …followed by this
+        "unpack-objects failed",          # …followed by this
+        "could not create work tree dir",
+    )
+
     def _run_git(cmd_args):
         try:
             return subprocess.run(
@@ -1066,7 +1079,7 @@ def cmd_agent_update(args):
             )
         except subprocess.CalledProcessError as e:
             err = (e.stderr or "") + (e.stdout or "")
-            if "Permission denied" in err or "unable to create" in err:
+            if any(hint in err for hint in _PERM_HINTS):
                 return subprocess.run(
                     ["sudo"] + cmd_args, cwd=install_dir, check=True,
                     capture_output=True, text=True,
@@ -1119,38 +1132,45 @@ def cmd_agent_update(args):
             _json_output(results)
         return
 
-    # Step 2: reinstall package (no-deps, just update entry points + code)
-    # Try plain pip first, then with --break-system-packages (PEP 668 on Ubuntu 24.04+)
-    pip_cmd = [sys.executable, "-m", "pip", "install", "--no-deps", "--quiet", install_dir]
-    try:
-        subprocess.run(pip_cmd, check=True, capture_output=True, text=True)
+    # Step 2: reinstall package — WITH deps. We used to pass --no-deps as
+    # an optimisation ("entry points + code only"), but it broke multi-
+    # release jumps: e.g. v0.9 → v0.12 introduced mcp/uvicorn/ruamel/tomli_w
+    # and --no-deps left users with a daemon that can't import its own
+    # modules. Pip skips already-satisfied deps in O(ms), so the cost of
+    # dropping the flag is negligible compared to the breakage risk.
+    # Fallback ladder mirrors install-linux.sh: plain → +break-system-packages
+    # → +break-system-packages +ignore-installed (for Debian-shipped deps
+    # like python3-jwt without RECORD metadata).
+    def _try_pip(extra_flags: list[str]) -> tuple[bool, str]:
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet",
+               *extra_flags, install_dir]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return True, ""
+        except subprocess.CalledProcessError as e:
+            return False, (e.stderr or "").strip() or str(e)
+
+    pip_ok, pip_err = _try_pip([])
+    if not pip_ok and ("externally-managed-environment" in pip_err or "PEP 668" in pip_err):
+        pip_ok, pip_err = _try_pip(["--break-system-packages"])
+    if not pip_ok and (
+        "RECORD file not found" in pip_err
+        or "Cannot uninstall" in pip_err
+        or "DistributionNotFound" in pip_err
+    ):
+        # Debian-managed dep blocks the upgrade path — install alongside.
+        pip_ok, pip_err = _try_pip(["--break-system-packages", "--ignore-installed"])
+
+    if pip_ok:
         if JSON_MODE:
             results["steps"].append({"pip": "ok"})
         else:
             print(f"  {GREEN}pip:{RESET} Package reinstalled")
-    except subprocess.CalledProcessError as e:
-        err = e.stderr.strip() if e.stderr else ""
-        if "externally-managed-environment" in err:
-            # PEP 668: retry with --break-system-packages
-            try:
-                pip_cmd_bsp = [sys.executable, "-m", "pip", "install", "--no-deps",
-                               "--quiet", "--break-system-packages", install_dir]
-                subprocess.run(pip_cmd_bsp, check=True, capture_output=True, text=True)
-                if JSON_MODE:
-                    results["steps"].append({"pip": "ok"})
-                else:
-                    print(f"  {GREEN}pip:{RESET} Package reinstalled")
-            except subprocess.CalledProcessError as e2:
-                msg = e2.stderr.strip() if e2.stderr else str(e2)
-                if JSON_MODE:
-                    results["steps"].append({"pip": "failed", "error": msg})
-                else:
-                    print(f"  {YELLOW}pip:{RESET} {msg}")
+    else:
+        if JSON_MODE:
+            results["steps"].append({"pip": "failed", "error": pip_err})
         else:
-            if JSON_MODE:
-                results["steps"].append({"pip": "failed", "error": err or str(e)})
-            else:
-                print(f"  {YELLOW}pip:{RESET} {err or str(e)}")
+            print(f"  {YELLOW}pip:{RESET} {pip_err}")
 
     # Skill file updates automatically via symlink — no action needed
 

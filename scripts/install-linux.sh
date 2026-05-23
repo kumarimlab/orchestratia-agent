@@ -331,8 +331,16 @@ PIP_FORCE="--force-reinstall --no-deps --no-cache-dir -q"
 
 # Always install system-wide. We deliberately skip --user here: when
 # the script runs as root via sudo, --user would put files in
-# /root/.local, which is never what anyone wants. If plain install
-# fails due to PEP 668, fall back to --break-system-packages.
+# /root/.local, which is never what anyone wants. Fallback chain:
+#   1. Plain install
+#   2. + --break-system-packages          (PEP 668 on Ubuntu 24.04+ / Debian 12)
+#   3. + --break-system-packages --ignore-installed
+#                                          (Debian apt-installed deps like
+#                                           python3-jwt that lack pip's RECORD
+#                                           metadata and so can't be uninstalled)
+# --ignore-installed at rung 3 is necessary because pip's "upgrade" path
+# tries to *uninstall* the existing package first; for Debian-shipped
+# packages that fails with "Cannot uninstall X, RECORD file not found".
 pip_install() {
     # $1 = flag-group variable name; pass "$INSTALL_SOURCE" as the last arg
     local flags="$1"
@@ -340,6 +348,9 @@ pip_install() {
         return 0
     elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
          PIP_OUTPUT=$(pip3 install $flags --break-system-packages "$INSTALL_SOURCE" 2>&1); then
+        return 0
+    elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
+         PIP_OUTPUT=$(pip3 install $flags --break-system-packages --ignore-installed "$INSTALL_SOURCE" 2>&1); then
         return 0
     else
         return 1

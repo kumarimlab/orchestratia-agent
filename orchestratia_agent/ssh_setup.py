@@ -287,12 +287,64 @@ def _win_get_auth_keys_path(privilege_level: str = "standard") -> Path:
 
 
 def _sudo_run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    """Run a command with sudo, suppressing password prompts (Linux/macOS)."""
-    return subprocess.run(
+    """Run a command with sudo, suppressing password prompts (Linux/macOS).
+
+    Avoids subprocess.run(timeout=...) because of a subtle masking bug:
+    when timeout fires, subprocess.run calls proc.kill() to terminate
+    the still-running child. If the child has by then execve'd into
+    setuid-root (which sudo always does), our uid-1000 process can't
+    SIGKILL it — the kernel returns EPERM. That PermissionError
+    propagates *up the same stack* as the original TimeoutExpired and
+    masks it entirely, leaving '[Errno 1] Operation not permitted'
+    in the log with no hint that the real problem was a timeout.
+
+    Bug we hit in production: a VMware-provisioned host with a missing
+    /etc/hosts entry made sudo block 15s on getaddrinfo() of its own
+    hostname; subprocess.run's 10s timeout fired, kill() returned
+    EPERM, and the agent reported a permissions error when the real
+    problem was DNS. (Diagnosed 2026-05-23 by a Claude task running
+    on the affected server — see dogfood-claude-diagnoses-bug.md.)
+
+    Two changes from the old subprocess.run path:
+      - Timeout raised from 10s → 30s so slow-DNS environments don't
+        false-trigger before real failures
+      - Manual Popen so we control the kill() call and can swallow
+        the EPERM that masks the real TimeoutExpired
+    """
+    timeout = kwargs.pop("timeout", 30)
+    input_data = kwargs.pop("input", None)
+
+    proc = subprocess.Popen(
         ["sudo", "-n"] + cmd,
-        capture_output=True, text=True, timeout=10,
+        stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
         **kwargs,
     )
+    try:
+        stdout, stderr = proc.communicate(input=input_data, timeout=timeout)
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode, stdout, stderr,
+        )
+    except subprocess.TimeoutExpired:
+        # Child is still alive (possibly now setuid root via sudo's
+        # execve). Try to kill it but tolerate EPERM — the kernel will
+        # reap it eventually when sudo's auth path completes.
+        try:
+            proc.kill()
+        except PermissionError:
+            log.warning(
+                f"sudo timeout: cannot SIGKILL setuid-root child pid={proc.pid} "
+                f"(cmd={cmd[:3]}). System will reap when sudo's auth completes. "
+                f"Likely cause: slow DNS/PAM. Check 'time hostname -f' and /etc/hosts."
+            )
+        # Drain pipes so they don't leak (best-effort, brief deadline).
+        try:
+            proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        raise  # Re-raise the original TimeoutExpired so caller sees the real cause.
 
 
 def _posix_ensure_orchestratia_user() -> bool:
@@ -454,10 +506,10 @@ def _posix_setup_authorized_key(tagged_key: str, grant_id: str) -> bool:
             existing.rstrip("\n") + "\n" + tagged_key + "\n"
             if existing.strip() else tagged_key + "\n"
         )
-        proc = subprocess.run(
-            ["sudo", "-n", "tee", str(_AUTH_KEYS_PATH)],
-            input=new_content, capture_output=True, text=True, timeout=10,
-        )
+        # Use _sudo_run (which handles the setuid-root-can't-kill EPERM
+        # masking — see its docstring). subprocess.run with timeout=10
+        # was the original failure path on the kritis box.
+        proc = _sudo_run(["tee", str(_AUTH_KEYS_PATH)], input=new_content)
         if proc.returncode != 0:
             log.error(f"Failed to write authorized_keys: {proc.stderr}")
             return False
@@ -539,10 +591,7 @@ def _posix_remove_authorized_key(grant_id: str) -> bool:
             return True  # Key wasn't there
 
         new_content = "\n".join(filtered) + "\n" if filtered else ""
-        proc = subprocess.run(
-            ["sudo", "-n", "tee", str(_AUTH_KEYS_PATH)],
-            input=new_content, capture_output=True, text=True, timeout=10,
-        )
+        proc = _sudo_run(["tee", str(_AUTH_KEYS_PATH)], input=new_content)
         if proc.returncode != 0:
             log.error(f"Failed to update authorized_keys: {proc.stderr}")
             return False
@@ -612,10 +661,7 @@ def _posix_setup_sudoers() -> bool:
         if not _posix_ensure_orchestratia_user():
             return False
         content = f"{_ORCHESTRATIA_USER} ALL=(ALL) NOPASSWD: ALL\n"
-        proc = subprocess.run(
-            ["sudo", "-n", "tee", str(_SUDOERS_PATH)],
-            input=content, capture_output=True, text=True, timeout=10,
-        )
+        proc = _sudo_run(["tee", str(_SUDOERS_PATH)], input=content)
         if proc.returncode != 0:
             log.error(f"Failed to write sudoers: {proc.stderr}")
             return False

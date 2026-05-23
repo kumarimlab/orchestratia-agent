@@ -371,6 +371,27 @@ else
     info "Install: sudo -u ${RUN_USER} npm install -g @anthropic-ai/claude-code && claude auth login"
 fi
 
+# Hostname resolution check. On VMware / non-cloud-init images that
+# don't auto-populate /etc/hosts, every sudo invocation can block 5-30s
+# waiting for DNS to resolve the local hostname during PAM. That makes
+# grant-setup look like a permissions bug. Warn here so it's fixed
+# before the agent tries to run sudo commands. See
+# dogfood-claude-diagnoses-bug.md for the full case study.
+HN=$(hostname 2>/dev/null)
+if [ -n "$HN" ]; then
+    DNS_ELAPSED=$(( $(date +%s%N) ))
+    getent ahosts "$HN" >/dev/null 2>&1 || true
+    DNS_ELAPSED=$(( ($(date +%s%N) - DNS_ELAPSED) / 1000000 ))  # ms
+    if [ "$DNS_ELAPSED" -gt 1000 ]; then
+        warn "Hostname '$HN' takes ${DNS_ELAPSED}ms to resolve (expected <100ms)."
+        info "Slow sudo will cause grant-setup timeouts. Fix:"
+        info "  echo '127.0.1.1 $HN' | sudo tee -a /etc/hosts"
+        _log_to_file "WARN_HOSTNAME_SLOW: ${HN} took ${DNS_ELAPSED}ms"
+    else
+        ok "Hostname resolves in ${DNS_ELAPSED}ms"
+    fi
+fi
+
 # Step 3: Install package
 step 3 "Installing orchestratia-agent"
 

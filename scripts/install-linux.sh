@@ -37,6 +37,12 @@ STEP_COLOR="${BLUE}"
 CONFIG_DIR="/etc/orchestratia"
 LOG_DIR="/var/log/orchestratia"
 SERVICE_NAME="orchestratia-agent"
+# Isolated venv for the agent. Keeps us out of system Python — no PEP 668
+# collisions, no Debian-managed-dep RECORD-not-found errors, no
+# --user-vs-system entry-point guessing, and `orchestratia update` runs
+# without sudo because the venv is owned by $RUN_USER. v0.13.0+ uses
+# this; earlier versions installed via pip3 system-wide.
+VENV_DIR="/opt/orchestratia-venv"
 TOTAL_STEPS=6
 ERRORS=0
 
@@ -230,6 +236,14 @@ for bin in orchestratia-agent orchestratia orchestratia-connect; do
     [ -n "$RUN_HOME" ] && rm -f "$RUN_HOME/.local/bin/$bin" 2>/dev/null || true
 done
 
+# Remove the v0.13.0+ venv if present. Migrating from pre-0.13 (pip-based)
+# to 0.13+ (venv-based) is a clean slate — venv install can't merge into
+# the old layout.
+if [ -d "$VENV_DIR" ]; then
+    EXISTING=true
+    sudo rm -rf "$VENV_DIR" 2>/dev/null && ok "Removed venv ($VENV_DIR)" || warn "Could not remove $VENV_DIR"
+fi
+
 if [ "$EXISTING" = false ]; then
     ok "No existing installation found"
 fi
@@ -300,82 +314,92 @@ fi
 # Step 3: Install package
 step 3 "Installing orchestratia-agent"
 
-info "Installing via pip..."
-PIP_OUTPUT=""
-# Two-pass install to handle a specific Debian/Ubuntu gotcha:
-#
-#   Pass 1 (--upgrade, no force): installs/upgrades the target and any
-#     missing deps. If deps are already satisfied (including apt-provided
-#     ones like python3-yaml), pip happily leaves them alone.
-#
-#   Pass 2 (--force-reinstall --no-deps): reinstalls JUST our package
-#     from fresh git, leaving deps untouched. This is what we need on
-#     re-install — pip caches wheels by git URL so without
-#     --force-reinstall it would skip when the version string hasn't
-#     changed even though main has new commits.
-#
-# Why not --force-reinstall in one shot? Because --force-reinstall
-# cascades to deps. On Debian/Ubuntu where pip-visible metadata for
-# apt-installed packages lacks a RECORD file, the uninstall step of
-# --force-reinstall fails:
-#   "Cannot uninstall PyYAML 6.0.1, RECORD file not found.
-#    Hint: The package was installed by debian."
-# --no-deps on the force-reinstall pass sidesteps that entirely.
-#
-# --no-cache-dir on both passes because pip caches the built wheel by
-# git URL; without this flag, Pass 2 would reuse a stale cached wheel
-# and never see new commits to main.
+# v0.13.0+ uses an isolated venv at $VENV_DIR instead of system pip3.
+# Eliminates an entire class of install/upgrade bugs:
+#   - PEP 668 externally-managed-environment errors (Ubuntu 24.04+)
+#   - Debian-managed dep collisions (PyJWT, PyYAML — "Cannot uninstall X,
+#     RECORD file not found")
+#   - Entry-point generation failures from stale system setuptools
+#   - --user vs system entry-point landing-spot guessing
+#   - "orchestratia update" needing sudo (venv is owned by RUN_USER)
 
-PIP_BASE="--upgrade --no-cache-dir -q"
-PIP_FORCE="--force-reinstall --no-deps --no-cache-dir -q"
-
-# Always install system-wide. We deliberately skip --user here: when
-# the script runs as root via sudo, --user would put files in
-# /root/.local, which is never what anyone wants. Fallback chain:
-#   1. Plain install
-#   2. + --break-system-packages          (PEP 668 on Ubuntu 24.04+ / Debian 12)
-#   3. + --break-system-packages --ignore-installed
-#                                          (Debian apt-installed deps like
-#                                           python3-jwt that lack pip's RECORD
-#                                           metadata and so can't be uninstalled)
-# --ignore-installed at rung 3 is necessary because pip's "upgrade" path
-# tries to *uninstall* the existing package first; for Debian-shipped
-# packages that fails with "Cannot uninstall X, RECORD file not found".
-pip_install() {
-    # $1 = flag-group variable name; pass "$INSTALL_SOURCE" as the last arg
-    local flags="$1"
-    if PIP_OUTPUT=$(pip3 install $flags "$INSTALL_SOURCE" 2>&1); then
-        return 0
-    elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
-         PIP_OUTPUT=$(pip3 install $flags --break-system-packages "$INSTALL_SOURCE" 2>&1); then
-        return 0
-    elif pip3 install --help 2>&1 | grep -q "break-system-packages" && \
-         PIP_OUTPUT=$(pip3 install $flags --break-system-packages --ignore-installed "$INSTALL_SOURCE" 2>&1); then
-        return 0
-    else
-        return 1
+# Ensure python3-venv module is present. Ubuntu 22.04 ships python3
+# without `venv` unless `python3-venv` (or the version-specific variant
+# like python3.10-venv) is also installed. Try the generic name first,
+# then the python-version-specific one as fallback.
+if ! python3 -m venv --help >/dev/null 2>&1; then
+    info "python3-venv module missing — installing..."
+    PYVENV_PKG="python3-venv"
+    if ! sudo apt-get install -y "$PYVENV_PKG" >/dev/null 2>&1; then
+        # Fall back to the version-specific name (e.g. python3.10-venv).
+        PYVENV_PKG="python${PYTHON_VER}-venv"
+        sudo apt-get install -y "$PYVENV_PKG" >/dev/null 2>&1 || \
+            fatal "Could not install python3-venv. Run manually: sudo apt install python3-venv"
     fi
-}
+    ok "Installed $PYVENV_PKG"
+fi
 
-if pip_install "$PIP_BASE" && pip_install "$PIP_FORCE"; then
-    ok "Package installed"
-else
-    fail "pip3 install failed:"
-    echo -e "     ${DIM}${PIP_OUTPUT}${NC}"
-    info "Try manually: sudo pip3 install --break-system-packages $INSTALL_SOURCE"
+info "Creating venv at $VENV_DIR..."
+sudo mkdir -p "$(dirname "$VENV_DIR")"
+if ! VENV_OUT=$(sudo python3 -m venv "$VENV_DIR" 2>&1); then
+    fail "Could not create venv:"
+    echo -e "     ${DIM}${VENV_OUT}${NC}"
+    fatal "Cannot proceed without the venv."
+fi
+ok "Venv created"
+
+# Bootstrap fresh pip + setuptools + wheel inside the venv. Distros'
+# bundled ensurepip seeds are sometimes years old and ship the exact
+# setuptools versions that fail to render console_scripts entry-points
+# on PEP 517 builds — the failure mode that prompted this whole refactor.
+# `--quiet` makes failures quieter; we capture stdout/stderr so the
+# fatal path still shows what went wrong.
+if ! BOOTSTRAP_OUT=$(sudo "$VENV_DIR/bin/pip" install --upgrade --quiet pip setuptools wheel 2>&1); then
+    fail "Could not bootstrap pip/setuptools/wheel in venv:"
+    echo -e "     ${DIM}${BOOTSTRAP_OUT}${NC}"
+    fatal "Cannot proceed without a working venv pip."
+fi
+ok "Venv pip bootstrapped"
+
+info "Installing agent into venv..."
+if ! VENV_INSTALL_OUT=$(sudo "$VENV_DIR/bin/pip" install --quiet "$INSTALL_SOURCE" 2>&1); then
+    fail "venv pip install failed:"
+    echo -e "     ${DIM}${VENV_INSTALL_OUT}${NC}"
+    info "Try manually: sudo $VENV_DIR/bin/pip install $INSTALL_SOURCE"
     fatal "Cannot proceed without the agent package."
 fi
+ok "Package installed in venv"
 
-AGENT_BIN=$(which orchestratia-agent 2>/dev/null || echo "")
-# Fallback: check common --user install location
-if [ -z "$AGENT_BIN" ] && [ -x "${RUN_HOME}/.local/bin/orchestratia-agent" ]; then
-    AGENT_BIN="${RUN_HOME}/.local/bin/orchestratia-agent"
+# Hand the venv to RUN_USER so `orchestratia update` (which runs as the
+# daemon user) can write into venv/lib/python*/site-packages without sudo.
+sudo chown -R "${RUN_USER}:${RUN_USER}" "$VENV_DIR" 2>/dev/null || true
+
+# PATH-discoverable wrappers at /usr/local/bin/ so users still type
+# `orchestratia status` etc from any shell. Each wrapper is a 2-line
+# stub that execs the venv binary — venv activation isn't needed
+# because venv's bin/orchestratia-agent shebang already points at the
+# venv's python interpreter, so subprocess imports resolve to venv
+# site-packages automatically.
+for bin in orchestratia-agent orchestratia; do
+    sudo tee "/usr/local/bin/$bin" >/dev/null <<WRAPPER
+#!/bin/sh
+exec "$VENV_DIR/bin/$bin" "\$@"
+WRAPPER
+    sudo chmod +x "/usr/local/bin/$bin"
+done
+
+# Sanity-check the entry point actually exists. If pip fell back to a
+# wheel that skipped console_scripts (the original v0.12.0 install bug),
+# this catches it loudly instead of silently shipping a broken install.
+if [ ! -x "$VENV_DIR/bin/orchestratia-agent" ]; then
+    fail "venv install completed but $VENV_DIR/bin/orchestratia-agent is missing"
+    info "pip files: sudo $VENV_DIR/bin/pip show -f orchestratia-agent"
+    fatal "Entry-point script was not created."
 fi
-if [ -n "$AGENT_BIN" ]; then
-    ok "Binary: ${AGENT_BIN}"
-else
-    fail "orchestratia-agent not found in PATH after install"
-fi
+
+AGENT_BIN="$VENV_DIR/bin/orchestratia-agent"
+ok "Binary: ${AGENT_BIN}"
+ok "Wrappers: /usr/local/bin/orchestratia{,-agent}"
 
 # Step 4: Register with hub
 step 4 "Registering with Orchestratia hub"
@@ -410,7 +434,9 @@ fi
 # Step 5: Systemd service
 step 5 "Setting up systemd service"
 
-AGENT_BIN=$(which orchestratia-agent 2>/dev/null || echo "/usr/local/bin/orchestratia-agent")
+# Use $AGENT_BIN as set by step 3 — the absolute venv path. Don't
+# `which` it: $PATH under sudo doesn't reliably include /usr/local/bin
+# on every distro, and the venv path is canonical anyway.
 
 sudo tee /etc/systemd/system/${SERVICE_NAME}.service >/dev/null <<SERVICEEOF
 [Unit]

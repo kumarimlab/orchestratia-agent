@@ -447,6 +447,24 @@ def entry_point():
         _test_pty()
         return
 
+    # PidfdChildWatcher avoids the SIGCHLD/waitpid race that causes
+    # synchronous subprocess.run(input=..., timeout=...) calls inside
+    # async contexts to spuriously time out. The default
+    # ThreadedChildWatcher calls waitpid(-1, ...) in a background thread,
+    # which reaps children spawned by subprocess.run before its own
+    # communicate() loop can see them — leaving subprocess.run to wait
+    # the full timeout and then try (and fail) to kill an already-reaped
+    # PID. We hit this on ssh_setup.py's `sudo tee` calls, where the
+    # subprocess completed in milliseconds but Python saw a 10s timeout
+    # followed by PermissionError on the kill.
+    # PidfdChildWatcher (Python 3.9+, Linux 5.3+) uses pidfd_open(2)
+    # instead of SIGCHLD and doesn't reap unowned children.
+    if sys.platform == "linux" and hasattr(asyncio, "PidfdChildWatcher"):
+        try:
+            asyncio.set_child_watcher(asyncio.PidfdChildWatcher())
+        except (AttributeError, NotImplementedError, OSError):
+            pass  # Older kernel / interpreter — fall back to default
+
     try:
         asyncio.run(main())
     except Exception:

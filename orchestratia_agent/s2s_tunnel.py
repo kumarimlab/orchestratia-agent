@@ -24,6 +24,11 @@ WsSender = Callable[[dict], Coroutine[Any, Any, bool]]
 # grant_id -> (server, grant_info)
 _active_grants: dict[str, tuple[asyncio.AbstractServer, dict]] = {}
 
+# bind_port -> grant_id (reverse index for fast "what's on this port?" lookup
+# during setup-with-conflict and reconciliation). Kept consistent with
+# _active_grants on every mutate.
+_port_to_grant: dict[int, str] = {}
+
 # tunnel_id -> (reader_task, writer, grant_id)
 _active_tunnels: dict[str, tuple[asyncio.Task, asyncio.StreamWriter, str]] = {}
 
@@ -37,19 +42,75 @@ _ready_events: dict[str, asyncio.Event] = {}
 _ws_send: WsSender | None = None
 
 
+def active_grant_ids() -> set[str]:
+    """Snapshot of grant IDs currently held in source-side tunnel state.
+
+    Consumed by hub.py::_reconcile_grants to compute the diff against the
+    hub's authoritative list. Returns a copy so callers can mutate during
+    iteration.
+    """
+    return set(_active_grants.keys())
+
+
+def active_grants_snapshot() -> list[dict]:
+    """Human-readable snapshot of current grant→port mapping. For diagnostics
+    (logged by reconcile loop; future `orchestratia tunnels` CLI)."""
+    return [
+        {"grant_id": gid, "bind_port": info["bind_port"], "target_port": info["target_port"]}
+        for gid, (_, info) in _active_grants.items()
+    ]
+
+
 async def setup_grant(
     grant_id: str,
     bind_port: int,
     target_port: int,
     ws_send: WsSender,
 ) -> bool:
-    """Start a local TCP listener for an access grant."""
+    """Start a local TCP listener for an access grant.
+
+    Idempotent + conflict-tolerant: any existing listener for the same
+    grant_id OR the same bind_port is torn down first. Without this, a
+    missed `revoke_grant_access` WS push from the hub leaves the stale
+    listener running with its old grant_id captured in the connection
+    handler's closure — every inbound connection routes to a grant the
+    target no longer recognises, causing 'target not ready after 10s'
+    on every SSH attempt. (Reported 2026-05-24 on staging.kritis.io;
+    workaround was a full daemon restart.)
+    """
     global _ws_send
     _ws_send = ws_send
 
+    # Conflict 1: same grant_id already active. Could be a re-broadcast of
+    # `grant_ssh_access` (idempotent path) or a port-changed re-create.
+    # Always tear down + recreate so the in-memory state matches the new
+    # arguments — never trust that "we already have it" is still correct.
     if grant_id in _active_grants:
-        log.warning(f"Grant {grant_id[:8]}: listener already active on port {bind_port}")
-        return True
+        existing_port = _active_grants[grant_id][1]["bind_port"]
+        if existing_port == bind_port:
+            log.info(
+                f"Grant {grant_id[:8]}: re-broadcast on same port {bind_port}, "
+                f"recreating listener (idempotent)"
+            )
+        else:
+            log.info(
+                f"Grant {grant_id[:8]}: bind port changed {existing_port} → {bind_port}, "
+                f"tearing down old listener"
+            )
+        await teardown_grant(grant_id)
+
+    # Conflict 2: a *different* grant holds this port. Standard cause is a
+    # missed revoke push (grant rotated on target; we never got told to
+    # release the port). Tear it down — the hub-issued port is now claimed
+    # by the new grant_id.
+    if bind_port in _port_to_grant and _port_to_grant[bind_port] != grant_id:
+        stale_gid = _port_to_grant[bind_port]
+        log.warning(
+            f"Port {bind_port} held by stale grant {stale_gid[:8]} "
+            f"(reassigning to {grant_id[:8]}). Likely a missed revoke push — "
+            f"reconciliation should prevent recurrence."
+        )
+        await teardown_grant(stale_gid)
 
     try:
         server = await asyncio.start_server(
@@ -61,6 +122,7 @@ async def setup_grant(
             "bind_port": bind_port,
             "target_port": target_port,
         })
+        _port_to_grant[bind_port] = grant_id
         log.info(f"Grant {grant_id[:8]}: TCP listener started on 127.0.0.1:{bind_port}")
         return True
     except Exception as e:
@@ -69,10 +131,19 @@ async def setup_grant(
 
 
 async def teardown_grant(grant_id: str):
-    """Stop listener and close all tunnels for a grant."""
+    """Stop listener and close all tunnels for a grant. Idempotent — calling
+    for a grant we don't have is a no-op, not an error (this is the
+    `revoke_grant_access` push arriving after the grant was already cleaned
+    up by reconciliation, for example)."""
     entry = _active_grants.pop(grant_id, None)
     if entry:
-        server, _ = entry
+        server, info = entry
+        # Keep the port index consistent — only release if it still points
+        # at this grant (it could have been overwritten by a concurrent
+        # setup_grant for a different grant on the same port).
+        port = info.get("bind_port")
+        if port is not None and _port_to_grant.get(port) == grant_id:
+            _port_to_grant.pop(port, None)
         server.close()
         await server.wait_closed()
         log.info(f"Grant {grant_id[:8]}: listener stopped")

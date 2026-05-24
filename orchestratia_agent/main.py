@@ -196,6 +196,16 @@ async def main():
         # Start MCP server (loopback only). Attaching the manager to state
         # makes it visible to hub.py's session_start handler — that's where
         # per-session MCPs are registered and .mcp.json is written.
+        # ws_send factory — returns a callable bound to whatever ws_connection
+        # is currently live. Used by grant_reconcile_loop because the WS can
+        # change across reconnects and we don't want a stale sender captured.
+        from orchestratia_agent.hub import grant_reconcile_loop, ws_send as _ws_send_fn
+
+        def _sender_factory():
+            async def _send(msg):
+                return await _ws_send_fn(state, msg)
+            return _send
+
         background_tasks = [
             heartbeat_loop(client, state),
             ws_connection_loop(state),
@@ -203,6 +213,10 @@ async def main():
             permlog_flush_loop(state),
             pending_uploads_loop(client, state),
             pending_pulls_loop(client, state),
+            # Reconcile grant state with hub every 60s. Defensive against
+            # missed WS pushes (grant_ssh_access / revoke_grant_access).
+            # See _reconcile_grants for the bug class this addresses.
+            grant_reconcile_loop(state, _sender_factory),
         ]
         if state.mcp_enabled:
             from orchestratia_agent.mcp_server import MCPServerManager

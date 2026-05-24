@@ -1426,7 +1426,40 @@ async def report_alive_sessions(state: DaemonState):
 
 
 async def _restore_grants(state: DaemonState, sender):
-    """Poll hub for active grants and restore SSH keys + listeners."""
+    """Compatibility wrapper — historical name, called from the WS reconnect
+    path. Now just dispatches to the reconciling implementation."""
+    await _reconcile_grants(state, sender)
+
+
+# Reconciliation cadence — every 60s the daemon refetches authoritative
+# grant state from the hub and converges local state to match. Catches
+# missed WS pushes (grant_ssh_access / revoke_grant_access lost between
+# the hub and the daemon's WS), which is the bug class that produced the
+# stale-listener case on staging.kritis.io (2026-05-24). See
+# orchestratia_agent/s2s_tunnel.py docstring for the symptom signature.
+_GRANT_RECONCILE_INTERVAL = 60.0
+
+
+async def _reconcile_grants(state: DaemonState, sender):
+    """Fetch authoritative grant state from the hub and converge local state.
+
+    Two-direction reconciliation:
+      1. For grants the hub says we have but we don't (or where our
+         port/key drifted) → setup_grant. setup_grant is itself idempotent
+         and tears down conflicts on the port — see its docstring.
+      2. For source-role grants we hold a listener for but the hub no
+         longer lists → teardown_grant. This is the half that was missing
+         before: WS push reliability was assumed, so a lost
+         `revoke_grant_access` left a phantom listener forever.
+
+    Target-side cleanup is intentionally NOT done here. Removing an
+    authorized_key for a grant the hub no longer knows about would race
+    with humans who manually added keys; the existing revoke push is the
+    right path for target-side teardown. (Worst case of a missed target
+    revoke is an extra pubkey in authorized_keys — not a security
+    regression as long as the source no longer has the matching privkey,
+    which IS reconciled here.)
+    """
     try:
         import httpx
         from orchestratia_agent.tls import httpx_verify
@@ -1438,16 +1471,14 @@ async def _restore_grants(state: DaemonState, sender):
                 timeout=10,
             )
             if resp.status_code != 200:
-                log.warning(f"Failed to fetch grants: HTTP {resp.status_code}")
+                log.warning(f"Failed to fetch grants for reconcile: HTTP {resp.status_code}")
                 return
 
-            grants = resp.json()
-            if not grants:
-                return
+            grants = resp.json() or []
 
             from orchestratia_agent.ssh_setup import (
                 setup_authorized_key, setup_sudoers,
-                store_private_key,
+                store_private_key, remove_private_key,
             )
             from orchestratia_agent import s2s_tunnel
 
@@ -1458,6 +1489,32 @@ async def _restore_grants(state: DaemonState, sender):
             # deadlock spuriously.
             loop = asyncio.get_running_loop()
 
+            # Compute the diff between hub-authoritative state and our
+            # local state BEFORE doing any work, so logging shows a clear
+            # before/after even if individual setup/teardown ops fail.
+            hub_source_grant_ids = {
+                g["grant_id"] for g in grants if g["role"] == "source"
+            }
+            local_source_grant_ids = s2s_tunnel.active_grant_ids()
+            stale_source_grants = local_source_grant_ids - hub_source_grant_ids
+
+            # ── (2) Tear down phantom source-side listeners ───────────
+            for stale_gid in stale_source_grants:
+                log.warning(
+                    f"Reconcile: tearing down phantom source listener for "
+                    f"grant {stale_gid[:8]} (hub no longer lists it — "
+                    f"likely a missed revoke push)"
+                )
+                await s2s_tunnel.teardown_grant(stale_gid)
+                # Also remove the privkey so the source can't accidentally
+                # still attempt outbound SSH if a tunnel listener is
+                # recreated under the same grant id.
+                try:
+                    await loop.run_in_executor(None, remove_private_key, stale_gid)
+                except Exception:
+                    log.debug(f"Reconcile: privkey cleanup failed for {stale_gid[:8]}", exc_info=True)
+
+            # ── (1) Set up / refresh grants from the hub ──────────────
             source_count = target_count = 0
             for g in grants:
                 grant_id = g["grant_id"]
@@ -1469,6 +1526,9 @@ async def _restore_grants(state: DaemonState, sender):
                     target_port = g.get("target_port", 22)
                     if priv_key and bind_port:
                         await loop.run_in_executor(None, store_private_key, grant_id, priv_key)
+                        # setup_grant is idempotent — safe to call every
+                        # reconcile cycle. It re-creates the listener
+                        # only when state actually drifted.
                         await s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
                         source_count += 1
 
@@ -1483,11 +1543,37 @@ async def _restore_grants(state: DaemonState, sender):
                             await loop.run_in_executor(None, setup_sudoers, priv_level)
                         target_count += 1
 
-            if source_count or target_count:
-                log.info(f"Restored {source_count} source + {target_count} target SSH grants")
+            # Log only when something actually happened — reconcile runs
+            # on a 60s timer and would otherwise flood the journal.
+            if source_count or target_count or stale_source_grants:
+                log.info(
+                    f"Reconciled: {source_count} source + {target_count} target grants active; "
+                    f"{len(stale_source_grants)} stale source grants torn down. "
+                    f"Live tunnels: {s2s_tunnel.active_grants_snapshot()}"
+                )
 
     except Exception as e:
-        log.warning(f"Failed to restore grants: {e}")
+        log.warning(f"Grant reconcile failed: {e}")
+
+
+async def grant_reconcile_loop(state: DaemonState, sender_factory):
+    """Periodic reconciler. sender_factory returns the current ws_send
+    bound to whatever WS connection is live (it can change across
+    reconnects). Sleeps gracefully across `state.running=False`."""
+    while state.running:
+        try:
+            await asyncio.sleep(_GRANT_RECONCILE_INTERVAL)
+            if not state.running:
+                break
+            # Don't run reconcile if WS is currently down — the WS
+            # reconnect path will run _restore_grants itself.
+            if state.ws_connection is None:
+                continue
+            await _reconcile_grants(state, sender_factory())
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            log.exception("grant_reconcile_loop iteration crashed")
 
 
 # ── Approval rules cache + permission log flush ──────────────────

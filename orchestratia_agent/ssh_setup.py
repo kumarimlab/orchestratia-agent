@@ -298,20 +298,23 @@ def _sudo_run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     masks it entirely, leaving '[Errno 1] Operation not permitted'
     in the log with no hint that the real problem was a timeout.
 
-    Bug we hit in production: a VMware-provisioned host with a missing
-    /etc/hosts entry made sudo block 15s on getaddrinfo() of its own
-    hostname; subprocess.run's 10s timeout fired, kill() returned
+    Bug that exposed this masking: a VMware-provisioned host with a
+    missing /etc/hosts entry made sudo block 15s on getaddrinfo() of
+    its own hostname; the 10s subprocess timeout fired, kill() returned
     EPERM, and the agent reported a permissions error when the real
     problem was DNS. (Diagnosed 2026-05-23 by a Claude task running
     on the affected server — see dogfood-claude-diagnoses-bug.md.)
 
-    Two changes from the old subprocess.run path:
-      - Timeout raised from 10s → 30s so slow-DNS environments don't
-        false-trigger before real failures
-      - Manual Popen so we control the kill() call and can swallow
-        the EPERM that masks the real TimeoutExpired
+    Design choice: we deliberately keep the 10s timeout (NOT increase
+    it). A healthy sudo invocation finishes in milliseconds. If sudo
+    takes >10s the host environment is broken (slow DNS, PAM hanging,
+    audit subsystem under load) and the agent should fail loudly, not
+    paper over it. The install-time hostname check + diag.sh's
+    hostname-timing section surface that class of issue at the right
+    layer. The fix here is purely diagnostic: surface the real
+    TimeoutExpired instead of letting the kill-EPERM mask it.
     """
-    timeout = kwargs.pop("timeout", 30)
+    timeout = kwargs.pop("timeout", 10)
     input_data = kwargs.pop("input", None)
 
     proc = subprocess.Popen(

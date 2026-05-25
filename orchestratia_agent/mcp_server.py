@@ -542,6 +542,67 @@ class _SessionMCP:
                 })
             return json.dumps({"memories": results}, default=str)
 
+        # ── Task supervision (§8.5.3) ────────────────────────────────
+        @self.mcp.tool()
+        async def review_task_result(
+            task_id: str,
+            decision: str,
+            feedback: str = "",
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Accept, revise, or reject a worker's task result. `decision` ∈
+            accept | revise | reject. `accept` marks it done. `reject` fails
+            it. `revise` keeps the worker on the task and pushes your
+            `feedback` to its MCP inbox so it fixes and re-completes — no
+            keystrokes. Always give concrete feedback when revising."""
+            if decision not in ("accept", "revise", "reject"):
+                return "error: decision must be accept|revise|reject"
+            r = await self._hub_post(
+                "/api/v1/server/orchestrator/review-task",
+                {
+                    "orchestrator_session_id": self.session_id,
+                    "task_id": task_id,
+                    "decision": decision,
+                    "feedback": feedback,
+                },
+            )
+            if r is None:
+                return "error: hub rejected the review (task not in your project?)"
+            return f"ok decision={r.get('decision')} task_status={r.get('new_status')}"
+
+        @self.mcp.tool()
+        async def assign_task(
+            session_id: str,
+            task_spec: str = "",
+            task_id: str = "",
+            task_title: str = "",
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Assign work to an already-running worker, keystroke-free. Pass
+            a new `task_spec` (a task is created) or an existing `task_id`.
+            The worker's `task://current` updates and it re-reads the task
+            over MCP on its own — nothing is typed into its terminal. (Often
+            it's cheaper to terminate a context-polluted worker and spawn a
+            fresh one than to reassign it.)"""
+            if not session_id:
+                return "error: session_id required"
+            if not task_spec and not task_id:
+                return "error: provide task_spec or task_id"
+            body: dict[str, Any] = {
+                "orchestrator_session_id": self.session_id,
+                "session_id": session_id,
+            }
+            if task_id:
+                body["task_id"] = task_id
+            if task_spec:
+                body["task_spec"] = task_spec
+            if task_title:
+                body["task_title"] = task_title
+            r = await self._hub_post("/api/v1/server/orchestrator/assign-task", body)
+            if r is None:
+                return "error: hub rejected the assignment (worker not in your project or not running)"
+            return f"ok assigned task_id={r.get('task_id')} to session={r.get('session_id')}"
+
     # ── Notifications ────────────────────────────────────────────────
 
     async def notify_governance_inbox(self):
@@ -570,6 +631,16 @@ class _SessionMCP:
             # Best effort — Claude can still poll the resource. Logged at
             # debug to avoid noise when no MCP client is connected yet.
             log.debug("notify_note_inbox: no active mcp session to push to")
+
+    async def notify_task_changed(self):
+        """Phase 2.5: tell the MCP client `task://current` changed (live
+        reassignment). A resources-list-changed nudge makes Claude re-read
+        its task on its own — keystroke-free."""
+        try:
+            server = self.mcp._mcp_server  # type: ignore[attr-defined]
+            await server.request_context.session.send_resource_list_changed()
+        except Exception:
+            log.debug("notify_task_changed: no active mcp session to push to")
 
 
 class MCPServerManager:
@@ -618,6 +689,13 @@ class MCPServerManager:
         if not sess:
             return
         await sess.notify_governance_inbox()
+
+    async def notify_task_changed(self, session_id: str):
+        """Phase 2.5: tell a (re)assigned worker its `task://current` changed."""
+        sess = self._sessions.get(session_id)
+        if not sess:
+            return
+        await sess.notify_task_changed()
 
     def _build_app(self):
         """Build the ASGI app that routes per-session MCP URLs.

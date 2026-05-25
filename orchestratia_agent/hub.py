@@ -849,6 +849,23 @@ async def ws_receive_loop(ws, state: DaemonState):
                         _inject_task_trigger(state, session, task_id)
                         log.info(f"Auto-triggered task #{task_id[:8]} in session {target_session_id[:8]}")
 
+            elif msg_type == "task_reassigned":
+                # Phase 2.5 live reassignment — keystroke-free. Update the
+                # worker's MCP task binding and nudge it to re-read
+                # task://current. NEVER inject keystrokes here (that's the
+                # spawn-launch mistake relocated to reassignment).
+                target_session_id = msg.get("session_id")
+                task_id = msg.get("task_id", "")
+                if state.mcp_manager and target_session_id and task_id and state.mcp_enabled:
+                    mcp_sess = state.mcp_manager._sessions.get(target_session_id)
+                    if mcp_sess:
+                        mcp_sess.task_id = task_id
+                    asyncio.create_task(state.mcp_manager.notify_task_changed(target_session_id))
+                    log.info(
+                        f"task_reassigned: session {target_session_id[:8]} -> "
+                        f"task {task_id[:8]} (keystroke-free)"
+                    )
+
             elif msg_type == "task_approved":
                 session_id = msg.get("session_id")
                 task_id = msg.get("task_id", "")

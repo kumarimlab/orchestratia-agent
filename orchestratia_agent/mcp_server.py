@@ -421,6 +421,43 @@ class _SessionMCP:
             parts.append(f"agent_type={r.get('agent_type')}")
             return " ".join(parts)
 
+        @self.mcp.tool()
+        async def terminate_worker(
+            session_id: str,
+            reason: str = "",
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Reap a worker session in your project when its task is done or
+            its context has gotten polluted.
+
+            If the project requires terminate approval, this raises a human
+            approval request and the worker keeps running until a human
+            approves — the tool returns the intervention id. Otherwise the
+            worker is killed immediately. Reap freely: workers are disposable;
+            a fresh worker is often cheaper than reassigning a polluted one.
+            """
+            if not session_id:
+                return "error: session_id required"
+            r = await self._hub_post(
+                "/api/v1/server/orchestrator/terminate-worker",
+                {
+                    "orchestrator_session_id": self.session_id,
+                    "session_id": session_id,
+                    "reason": reason,
+                },
+            )
+            if r is None:
+                return (
+                    "error: hub rejected the terminate (worker not in your "
+                    "project, already stopped, or you are not its orchestrator)"
+                )
+            if r.get("requires_approval"):
+                return (
+                    f"pending human approval — intervention_id={r.get('intervention_id')}. "
+                    "The worker keeps running until approved."
+                )
+            return "ok worker terminated"
+
     # ── Notifications ────────────────────────────────────────────────
 
     async def notify_governance_inbox(self):

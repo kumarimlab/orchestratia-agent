@@ -365,6 +365,62 @@ class _SessionMCP:
             ok, info = await mgr.respond_to_request(request_id, "escalate", reason)
             return "ok" if ok else f"error: {info}"
 
+        # ── Phase 2.5: worker lifecycle ──────────────────────────────
+        @self.mcp.tool()
+        async def spawn_worker(
+            name: str | None = None,
+            agent_type: str = "claude_code",
+            working_dir: str | None = None,
+            task_spec: str | None = None,
+            task_title: str | None = None,
+            launch_command: str | None = None,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Spawn a disposable worker session in this project.
+
+            The worker comes up with the agent CLI as its root process (no
+            shell, no keystrokes) on your server. If `task_spec` is given, a
+            task is created and bound to the worker so it reads its full spec
+            from `task://current` over MCP and begins on its own.
+
+            `agent_type` ∈ claude_code | gemini_cli | codex_cli | aider |
+            cursor (default claude_code) — cross-agent: a Claude orchestrator
+            can spawn a Gemini worker. `launch_command` overrides the CLI
+            binary (e.g. "claude --model opus"); otherwise it's derived from
+            `agent_type`. `working_dir` is where the worker runs.
+
+            Fails if the project's worker limit is reached (try
+            `terminate_worker` first) or the requested agent_type isn't
+            worker-ready on the server (a human must authenticate it once).
+            Returns the new session_id (and task_id, if a task was created).
+            """
+            body: dict[str, Any] = {
+                "orchestrator_session_id": self.session_id,
+                "agent_type": agent_type,
+            }
+            if name:
+                body["name"] = name
+            if working_dir:
+                body["working_dir"] = working_dir
+            if task_spec:
+                body["task_spec"] = task_spec
+            if task_title:
+                body["task_title"] = task_title
+            if launch_command:
+                body["launch_command"] = launch_command
+            r = await self._hub_post("/api/v1/server/orchestrator/spawn-worker", body)
+            if r is None:
+                return (
+                    "error: hub rejected the spawn (worker limit reached, "
+                    "agent_type not worker-ready, or daemon unreachable — "
+                    "check the project's worker fleet + server readiness)"
+                )
+            parts = [f"ok session_id={r.get('session_id')}"]
+            if r.get("task_id"):
+                parts.append(f"task_id={r['task_id']}")
+            parts.append(f"agent_type={r.get('agent_type')}")
+            return " ".join(parts)
+
     # ── Notifications ────────────────────────────────────────────────
 
     async def notify_governance_inbox(self):

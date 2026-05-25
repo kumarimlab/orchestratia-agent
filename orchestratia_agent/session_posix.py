@@ -7,6 +7,7 @@ import fcntl
 import logging
 import os
 import pty
+import shlex
 import signal
 import struct
 import subprocess
@@ -14,7 +15,11 @@ import sys
 import termios
 import time
 
-from orchestratia_agent.session_base import SessionBackend, SessionHandle
+from orchestratia_agent.session_base import (
+    WORKER_BOOTSTRAP_PROMPT,
+    SessionBackend,
+    SessionHandle,
+)
 from orchestratia_agent.tmux import discover_tmux_sessions, has_tmux
 
 if sys.platform == "win32":
@@ -34,6 +39,7 @@ class PosixSessionBackend:
         rows: int,
         env_vars: dict[str, str] | None,
         project_id: str | None,
+        launch_command: str | None = None,
     ) -> SessionHandle | None:
         use_tmux = has_tmux()
         tmux_name = f"orc-{session_id[:12]}" if use_tmux else ""
@@ -85,6 +91,18 @@ class PosixSessionBackend:
                     if project_id:
                         os.environ["ORCHESTRATIA_PROJECT_ID"] = project_id
 
+                    # Phase 2.5: when launch_command is set, the agent CLI is
+                    # the session's root process — no bare shell, no keystroke
+                    # injection. `bash -l` resolves PATH so `claude`/`gemini`/
+                    # etc. is found; `exec` makes the session exit code the
+                    # agent's own, so the worker dies → session dies → reap is
+                    # automatic. The bootstrap is a fixed argv constant (the
+                    # spec itself flows over MCP via task://current).
+                    root_cmd: list[str] | None = None
+                    if launch_command:
+                        bootstrap = shlex.quote(WORKER_BOOTSTRAP_PROMPT)
+                        root_cmd = ["bash", "-lc", f"exec {launch_command} {bootstrap}"]
+
                     if use_tmux:
                         tmux_cmd = [
                             "tmux", "new-session", "-s", tmux_name,
@@ -98,7 +116,14 @@ class PosixSessionBackend:
                                 tmux_cmd.extend(["-e", f"{k}={v}"])
                         if project_id:
                             tmux_cmd.extend(["-e", f"ORCHESTRATIA_PROJECT_ID={project_id}"])
+                        if root_cmd:
+                            # `--` ends tmux options; the rest is the session's
+                            # root command. When it exits, the tmux session ends.
+                            tmux_cmd.append("--")
+                            tmux_cmd.extend(root_cmd)
                         os.execvp("tmux", tmux_cmd)
+                    elif root_cmd:
+                        os.execvp("bash", root_cmd)
                     else:
                         os.execvp(user_shell, [f"-{os.path.basename(user_shell)}"])
                 except Exception as e:

@@ -188,7 +188,12 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
     try:
         resp = await client.post(
             f"{state.hub_url}/api/v1/servers/heartbeat",
-            json={"system_info": get_system_info()},
+            json={
+                "system_info": get_system_info(),
+                # Phase 2.5: per-agent_type worker-readiness (empty until the
+                # first preflight probe runs). Older hubs ignore this field.
+                "worker_ready": state.worker_ready,
+            },
             headers={"X-API-Key": state.api_key},
         )
         resp.raise_for_status()
@@ -606,9 +611,17 @@ async def ws_receive_loop(ws, state: DaemonState):
                 # Orchestrator sessions get the governance MCP toolset +
                 # the orchestrator system prompt written to the workspace.
                 role = msg.get("role") or "worker"
+                # Phase 2.5: orchestrator-spawned workers carry a
+                # launch_command (run the CLI as the session root process,
+                # keystroke-free) and a task_id bound at spawn so
+                # task://current resolves the instant the worker's MCP client
+                # connects — no task_assigned keystroke injection.
+                launch_command = msg.get("launch_command")
+                start_task_id = msg.get("task_id")
                 log.info(
                     f"Hub requests session start: {session_id[:8]} "
-                    f"(agent_type={agent_type or 'auto'}, role={role})"
+                    f"(agent_type={agent_type or 'auto'}, role={role}"
+                    f"{', launch=' + launch_command if launch_command else ''})"
                 )
 
                 try:
@@ -621,6 +634,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                     handle = backend.spawn(
                         session_id, working_dir, cols, rows,
                         env_vars=env_vars, project_id=project_id,
+                        launch_command=launch_command,
                     )
                     if handle:
                         # Compute the resolved working_dir so fs operations
@@ -647,7 +661,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                         if state.mcp_manager and state.mcp_enabled:
                             try:
                                 await state.mcp_manager.register_session(
-                                    session_id, task_id=None, role=role,
+                                    session_id, task_id=start_task_id, role=role,
                                 )
                                 from orchestratia_agent.mcp_server import write_mcp_config
                                 mcp_status_value, written_path = write_mcp_config(

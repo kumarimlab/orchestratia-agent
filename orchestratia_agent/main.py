@@ -58,6 +58,11 @@ class DaemonState:
     # MCP session round trip. Initialized alongside mcp_manager. None when
     # MCP is disabled.
     governance_manager: object | None = None
+    # Phase 2.5 worker-readiness preflight: agent_type → readiness string,
+    # populated by WorkerPreflight.probe_all() and shipped on the heartbeat
+    # so spawn_worker only targets servers that can actually launch workers.
+    worker_ready: dict = field(default_factory=dict)
+    worker_preflight: object | None = None
 
 
 async def main():
@@ -188,6 +193,13 @@ async def main():
                     scan_and_write(state)
                 except Exception:
                     log.exception("workspace-scan on SIGHUP failed")
+                # Re-probe worker-readiness too — handy right after a human
+                # installs/authenticates a CLI on this server.
+                if state.worker_preflight is not None:
+                    try:
+                        asyncio.ensure_future(state.worker_preflight.probe_all())
+                    except Exception:
+                        log.exception("preflight re-probe on SIGHUP failed")
             if hasattr(signal, "SIGHUP"):
                 signal.signal(signal.SIGHUP, _sighup_rescan)
 
@@ -217,6 +229,9 @@ async def main():
             # missed WS pushes (grant_ssh_access / revoke_grant_access).
             # See _reconcile_grants for the bug class this addresses.
             grant_reconcile_loop(state, _sender_factory),
+            # Phase 2.5: probe which agent CLIs can run as workers and keep
+            # servers.worker_ready fresh via the heartbeat.
+            worker_preflight_loop(state),
         ]
         if state.mcp_enabled:
             from orchestratia_agent.mcp_server import MCPServerManager
@@ -245,6 +260,28 @@ async def main():
             await cleanup_sessions(state)
 
     log.info("Agent daemon stopped.")
+
+
+async def worker_preflight_loop(state: DaemonState):
+    """Probe worker-readiness at startup, then refresh every 10 minutes.
+
+    Cheap (binary-presence on the login-shell PATH), so re-running keeps
+    servers.worker_ready current when a CLI is installed or authenticated
+    after the daemon started — without a restart. Results ride the heartbeat.
+    """
+    from orchestratia_agent.worker_preflight import WorkerPreflight
+
+    preflight = WorkerPreflight(state)
+    state.worker_preflight = preflight
+    # Small initial delay so the first heartbeat (which sends worker_ready)
+    # doesn't race the probe — a stale-empty first beat is harmless either way.
+    await asyncio.sleep(2)
+    while state.running:
+        try:
+            await preflight.probe_all()
+        except Exception:
+            log.exception("preflight: probe_all failed (will retry)")
+        await asyncio.sleep(600)
 
 
 async def idle_note_flush_loop(state: DaemonState):

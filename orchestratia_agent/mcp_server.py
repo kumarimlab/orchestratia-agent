@@ -153,6 +153,11 @@ class _SessionMCP:
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self.state.api_key}
 
+    def _working_dir(self) -> str | None:
+        """This session's resolved working directory (for memory file I/O)."""
+        sess = self.state.active_sessions.get(self.session_id)
+        return getattr(sess, "working_dir", None) if sess else None
+
     async def _hub_get(self, path: str) -> dict[str, Any] | None:
         url = f"{self.state.hub_url}{path}"
         try:
@@ -327,6 +332,17 @@ class _SessionMCP:
                 default=str,
             )
 
+        @self.mcp.resource("orchestrator://memory")
+        async def orchestrator_memory() -> str:
+            """Recent project memories (file path + tags + summary). Use the
+            `recall` tool to search and read full contents."""
+            data = await self._hub_get(
+                f"/api/v1/server/orchestrator/memory/search"
+                f"?orchestrator_session_id={self.session_id}&limit=20"
+            )
+            entries = (data or {}).get("entries", []) if isinstance(data, dict) else []
+            return json.dumps({"memories": entries}, default=str)
+
     def _register_orchestrator_tools(self):
         @self.mcp.tool()
         async def evaluate_tool_call(
@@ -457,6 +473,74 @@ class _SessionMCP:
                     "The worker keeps running until approved."
                 )
             return "ok worker terminated"
+
+        # ── Persistent project memory (§8.5.2) ───────────────────────
+        @self.mcp.tool()
+        async def remember(
+            fact: str,
+            tags: list[str] | None = None,
+            related_task_id: str | None = None,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Persist a durable project fact (architecture decision, user
+            preference, gotcha) to orchestrator memory. Stored as a markdown
+            file in your working tree (.orchestratia/memory/) and indexed for
+            `recall`. Survives across worker lifecycles and your own restarts.
+            Tag it so future recall is sharp (e.g. ["auth","db"])."""
+            cwd = self._working_dir()
+            if not cwd:
+                return "error: this orchestrator session has no working directory"
+            from orchestratia_agent.orchestrator_memory import write_memory
+            try:
+                payload = write_memory(cwd, fact, tags or [], related_task_id)
+            except Exception as e:
+                return f"error: failed to write memory file: {e}"
+            r = await self._hub_post(
+                "/api/v1/server/orchestrator/memory",
+                {"orchestrator_session_id": self.session_id, **payload},
+            )
+            if r is None:
+                return (
+                    f"saved to {payload['file_path']} but index push failed — "
+                    "it will be picked up on the next reindex"
+                )
+            return f"ok remembered -> {payload['file_path']}"
+
+        @self.mcp.tool()
+        async def recall(
+            query: str = "",
+            tags: str = "",
+            limit: int = 10,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Search orchestrator memory and return matching facts with their
+            full content. `query` matches summary/path/tags; `tags` is a
+            comma-separated any-match filter; empty args return recent
+            memories. Reads the canonical files, so it works even if the index
+            was rebuilt."""
+            from urllib.parse import quote
+            cwd = self._working_dir()
+            path = (
+                f"/api/v1/server/orchestrator/memory/search"
+                f"?orchestrator_session_id={self.session_id}&limit={int(limit)}"
+            )
+            if query:
+                path += f"&q={quote(query)}"
+            if tags:
+                path += f"&tags={quote(tags)}"
+            data = await self._hub_get(path)
+            entries = (data or {}).get("entries", []) if isinstance(data, dict) else []
+            from orchestratia_agent.orchestrator_memory import read_memory
+            results = []
+            for e in entries:
+                body = read_memory(cwd, e["file_path"]) if cwd else None
+                results.append({
+                    "file": e["file_path"],
+                    "tags": e.get("tags", []),
+                    "summary": e.get("summary"),
+                    "content": body,
+                })
+            return json.dumps({"memories": results}, default=str)
 
     # ── Notifications ────────────────────────────────────────────────
 

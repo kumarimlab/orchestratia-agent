@@ -232,6 +232,8 @@ async def main():
             # Phase 2.5: probe which agent CLIs can run as workers and keep
             # servers.worker_ready fresh via the heartbeat.
             worker_preflight_loop(state),
+            # Phase 2.5: reconcile orchestrator memory files → hub index.
+            orchestrator_memory_sync_loop(state),
         ]
         if state.mcp_enabled:
             from orchestratia_agent.mcp_server import MCPServerManager
@@ -260,6 +262,44 @@ async def main():
             await cleanup_sessions(state)
 
     log.info("Agent daemon stopped.")
+
+
+async def orchestrator_memory_sync_loop(state: DaemonState):
+    """Reconcile orchestrator memory files → hub index every ~10s.
+
+    Picks up files the user created/edited/deleted by hand (scenarios 6/7)
+    and rebuilds the index from the canonical files after a wipe (8/12). Only
+    runs for active orchestrator sessions; cheap when the memory dir is empty.
+    """
+    import httpx
+    from orchestratia_agent.orchestrator_memory import scan_memory
+    from orchestratia_agent.tls import httpx_verify
+
+    while state.running:
+        await asyncio.sleep(10)
+        if not state.mcp_manager or not state.mcp_enabled:
+            continue
+        try:
+            mcp_sessions = dict(getattr(state.mcp_manager, "_sessions", {}))
+        except Exception:
+            continue
+        for sid, msess in mcp_sessions.items():
+            if getattr(msess, "role", "worker") != "orchestrator":
+                continue
+            managed = state.active_sessions.get(sid)
+            cwd = getattr(managed, "working_dir", None) if managed else None
+            if not cwd:
+                continue
+            try:
+                entries = scan_memory(cwd)
+                async with httpx.AsyncClient(timeout=15, verify=httpx_verify(state=state)) as client:
+                    await client.post(
+                        f"{state.hub_url}/api/v1/server/orchestrator/memory/sync",
+                        headers={"X-API-Key": state.api_key},
+                        json={"orchestrator_session_id": sid, "entries": entries},
+                    )
+            except Exception:
+                log.debug(f"memory: sync for orchestrator {sid[:8]} failed (will retry)")
 
 
 async def worker_preflight_loop(state: DaemonState):

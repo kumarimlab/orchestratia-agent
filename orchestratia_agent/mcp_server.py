@@ -603,6 +603,69 @@ class _SessionMCP:
                 return "error: hub rejected the assignment (worker not in your project or not running)"
             return f"ok assigned task_id={r.get('task_id')} to session={r.get('session_id')}"
 
+        # ── Break-glass (§8.5.3a) — escape hatches, not the normal channel ──
+        @self.mcp.tool()
+        async def peek_worker(
+            session_id: str,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Break-glass: one-shot snapshot of a worker's current screen.
+            Use ONLY when a worker has gone non-responsive to `ask_agent` —
+            this is not how you normally observe workers (no streaming). Pull
+            only; returns the last rendered screen lines."""
+            data = await self._hub_get(
+                f"/api/v1/server/orchestrator/worker-screen"
+                f"?orchestrator_session_id={self.session_id}&session_id={session_id}"
+            )
+            if data is None:
+                return "error: hub rejected peek (worker not in your project?)"
+            screen = data.get("last_screen") or []
+            return json.dumps({"session_id": session_id, "screen": screen}, default=str)
+
+        @self.mcp.tool()
+        async def interrupt_worker(
+            session_id: str,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Break-glass: send Esc to unstick a hung worker without a full
+            kill+respawn. For a worker non-responsive to `ask_agent` only —
+            if you reach for this routinely, the supervision channel has
+            failed. Audited."""
+            r = await self._hub_post(
+                "/api/v1/server/orchestrator/worker-input",
+                {"orchestrator_session_id": self.session_id, "session_id": session_id, "mode": "interrupt"},
+            )
+            if r is None:
+                return "error: hub rejected interrupt (worker not in your project or not running)"
+            return "ok interrupt sent (Esc)"
+
+        @self.mcp.tool()
+        async def send_keys(
+            session_id: str,
+            keys: str,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Break-glass: inject a bounded keystroke string into a worker's
+            terminal. Disabled unless the project enables
+            `allow_worker_keystrokes` (default off), because it can route
+            around the permission system. Every call is audited. Last resort
+            for a worker no structured channel can reach — prefer fixing the
+            structured path instead."""
+            if not keys:
+                return "error: keys required"
+            r = await self._hub_post(
+                "/api/v1/server/orchestrator/worker-input",
+                {"orchestrator_session_id": self.session_id, "session_id": session_id,
+                 "mode": "keys", "keys": keys},
+            )
+            if r is None:
+                return (
+                    "error: hub rejected send_keys (disabled for this project "
+                    "[allow_worker_keystrokes=false], worker not in your project, "
+                    "or input too long)"
+                )
+            return "ok keys sent"
+
     # ── Notifications ────────────────────────────────────────────────
 
     async def notify_governance_inbox(self):

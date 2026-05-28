@@ -203,6 +203,27 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
         return False
 
 
+def _close_session(state: "DaemonState", session_id: str):
+    """Single source of truth for tearing down a closed session.
+
+    Always unregisters the per-session MCP plane so its loopback URL stops
+    resolving. A leaked instance keeps answering as a now-closed session —
+    e.g. an orchestrator whose spawn/governance tools still post a dead
+    session_id, which the hub then rejects with "not an active orchestrator".
+    Both the live WS loop and the startup recovery scan route through here so
+    the two paths cannot drift apart (the recovery copy previously skipped the
+    MCP teardown, leaking orchestrator planes across session restarts).
+    """
+    session = state.active_sessions.pop(session_id, None)
+    if state.mcp_manager:
+        state.mcp_manager.unregister_session(session_id)
+    if session and getattr(session, "working_directory", None):
+        project_id = getattr(session, "project_id", "") or ""
+        asyncio.create_task(_run_architecture_scan(
+            state, session.working_directory, session_id, project_id, "session_closed",
+        ))
+
+
 async def connect_ws(state: DaemonState):
     """Connect to the hub's agent WebSocket."""
     from orchestratia_agent.tls import build_ssl_context
@@ -578,16 +599,7 @@ async def ws_receive_loop(ws, state: DaemonState):
         return sender
 
     def _on_session_close(session_id: str):
-        session = state.active_sessions.pop(session_id, None)
-        # Drop the per-session MCP instance so the URL stops resolving.
-        if state.mcp_manager:
-            state.mcp_manager.unregister_session(session_id)
-        # Trigger architecture scan if session had a working directory
-        if session and hasattr(session, 'working_directory') and session.working_directory:
-            project_id = getattr(session, 'project_id', '') or ''
-            asyncio.create_task(_run_architecture_scan(
-                state, session.working_directory, session_id, project_id, "session_closed",
-            ))
+        _close_session(state, session_id)
 
     sender = _make_ws_sender(state)
 
@@ -1357,7 +1369,7 @@ async def report_alive_sessions(state: DaemonState):
         return sender
 
     def _on_session_close(session_id: str):
-        state.active_sessions.pop(session_id, None)
+        _close_session(state, session_id)
 
     sender = _make_ws_sender(state)
 

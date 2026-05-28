@@ -780,6 +780,44 @@ async def ws_receive_loop(ws, state: DaemonState):
                         session.send_sigwinch()
                         log.info(f"Started reader for recovered session {real_id[:8]}")
 
+                    # Phase 2.5: re-register the MCP plane on recovery. A daemon
+                    # restart reattaches the tmux but otherwise leaves the session
+                    # without its MCP server — task/notes resources, and for an
+                    # orchestrator the whole worker-lifecycle toolset (spawn_worker
+                    # etc.). Rebuild it from the role/agent_type/task the hub sent.
+                    rec_role = msg.get("role") or "worker"
+                    rec_agent_type = msg.get("agent_type")
+                    rec_task_id = msg.get("task_id")
+                    if state.mcp_manager and state.mcp_enabled:
+                        rec_cwd = getattr(session, "working_dir", None) or os.path.expanduser("~")
+                        try:
+                            await state.mcp_manager.register_session(
+                                real_id, task_id=rec_task_id, role=rec_role,
+                            )
+                            from orchestratia_agent.mcp_server import write_mcp_config
+                            mcp_status_value, _ = write_mcp_config(
+                                rec_cwd, "127.0.0.1", state.mcp_port, real_id,
+                                agent_type=rec_agent_type,
+                            )
+                            if rec_role == "orchestrator":
+                                try:
+                                    from orchestratia_agent.governance_hook import (
+                                        write_orchestrator_system_prompt,
+                                    )
+                                    write_orchestrator_system_prompt(rec_cwd, rec_agent_type)
+                                except Exception:
+                                    log.exception(
+                                        f"governance: failed to rewrite orchestrator prompt for recovered {real_id[:8]}"
+                                    )
+                            if mcp_status_value:
+                                asyncio.create_task(_report_mcp_status(state, real_id, mcp_status_value))
+                            log.info(
+                                f"Re-registered MCP for recovered session {real_id[:8]} "
+                                f"(role={rec_role}, agent_type={rec_agent_type or 'auto'})"
+                            )
+                        except Exception:
+                            log.exception(f"mcp: re-register on recovery failed for {real_id[:8]}")
+
             elif msg_type == "session_exit_copy_mode":
                 session_id = msg.get("session_id")
                 session = state.active_sessions.get(session_id)

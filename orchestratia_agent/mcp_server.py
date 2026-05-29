@@ -841,6 +841,13 @@ class MCPServerManager:
                 await _context_report_asgi(manager.state, scope, receive, send)
                 return
 
+            # Worker attention: the Notification hook reports the worker is
+            # parked on a prompt (permission_prompt / elicitation_dialog).
+            # Forwarded to the hub → orchestrator wake. Loopback-only.
+            if path == "/attention" and scope["method"] == "POST":
+                await _attention_asgi(manager.state, scope, receive, send)
+                return
+
             # /mcp/sessions/<session_id>/<anything>
             prefix = "/mcp/sessions/"
             if not path.startswith(prefix):
@@ -996,6 +1003,54 @@ async def _context_report_asgi(state, scope, receive, send) -> None:
     await send({
         "type": "http.response.start",
         "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(response)).encode("ascii")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": response})
+
+
+async def _attention_asgi(state, scope, receive, send) -> None:
+    """Raw-ASGI shim for POST /attention.
+
+    The worker's Notification hook posts here when Claude Code parks on a
+    prompt (permission_prompt / elicitation_dialog). We forward it to the hub
+    as `worker_attention`; the hub finds the worker's project orchestrator and
+    delivers `worker_attention_to_orchestrator`, which WAKES the orchestrator
+    (PTY turn) so it can peek + send_keys / escalate. Loopback-only; fail-open.
+    """
+    body = b""
+    while True:
+        msg = await receive()
+        if msg["type"] != "http.request":
+            continue
+        body += msg.get("body", b"")
+        if not msg.get("more_body"):
+            break
+    try:
+        payload = json.loads(body or b"{}")
+    except Exception:
+        payload = {}
+
+    session_id = payload.get("session_id") or ""
+    try:
+        if session_id:
+            from orchestratia_agent.hub import ws_send
+            await ws_send(state, {
+                "type": "worker_attention",
+                "session_id": session_id,
+                "project_id": payload.get("project_id"),
+                "kind": payload.get("kind") or "input",
+                "message": payload.get("message") or "",
+            })
+    except Exception:
+        log.exception("attention: forward to hub failed")
+
+    response = b'{"ok": true}'
+    await send({
+        "type": "http.response.start",
+        "status": 200,
         "headers": [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(response)).encode("ascii")),

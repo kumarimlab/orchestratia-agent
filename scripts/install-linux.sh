@@ -789,6 +789,7 @@ sudo chown -R "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" 2>/dev/null || true
 HOOK_CONTEXT="$INSTALL_DIR/agent-skills/hooks/orchestratia-context.sh"
 HOOK_PRETOOLUSE="$INSTALL_DIR/agent-skills/hooks/orchestratia-pretooluse.sh"
 HOOK_STATUSLINE="$INSTALL_DIR/agent-skills/hooks/orchestratia-statusline.sh"
+HOOK_NOTIFICATION="$INSTALL_DIR/agent-skills/hooks/orchestratia-notification.sh"
 
 # Make hook scripts executable (git clone preserves the +x bit but
 # defensive chmod in case someone re-checked out without it).
@@ -860,6 +861,42 @@ else:
 " 2>/dev/null
 }
 
+# Register the Orchestratia Notification hook (Claude Code only) with matchers
+# scoped to permission_prompt + elicitation_dialog — the cases where a worker
+# is parked on a prompt it can't answer autonomously. We deliberately do NOT
+# match idle_prompt (known bug: fires after every response). This is how the
+# orchestrator gets WOKEN to peek + answer a stuck worker. Idempotent.
+merge_notification() {
+    local SETTINGS_PATH="$1"
+    local NOTIFICATION_CMD="$2"
+    sudo -u "$RUN_USER" python3 -c "
+import json, os
+path = '$SETTINGS_PATH'
+settings = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        settings = {}
+hooks = settings.setdefault('hooks', {})
+entries = hooks.setdefault('Notification', [])
+# Drop any prior orchestratia Notification entries (idempotent re-install).
+entries = [e for e in entries if 'orchestratia' not in str(e)]
+for matcher in ('permission_prompt', 'elicitation_dialog'):
+    entries.append({
+        'matcher': matcher,
+        'hooks': [{'type': 'command', 'command': '$NOTIFICATION_CMD', 'timeout': 5000}],
+    })
+hooks['Notification'] = entries
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+print('ok')
+" 2>/dev/null
+}
+
 CLAUDE_DETECTED=false
 GEMINI_DETECTED=false
 CODEX_DETECTED=false
@@ -885,6 +922,9 @@ if sudo -u "$RUN_USER" bash -lc 'command -v claude >/dev/null 2>&1'; then
     fi
     if merge_statusline "${RUN_HOME}/.claude/settings.json" "$HOOK_STATUSLINE" | grep -q "ok"; then
         ok "Claude Code statusLine configured"
+    fi
+    if merge_notification "${RUN_HOME}/.claude/settings.json" "$HOOK_NOTIFICATION" | grep -q "ok"; then
+        ok "Claude Code Notification hook configured (worker-attention)"
     fi
 fi
 

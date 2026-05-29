@@ -40,6 +40,7 @@ class PosixSessionBackend:
         env_vars: dict[str, str] | None,
         project_id: str | None,
         launch_command: str | None = None,
+        append_bootstrap: bool = True,
     ) -> SessionHandle | None:
         use_tmux = has_tmux()
         tmux_name = f"orc-{session_id[:12]}" if use_tmux else ""
@@ -100,8 +101,16 @@ class PosixSessionBackend:
                     # spec itself flows over MCP via task://current).
                     root_cmd: list[str] | None = None
                     if launch_command:
-                        bootstrap = shlex.quote(WORKER_BOOTSTRAP_PROMPT)
-                        root_cmd = ["bash", "-lc", f"exec {launch_command} {bootstrap}"]
+                        # Workers get the bootstrap prompt ("read task://current
+                        # and begin") as a positional arg. Orchestrators
+                        # (append_bootstrap=False) come up interactive with NO
+                        # auto-prompt — they have no task; they manage the fleet
+                        # and their role arrives via the SessionStart hook.
+                        if append_bootstrap:
+                            cmd = f"exec {launch_command} {shlex.quote(WORKER_BOOTSTRAP_PROMPT)}"
+                        else:
+                            cmd = f"exec {launch_command}"
+                        root_cmd = ["bash", "-lc", cmd]
 
                     if use_tmux:
                         tmux_cmd = [

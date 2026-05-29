@@ -47,8 +47,13 @@ class SessionBackend(Protocol):
         env_vars: dict[str, str] | None,
         project_id: str | None,
         launch_command: str | None = None,
+        append_bootstrap: bool = True,
     ) -> SessionHandle | None:
         """Spawn a new interactive session. Returns handle or None on failure.
+
+        ``append_bootstrap`` (default True): append the worker bootstrap prompt
+        as a positional arg to ``launch_command``. Set False for orchestrator
+        sessions, which come up interactive with no auto-prompt.
 
         ``launch_command`` (Phase 2.5): when set, the agent CLI is launched as
         the session's *root process* (``bash -lc 'exec <launch_command>

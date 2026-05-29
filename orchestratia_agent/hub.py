@@ -578,6 +578,43 @@ def _inject_escape(session: "ManagedSession"):
         session.write_input(b"\x1b")
 
 
+_last_orch_wake: dict[str, float] = {}
+_ORCH_WAKE_DEBOUNCE_S = 8.0
+
+
+def _wake_orchestrator(state: "DaemonState", session_id: str | None, reason: str) -> None:
+    """Wake an idle orchestrator by injecting a turn into its PTY.
+
+    An idle CLI agent does NOT act on MCP resource-list bumps (notify_*_inbox)
+    — those aren't turns — so a pending governance decision or a stuck worker
+    would sit unseen (the orchestrator only notices when it happens to poll).
+    This injects a short directive line + Enter so the orchestrator takes a
+    turn now and reads its inboxes. Debounced: one wake covers all currently
+    pending items, since the orchestrator reads the whole inbox on that turn.
+    """
+    import time
+
+    if not session_id:
+        return
+    session = state.active_sessions.get(session_id)
+    if not session or session.closed:
+        return
+    now = time.monotonic()
+    if now - _last_orch_wake.get(session_id, 0.0) < _ORCH_WAKE_DEBOUNCE_S:
+        return
+    _last_orch_wake[session_id] = now
+    try:
+        _inject_text(
+            session,
+            f"[orchestratia] {reason} — check governance://inbox and "
+            f"notes://inbox and handle the oldest first.",
+            send_enter=True,
+        )
+        log.info(f"woke orchestrator {session_id[:8]}: {reason[:70]}")
+    except Exception:
+        log.exception(f"failed to wake orchestrator {session_id[:8]}")
+
+
 def _inject_task_trigger(state: "DaemonState", session: "ManagedSession", task_id: str):
     """Inject a user prompt into the session to trigger task pickup."""
     message = (
@@ -707,6 +744,9 @@ async def ws_receive_loop(ws, state: DaemonState):
                         session_id, working_dir, cols, rows,
                         env_vars=env_vars, project_id=project_id,
                         launch_command=launch_command,
+                        # Orchestrators launch interactive (no worker bootstrap
+                        # prompt) — they have no task and manage the fleet.
+                        append_bootstrap=(role != "orchestrator"),
                     )
                     if handle:
                         # Compute the resolved working_dir so fs operations
@@ -730,7 +770,9 @@ async def ws_receive_loop(ws, state: DaemonState):
                         # in later. Status is reported back so the dashboard
                         # can show green/amber pips.
                         mcp_status_value: str | None = None
-                        if state.mcp_manager and state.mcp_enabled:
+                        # agent_type "shell" is a plain terminal — no AI agent,
+                        # so no MCP plane (no registration, no config written).
+                        if agent_type != "shell" and state.mcp_manager and state.mcp_enabled:
                             try:
                                 await state.mcp_manager.register_session(
                                     session_id, task_id=start_task_id, role=role,
@@ -1385,6 +1427,33 @@ async def ws_receive_loop(ws, state: DaemonState):
                 mgr = getattr(state, "governance_manager", None)
                 if mgr is not None:
                     mgr.handle_orchestrator_request(msg)
+                # WAKE: the MCP inbox bump alone won't make an idle orchestrator
+                # act (it's not a turn), so the decision would sit until the
+                # orchestrator next polls — the 25s race. Inject a turn so it
+                # responds promptly via evaluate_tool_call.
+                _wake_orchestrator(
+                    state,
+                    msg.get("orchestrator_session_id"),
+                    "a worker is waiting on a permission decision",
+                )
+
+            # Worker-attention: a worker's Notification hook reported it is
+            # parked on a prompt (permission_prompt / elicitation_dialog).
+            # Wake the orchestrator with the actionable directive so it can
+            # peek_worker + send_keys (or escalate) — no MCP resource needed,
+            # the wake line carries everything.
+            elif msg_type == "worker_attention_to_orchestrator":
+                orch_sid = msg.get("orchestrator_session_id")
+                worker_sid = msg.get("worker_session_id") or ""
+                worker_name = msg.get("worker_name") or worker_sid[:8]
+                kind = msg.get("kind") or "input"
+                _wake_orchestrator(
+                    state,
+                    orch_sid,
+                    f"worker '{worker_name}' ({worker_sid[:8]}) is waiting "
+                    f"for {kind} at a prompt; peek_worker it and send_keys to "
+                    f"answer a safe bootstrap prompt, else escalate_to_human",
+                )
 
             elif msg_type == "orchestrator_pointer_changed":
                 # Hub tells us a project's orchestrator pointer changed —

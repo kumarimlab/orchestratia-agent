@@ -623,6 +623,34 @@ class _SessionMCP:
             return json.dumps({"session_id": session_id, "screen": screen}, default=str)
 
         @self.mcp.tool()
+        async def worker_context(
+            session_id: str,
+            ctx: Context = None,  # type: ignore[assignment]
+        ) -> str:
+            """Latest context-window usage for a worker, measured at the
+            worker itself (only its own agent process knows its real usage).
+            Returns `{session_id, pct, used, window, ts}` or a clear error
+            string. A high pct means the worker is near its context limit —
+            consider terminating + respawning a fresh one rather than letting
+            it degrade."""
+            data = await self._hub_get(
+                f"/api/v1/server/orchestrator/worker-context"
+                f"?orchestrator_session_id={self.session_id}&session_id={session_id}"
+            )
+            if data is None:
+                return (
+                    "error: context reading not available yet (hub endpoint "
+                    "missing, or no reading reported for this worker)"
+                )
+            return json.dumps({
+                "session_id": session_id,
+                "pct": data.get("pct"),
+                "used": data.get("used"),
+                "window": data.get("window"),
+                "ts": data.get("ts"),
+            }, default=str)
+
+        @self.mcp.tool()
         async def interrupt_worker(
             session_id: str,
             ctx: Context = None,  # type: ignore[assignment]
@@ -807,6 +835,12 @@ class MCPServerManager:
                 await _governance_evaluate_asgi(manager.state, scope, receive, send)
                 return
 
+            # Worker context monitoring: the statusLine hook reports the
+            # worker's own context-window usage here. Loopback-only.
+            if path == "/context/report" and scope["method"] == "POST":
+                await _context_report_asgi(manager.state, scope, receive, send)
+                return
+
             # /mcp/sessions/<session_id>/<anything>
             prefix = "/mcp/sessions/"
             if not path.startswith(prefix):
@@ -914,6 +948,62 @@ async def _governance_evaluate_asgi(state, scope, receive, send) -> None:
     await send({"type": "http.response.body", "body": response})
 
 
+async def _context_report_asgi(state, scope, receive, send) -> None:
+    """Raw-ASGI shim for POST /context/report.
+
+    The statusLine hook posts `{session_id, used_tokens, window_size?}`.
+    We compute a reading via `context_meter` and store only the latest
+    sample per session on the daemon state (the hook fires often, so we
+    throttle by keeping just the most recent). Loopback-only, no auth.
+    """
+    body = b""
+    while True:
+        msg = await receive()
+        if msg["type"] != "http.request":
+            continue
+        body += msg.get("body", b"")
+        if not msg.get("more_body"):
+            break
+
+    try:
+        payload = json.loads(body or b"{}")
+    except Exception:
+        payload = {}
+
+    session_id = payload.get("session_id") or ""
+    if not session_id:
+        result = {"ok": False, "error": "missing session_id"}
+        status = 400
+    else:
+        try:
+            from orchestratia_agent.context_meter import make_reading, DEFAULT_WINDOW_SIZE
+            window = payload.get("window_size") or DEFAULT_WINDOW_SIZE
+            reading = make_reading(payload.get("used_tokens", 0), window)
+            cache = getattr(state, "context_readings", None)
+            if cache is None:
+                cache = {}
+                state.context_readings = cache
+            # Throttle: keep only the latest reading per session.
+            cache[session_id] = reading.to_dict()
+            result = {"ok": True, **reading.to_dict()}
+            status = 200
+        except Exception as e:
+            log.exception("context: report failed")
+            result = {"ok": False, "error": f"context_error: {e}"}
+            status = 500
+
+    response = json.dumps(result).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(response)).encode("ascii")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": response})
+
+
 def mcp_url_for_session(host: str, port: int, session_id: str) -> str:
     """Return the URL a session's MCP config should point at."""
     return f"http://{host}:{port}/mcp/sessions/{session_id}/mcp"
@@ -961,3 +1051,38 @@ def write_mcp_config(
     url = mcp_url_for_session(host, port, session_id)
     status, path = merge_config(working_dir, agent, url)
     return (status.value, str(path) if path else None)
+
+
+def write_session_mcp_config(
+    host: str,
+    port: int,
+    session_id: str,
+    home: str | None = None,
+) -> str | None:
+    """Write a per-session Claude Code MCP config to a unique path; return it.
+
+    cwd-collision fix: the per-format writers (write_mcp_config) drop a
+    `.mcp.json` into the session's working directory, so two sessions sharing a
+    cwd clobber each other's route — a worker's config can overwrite an
+    orchestrator's, silently handing the orchestrator the worker toolset. This
+    writes an isolated config keyed by session_id under ~/.orchestratia/mcp/,
+    to be passed via `claude --mcp-config <path> --strict-mcp-config` so the
+    session uses ONLY its own route regardless of what's in its cwd.
+
+    Claude-Code-format only (the --mcp-config flag is Claude-specific). Returns
+    the path written, or None on failure (caller falls back to cwd config).
+    """
+    try:
+        url = mcp_url_for_session(host, port, session_id)
+        base = os.path.join(home or os.path.expanduser("~"), ".orchestratia", "mcp")
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, f"{session_id}.json")
+        doc = {"mcpServers": {"orchestratia": {"type": "http", "url": url}}}
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(doc, f, indent=2)
+        os.replace(tmp, path)
+        return path
+    except Exception:
+        log.exception("mcp: failed to write per-session MCP config")
+        return None

@@ -63,6 +63,10 @@ class DaemonState:
     # so spawn_worker only targets servers that can actually launch workers.
     worker_ready: dict = field(default_factory=dict)
     worker_preflight: object | None = None
+    # Worker context-window monitoring: latest reading per session, reported
+    # by the statusLine hook to the loopback POST /context/report endpoint.
+    # Throttled to the latest sample per session_id (the hook fires often).
+    context_readings: dict = field(default_factory=dict)
 
 
 async def main():

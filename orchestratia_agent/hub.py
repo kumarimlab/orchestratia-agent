@@ -669,6 +669,40 @@ async def ws_receive_loop(ws, state: DaemonState):
                             f"claude_trust: pre-trust failed for {session_id[:8]}"
                         )
 
+                    # cwd-collision fix: give Claude Code an ISOLATED per-session
+                    # MCP config and force it with --strict-mcp-config, so two
+                    # sessions sharing a working dir can't clobber each other's
+                    # cwd .mcp.json. That collision silently handed orchestrators
+                    # a worker's route (worker toolset). Claude-only (the flag is
+                    # Claude-specific); other agents keep cwd-config. Done before
+                    # spawn so the CLI reads it at launch.
+                    if launch_command:
+                        try:
+                            from orchestratia_agent.agent_registry import (
+                                AgentType,
+                                coerce_agent_type,
+                            )
+                            if coerce_agent_type(agent_type) == AgentType.CLAUDE_CODE:
+                                from orchestratia_agent.mcp_server import (
+                                    write_session_mcp_config,
+                                )
+                                _cfg = write_session_mcp_config(
+                                    "127.0.0.1", state.mcp_port, session_id
+                                )
+                                if _cfg:
+                                    launch_command = (
+                                        f"{launch_command} --mcp-config {_cfg} "
+                                        f"--strict-mcp-config"
+                                    )
+                                    log.info(
+                                        f"mcp: per-session config for {session_id[:8]} "
+                                        f"→ {_cfg} (--strict-mcp-config)"
+                                    )
+                        except Exception:
+                            log.exception(
+                                f"mcp: per-session config failed for {session_id[:8]}"
+                            )
+
                     handle = backend.spawn(
                         session_id, working_dir, cols, rows,
                         env_vars=env_vars, project_id=project_id,

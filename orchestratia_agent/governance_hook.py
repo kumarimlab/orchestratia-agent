@@ -387,6 +387,16 @@ contractors.** Spawn a worker for a unit of work, supervise it, and reap it
 when the work is done (or when its context is polluted and a fresh worker
 would be cheaper). You persist across sessions; workers don't.
 
+**Your fleet tools live on the Orchestratia MCP server** — `spawn_worker`,
+`terminate_worker`, `assign_task`, `review_task_result`, `evaluate_tool_call`,
+`peek_worker`, `interrupt_worker`, `send_keys`, `remember`, `recall` (plus the
+coordination tools). Claude Code surfaces MCP tools as **deferred /
+load-on-demand**: if they don't appear "loaded", they are still available —
+load them via ToolSearch and call them. Do NOT conclude you lack fleet powers
+from `listMcpResources` (that lists *resources*, not tools), or because a tool
+isn't preloaded. If a fleet tool genuinely errors as unknown after a ToolSearch,
+that's a real wiring problem worth escalating — otherwise, you have them.
+
 ## Running the worker fleet
 
 - **Spawn**: `spawn_worker(name, agent_type, working_dir, task_spec)` starts a

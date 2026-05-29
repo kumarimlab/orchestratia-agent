@@ -656,6 +656,19 @@ async def ws_receive_loop(ws, state: DaemonState):
                         "ORCHESTRATIA_ROLE": role,
                     }
 
+                    # Pre-trust the working dir for Claude Code BEFORE launch:
+                    # a keystroke-free worker can't answer the interactive
+                    # folder-trust dialog, so without this it hangs there
+                    # instead of reading task://current. Must run before spawn
+                    # (the CLI reads trust at startup). No-op for other agents.
+                    try:
+                        from orchestratia_agent.claude_trust import ensure_folder_trusted
+                        ensure_folder_trusted(working_dir, agent_type)
+                    except Exception:
+                        log.exception(
+                            f"claude_trust: pre-trust failed for {session_id[:8]}"
+                        )
+
                     handle = backend.spawn(
                         session_id, working_dir, cols, rows,
                         env_vars=env_vars, project_id=project_id,

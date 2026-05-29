@@ -15,3 +15,6 @@ build/
 # SessionStart hook (orchestratia context-prompt), not by a committed file.
 CLAUDE.md
 .claude/
+# Per-session MCP config the daemon writes into a worker's cwd (points at a
+# loopback session route) — never commit it to this public repo.
+.mcp.json

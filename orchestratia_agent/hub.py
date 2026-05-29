@@ -849,6 +849,22 @@ async def ws_receive_loop(ws, state: DaemonState):
                 if session and not session.closed:
                     session.exit_copy_mode()
 
+            elif msg_type == "capture_screen":
+                # On-demand live screen capture (orchestrator peek_worker).
+                # Reply with a session_screen message — the hub's existing
+                # handler caches it, which peek then reads. Guarantees a
+                # current screen even for an idle worker whose periodic
+                # (on-change) snapshot has gone stale.
+                session_id = msg.get("session_id")
+                session = state.active_sessions.get(session_id)
+                if session and not session.closed:
+                    lines = session.capture_screen()
+                    await ws_send(state, {
+                        "type": "session_screen",
+                        "session_id": session_id,
+                        "lines": lines or [],
+                    })
+
             elif msg_type == "capture_scrollback":
                 session_id = msg.get("session_id")
                 session = state.active_sessions.get(session_id)

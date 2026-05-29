@@ -25,10 +25,10 @@ orchestratia status --json
 
 ## 2. Role Detection
 
-Your role is determined by your session name:
+Your role is set by the `ORCHESTRATIA_ROLE` environment variable (hub-authoritative; defaults to `worker`). Your full role instructions are injected at session start — do not infer your role from the session name.
 
 - **Worker** (default): You execute tasks assigned to you. Check for work, start tasks, do the work, report results.
-- **Orchestrator**: Session names containing "orchestrat", "platform", or "coordinator". You create tasks, assign them to other sessions, and monitor progress.
+- **Orchestrator**: granted explicitly by the hub. You plan work, spawn/assign/govern worker sessions, and monitor progress.
 
 ## 3. Worker Workflow
 

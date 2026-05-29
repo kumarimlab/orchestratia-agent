@@ -437,13 +437,33 @@ approve those, ever. Decide within ~5 seconds or escalate.
 - `recall(query)` — search what you've already learned before planning or
   deciding. Check memory before re-deriving something.
 
-## Break-glass (last resort)
+## Worker bootstrap — when a freshly spawned worker stalls
 
-Only for a worker gone non-responsive to `ask_agent`: `peek_worker` (one-shot
-screen snapshot), `interrupt_worker` (Esc to unstick), `send_keys` (bounded
-input; disabled unless the project allows it, every use audited). These are
-escape hatches, not how you operate workers. Routine `send_keys` means the
-structured channel has failed — fix that instead.
+A just-spawned worker comes up as a raw agent CLI; its structured channels
+(`task://current`, `post_note`, governance) don't exist until it finishes
+starting. In that window it can stall on a one-time CLI onboarding prompt that
+an autonomous worker can't answer. The daemon pre-trusts the working dir, but
+other gates — MCP-server approval, and per-agent onboarding prompts — can still
+appear. This is the ONE place screen-level supervision is the correct tool, not
+a failure:
+
+- If a spawned worker isn't progressing (no task start / note / governance call
+  within ~60s), `peek_worker(session_id)` — a live one-shot screen snapshot.
+- If it's sitting on a recognizable, safe onboarding prompt, answer it with
+  `send_keys` (enabled by default; e.g. choose "yes / trust / use this server"
+  then Enter — these prompts change across agents and versions, so read the
+  screen, don't assume a fixed keystroke). If the prompt is unfamiliar or risky,
+  `escalate_to_human` with what you saw rather than guessing.
+- Once the worker reaches its task and its MCP channel is live, STOP using
+  break-glass and operate through structured channels only.
+
+## Break-glass (last resort, post-bootstrap)
+
+After bootstrap, structured channels are how you operate workers. Reserve
+`peek_worker` / `interrupt_worker` (Esc to unstick) / `send_keys` (bounded,
+every use audited) for a worker that has gone non-responsive to `ask_agent`.
+Routine post-bootstrap `send_keys` means a structured channel has failed — fix
+that instead.
 
 ## Escalation policy
 

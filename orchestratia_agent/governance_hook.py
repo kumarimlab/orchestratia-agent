@@ -126,7 +126,13 @@ class GovernanceManager:
         self._inbox_by_session: dict[str, list[str]] = {}  # session_id → [request_ids]
         # Cached pointer: project_id → pointer dict (None means we know none)
         self._pointer_cache: dict[str, dict[str, Any]] = {}
-        self._timeout_seconds = 5.5  # match hub timeout + small margin
+        # Worker-side wait AND orchestrator-side auto-escalate window. Must
+        # exceed the hub's _DECISION_TIMEOUT_SECONDS (so the hub's verdict
+        # arrives first) and stay under the PreToolUse hook's Claude Code
+        # timeout (30s) and the hook's HTTP read timeout (28s). 5.5s was far
+        # too short for an LLM orchestrator to read its inbox and decide —
+        # every governed call timed out → escalate → native prompt.
+        self._timeout_seconds = 26.0
 
     # ── Worker side ─────────────────────────────────────────────────
 

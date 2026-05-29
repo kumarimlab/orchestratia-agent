@@ -641,6 +641,10 @@ async def ws_receive_loop(ws, state: DaemonState):
                         "ORCHESTRATIA_HUB_URL": state.hub_url,
                         "ORCHESTRATIA_API_KEY": state.api_key,
                         "ORCHESTRATIA_SESSION_ID": session_id,
+                        # Lets the PreToolUse hook reach the loopback
+                        # governance endpoint to route a rule-miss to the
+                        # orchestrator instead of falling back to a prompt.
+                        "ORCHESTRATIA_MCP_PORT": str(state.mcp_port),
                     }
 
                     handle = backend.spawn(
@@ -1382,6 +1386,7 @@ async def report_alive_sessions(state: DaemonState):
     recovery_env = {
         "ORCHESTRATIA_HUB_URL": state.hub_url,
         "ORCHESTRATIA_API_KEY": state.api_key,
+        "ORCHESTRATIA_MCP_PORT": str(state.mcp_port),
     }
 
     for sid, s in list(state.active_sessions.items()):

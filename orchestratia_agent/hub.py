@@ -1431,11 +1431,17 @@ async def ws_receive_loop(ws, state: DaemonState):
                 # act (it's not a turn), so the decision would sit until the
                 # orchestrator next polls — the 25s race. Inject a turn so it
                 # responds promptly via evaluate_tool_call.
-                _wake_orchestrator(
-                    state,
-                    msg.get("orchestrator_session_id"),
-                    "a worker is waiting on a permission decision",
-                )
+                # SELF-WAKE GUARD: never wake the orchestrator for its OWN
+                # governed calls. A grandfathered/un-exempt orchestrator routes
+                # its own tool calls (even inbox reads) through governance; waking
+                # itself for those is a feedback loop.
+                _orch_sid = msg.get("orchestrator_session_id")
+                if msg.get("requesting_session_id") != _orch_sid:
+                    _wake_orchestrator(
+                        state,
+                        _orch_sid,
+                        "a worker is waiting on a permission decision",
+                    )
 
             # Worker-attention: a worker's Notification hook reported it is
             # parked on a prompt (permission_prompt / elicitation_dialog).

@@ -54,14 +54,9 @@ try {
     $server = if ($d.server_name) { $d.server_name } else { "unknown" }
     $session = if ($d.session_name) { $d.session_name } else { "unknown" }
 
-    # Derive role
-    $role = "worker"
-    if ($session) {
-        $sl = $session.ToLower()
-        if ($sl -match "orchestrat|platform|coordinator") {
-            $role = "orchestrator"
-        }
-    }
+    # Role is the hub-stamped ORCHESTRATIA_ROLE env var (default 'worker').
+    # Not inferred from the session name — role must be authoritative.
+    $role = if ($env:ORCHESTRATIA_ROLE) { $env:ORCHESTRATIA_ROLE } else { "worker" }
 
     $project = $d.project_name
     $tasks = $d.tasks
@@ -100,3 +95,10 @@ try {
     Write-Output "Orchestratia: Could not parse status response"
     exit 0
 }
+
+# Inject the role-appropriate system prompt (orchestrator vs worker). Stdout is
+# merged into the agent's context — the on-disk-free role delivery channel
+# (never a CLAUDE.md, so it can't leak into child sessions via the dir tree).
+# Role is read from ORCHESTRATIA_ROLE inside the command.
+Write-Output ""
+try { & orchestratia context-prompt 2>$null } catch { }

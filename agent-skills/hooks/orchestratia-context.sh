@@ -33,7 +33,7 @@ fi
 
 # Parse JSON and format output using Python (guaranteed available on agent servers)
 python3 -c "
-import json, sys
+import json, sys, os
 
 try:
     d = json.loads(sys.stdin.read())
@@ -49,12 +49,10 @@ if not d.get('connected'):
 server = d.get('server_name', 'unknown')
 session = d.get('session_name', 'unknown')
 
-# Derive role
-role = 'worker'
-if session:
-    sl = session.lower()
-    if any(k in sl for k in ('orchestrat', 'platform', 'coordinator')):
-        role = 'orchestrator'
+# Role is the hub-stamped ORCHESTRATIA_ROLE env var (default 'worker').
+# We do NOT infer it from the session name — name is cosmetic and a worker
+# could be named anything; role must be authoritative and fail-safe.
+role = os.environ.get('ORCHESTRATIA_ROLE', 'worker')
 
 project = d.get('project_name', '')
 tasks = d.get('tasks', [])
@@ -86,3 +84,11 @@ print()
 print('Use /orchestratia for workflow details')
 print(bar)
 " <<< "$STATUS_JSON"
+
+# Inject the role-appropriate system prompt (orchestrator vs worker). This is
+# the on-disk-free delivery channel for the role: its stdout is merged into
+# the agent's context by Claude Code, so the role travels with the session and
+# is never written to a CLAUDE.md (which would leak into child sessions via the
+# directory tree). Role is read from ORCHESTRATIA_ROLE inside the command.
+echo
+timeout 5 orchestratia context-prompt 2>/dev/null || true

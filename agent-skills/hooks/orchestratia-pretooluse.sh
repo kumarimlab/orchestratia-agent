@@ -133,9 +133,19 @@ for rule in rules:
 #     error / unreachable hub) falls back to 'ask' so a human can still
 #     decide at the terminal.
 if decision == 'ask' and session_id:
+    role = os.environ.get('ORCHESTRATIA_ROLE', 'worker')
     if tool_name.startswith('mcp__orchestratia__'):
         decision = 'allow'
         reason = 'Auto-approved: Orchestratia coordination tool'
+    elif role == 'orchestrator':
+        # The orchestrator is the *governor*, not the governed. Routing its
+        # own tool calls to /governance/evaluate would be self-referential:
+        # it would receive (via governance://inbox) and have to answer its own
+        # requests — the self-loop we are fixing. Leave decision='ask' so its
+        # human supervisor decides natively at the terminal. (The static deny
+        # list lives on the worker→governance path; the orchestrator is
+        # human-attended and never auto-runs destructive shell.)
+        reason = 'Orchestrator session: not self-governed'
     else:
         try:
             import urllib.request

@@ -645,6 +645,15 @@ async def ws_receive_loop(ws, state: DaemonState):
                         # governance endpoint to route a rule-miss to the
                         # orchestrator instead of falling back to a prompt.
                         "ORCHESTRATIA_MCP_PORT": str(state.mcp_port),
+                        # Single source of truth for the session's role
+                        # (hub-stamped; defaults to 'worker'). The PreToolUse
+                        # hook reads it to skip governing the orchestrator
+                        # itself, and the SessionStart hook reads it to inject
+                        # the role-appropriate system prompt. Role thus travels
+                        # with the session's environment — never written to
+                        # disk, never inherited by child sessions via the
+                        # directory tree.
+                        "ORCHESTRATIA_ROLE": role,
                     }
 
                     handle = backend.spawn(
@@ -692,22 +701,14 @@ async def ws_receive_loop(ws, state: DaemonState):
                                         f"mcp: {mcp_status_value} {written_path} "
                                         f"(session={session_id[:8]}, agent_type={agent_type or 'auto'}, role={role})"
                                     )
-                                # Phase 2: orchestrator sessions get a
-                                # system-prompt file written to whatever
-                                # location the chosen agent reads (CLAUDE.md,
-                                # GEMINI.md, AGENTS.md, etc.). Idempotent.
-                                if role == "orchestrator" and resolved_cwd:
-                                    try:
-                                        from orchestratia_agent.governance_hook import (
-                                            write_orchestrator_system_prompt,
-                                        )
-                                        write_orchestrator_system_prompt(
-                                            resolved_cwd, agent_type
-                                        )
-                                    except Exception:
-                                        log.exception(
-                                            f"governance: failed to write orchestrator prompt for {session_id[:8]}"
-                                        )
+                                # Role delivery: the orchestrator/worker system
+                                # prompt is injected ephemerally by the
+                                # SessionStart hook (keyed on ORCHESTRATIA_ROLE,
+                                # exported above) — NOT written to disk here.
+                                # Writing a CLAUDE.md into the cwd leaked the
+                                # orchestrator role into every worker under that
+                                # directory and polluted tracked project files;
+                                # see governance_hook.role_system_prompt().
                             except Exception:
                                 log.exception(f"mcp: register/config failed for {session_id[:8]}")
                                 mcp_status_value = "unsupported"
@@ -815,16 +816,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                                 rec_cwd, "127.0.0.1", state.mcp_port, real_id,
                                 agent_type=rec_agent_type,
                             )
-                            if rec_role == "orchestrator":
-                                try:
-                                    from orchestratia_agent.governance_hook import (
-                                        write_orchestrator_system_prompt,
-                                    )
-                                    write_orchestrator_system_prompt(rec_cwd, rec_agent_type)
-                                except Exception:
-                                    log.exception(
-                                        f"governance: failed to rewrite orchestrator prompt for recovered {real_id[:8]}"
-                                    )
+                            # Role prompt is re-injected by the SessionStart
+                            # hook on the agent's next launch (keyed on the
+                            # ORCHESTRATIA_ROLE env set at original spawn, which
+                            # persists in the surviving tmux session) — no disk
+                            # write on recovery either.
                             if mcp_status_value:
                                 asyncio.create_task(_report_mcp_status(state, real_id, mcp_status_value))
                             log.info(
@@ -1382,7 +1378,10 @@ async def report_alive_sessions(state: DaemonState):
     surviving_ids = backend.discover_surviving_sessions()
     is_pty_host = hasattr(backend, "_connected")  # PtyHostSessionBackend
 
-    # Env vars to inject into recovered sessions (API key may have changed)
+    # Env vars to inject into recovered sessions (API key may have changed).
+    # ORCHESTRATIA_ROLE is intentionally NOT re-injected here: it's set at
+    # original spawn and persists in the surviving tmux session's environment,
+    # and a reattach can't rewrite an already-running process's env anyway.
     recovery_env = {
         "ORCHESTRATIA_HUB_URL": state.hub_url,
         "ORCHESTRATIA_API_KEY": state.api_key,

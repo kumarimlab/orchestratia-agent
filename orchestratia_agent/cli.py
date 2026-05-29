@@ -1819,6 +1819,27 @@ def cmd_code_priorities(args):
             print(f"     • {r}")
 
 
+def cmd_context_prompt(args):
+    """Print the role-appropriate system prompt for this session.
+
+    Called by the SessionStart hook; its stdout is injected into the agent's
+    context. Role comes from the hub-stamped ORCHESTRATIA_ROLE env var
+    (default 'worker'). This is the single, on-disk-free delivery channel for
+    the orchestrator/worker role — replaces the old write-CLAUDE.md path that
+    leaked the orchestrator role into workers via the directory tree.
+
+    Must never raise: a failure here would break SessionStart for every
+    agent on the box. On any error it prints nothing and exits 0.
+    """
+    try:
+        from orchestratia_agent.governance_hook import role_system_prompt
+        role = os.environ.get("ORCHESTRATIA_ROLE", "worker")
+        sys.stdout.write(role_system_prompt(role))
+    except Exception:
+        pass
+    sys.exit(0)
+
+
 def main():
     global JSON_MODE
 
@@ -2049,6 +2070,11 @@ def main():
     code_review_p.add_argument("task_id", help="Task ID to check review for")
 
     # ── init subcommand ──
+    subparsers.add_parser(
+        "context-prompt",
+        help="Print the role-appropriate system prompt (used by the SessionStart hook)",
+    )
+
     init_parser = subparsers.add_parser("init", help="Generate ORCHESTRATIA.md for this repo")
     init_parser.add_argument("--print", dest="print_only", action="store_true",
                             help="Print to stdout instead of writing file")
@@ -2184,6 +2210,9 @@ def main():
 
     elif args.command == "init":
         cmd_init(args)
+
+    elif args.command == "context-prompt":
+        cmd_context_prompt(args)
 
 
 if __name__ == "__main__":

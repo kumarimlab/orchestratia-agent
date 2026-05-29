@@ -92,9 +92,15 @@ for rule in rules:
 # escalate (or any error / unreachable hub) falls back to 'ask' (native prompt).
 agent_name = os.environ.get('ORCHESTRATIA_AGENT_NAME', 'claude')
 if decision == 'ask' and session_id:
+    role = os.environ.get('ORCHESTRATIA_ROLE', 'worker')
     if tool_name.startswith('mcp__orchestratia__'):
         decision = 'allow'
         reason = 'Auto-approved: Orchestratia coordination tool'
+    elif role == 'orchestrator':
+        # The orchestrator is the governor, not the governed: never route its
+        # own calls to /governance/evaluate (that self-loop is the bug we are
+        # fixing). Leave decision='ask' for its human supervisor.
+        reason = 'Orchestrator session: not self-governed'
     else:
         try:
             import urllib.request

@@ -468,18 +468,70 @@ def _default_escalation_policy() -> str:
     )
 
 
+# A short preamble injected into ordinary *worker* sessions. Deliberately
+# minimal — a worker just needs to know it's governed and how to reach its
+# orchestrator. The bulk of a worker's instructions come from its task spec
+# (task://current) and the repo's own project CLAUDE.md, NOT from here.
+_WORKER_PROMPT_TEMPLATE = """\
+# Worker role — Orchestratia
+
+You are a **worker** agent in an Orchestratia fleet: a short-lived contractor
+spawned to complete one unit of work. An **orchestrator** supervises you; the
+human is reached through it, not directly.
+
+- Your assignment lives in the `task://current` MCP resource — read it for the
+  full spec, acceptance criteria, and any resolved inputs. Do the work in your
+  working directory; follow the repo's own project conventions.
+- Report progress with `post_note`; ask the orchestrator a question with
+  `ask_agent`; request human help with `request_intervention`. These are your
+  lifelines — they never block.
+- Risky tool calls (shell, edits outside your workspace, network) are
+  **governed**: a call that misses the static approval rules is routed to your
+  orchestrator for an allow/deny verdict. Expect occasional short waits; don't
+  work around them.
+- You do **not** govern other agents, spawn workers, or read the
+  orchestrator's queues — those tools aren't yours. Finish your task, report
+  the result, and stop.
+"""
+
+
+def role_system_prompt(role: str | None, escalation_policy: str | None = None) -> str:
+    """Return the system-prompt text for a session's role.
+
+    Single source of truth for role instructions. Consumed by the
+    SessionStart hook (via the `orchestratia context-prompt` CLI command),
+    which injects the returned markdown into the agent's context at launch —
+    so the role travels with the *session/env*, never written to disk and
+    never inherited by child sessions through the directory tree.
+
+    `role` is the hub-stamped ORCHESTRATIA_ROLE; anything other than the
+    literal "orchestrator" is treated as a worker (fail-safe default).
+    """
+    if (role or "").strip().lower() == "orchestrator":
+        policy = (escalation_policy or "").strip() or _default_escalation_policy()
+        return _ORCHESTRATOR_PROMPT_TEMPLATE.format(escalation_policy=policy)
+    return _WORKER_PROMPT_TEMPLATE
+
+
 def write_orchestrator_system_prompt(
     workspace_dir: str,
     agent_type: str | None,
     escalation_policy: str | None = None,
 ) -> str | None:
-    """Write the orchestrator role's system prompt to whichever file the
-    chosen CLI reads. Returns the path written, or None if no writer is
-    defined for `agent_type` (in which case the MCP `prompts/list`
-    fallback path is the only delivery channel).
+    """DEPRECATED — superseded by `role_system_prompt()` + the SessionStart
+    hook (`orchestratia context-prompt`).
 
-    Idempotent — re-running it overwrites with the same content unless
-    the escalation policy changed.
+    Historically this wrote the orchestrator role into the cwd's system-prompt
+    file (CLAUDE.md/GEMINI.md/AGENTS.md). That delivery leaks: a CLAUDE.md at a
+    directory that is a *parent* of worker repos is merged into every worker's
+    context (so workers inherited the orchestrator role), and it pollutes a
+    repo's own tracked CLAUDE.md. Role is now injected ephemerally per-session
+    by the SessionStart hook keyed on ORCHESTRATIA_ROLE — nothing on disk, no
+    cross-tree inheritance. Kept only for backward reference; no longer called.
+
+    Write the orchestrator role's system prompt to whichever file the chosen
+    CLI reads. Returns the path written, or None if no writer is defined for
+    `agent_type`. Idempotent.
     """
     from orchestratia_agent.agent_registry import REGISTRY, AgentType, coerce_agent_type
 

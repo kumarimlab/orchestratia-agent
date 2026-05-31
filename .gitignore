@@ -8,13 +8,3 @@ config.yaml
 *.egg-info/
 dist/
 build/
-
-# Local agent/IDE context files. This repo is PUBLIC — a local CLAUDE.md (or
-# .claude/ dir) carries per-host worker/project context and must never be
-# committed. The orchestrator/worker ROLE is delivered at runtime by the
-# SessionStart hook (orchestratia context-prompt), not by a committed file.
-CLAUDE.md
-.claude/
-# Per-session MCP config the daemon writes into a worker's cwd (points at a
-# loopback session route) — never commit it to this public repo.
-.mcp.json

@@ -79,14 +79,6 @@ VENV_DIR="/opt/orchestratia-venv"
 TOTAL_STEPS=6
 ERRORS=0
 
-# Wait for the apt/dpkg lock instead of failing when another process holds it.
-# A freshly-provisioned box almost always has unattended-upgrades (or cloud-init
-# apt) running at first boot, which holds /var/lib/apt/lists/lock and
-# /var/lib/dpkg/lock-frontend — the #1 transient install failure ("Could not
-# get lock ... It is held by process"). DPkg::Lock::Timeout makes apt block up
-# to N seconds for the lock rather than erroring out immediately.
-APT_OPTS="-o DPkg::Lock::Timeout=300"
-
 # Install from the public GitHub repo by default (the package is not on
 # PyPI). Users can override with ORCHESTRATIA_INSTALL_SOURCE=<spec> for
 # a custom pip spec (e.g. a fork, a PR branch, a pinned tag, or a local
@@ -336,7 +328,7 @@ if check_command pip3; then
     ok "pip3 available"
 else
     info "pip3 not found, installing..."
-    if sudo apt-get $APT_OPTS install -y python3-pip >/dev/null 2>&1; then
+    if sudo apt-get install -y python3-pip >/dev/null 2>&1; then
         ok "pip3 installed"
     else
         fail "Could not install pip3. Install manually: sudo apt install python3-pip"
@@ -348,7 +340,7 @@ if check_command git; then
     ok "git available"
 else
     info "git not found, installing..."
-    if sudo apt-get $APT_OPTS install -y git >/dev/null 2>&1; then
+    if sudo apt-get install -y git >/dev/null 2>&1; then
         ok "git installed"
     else
         fatal "Could not install git. Install manually: sudo apt install git"
@@ -359,7 +351,7 @@ if check_command tmux; then
     ok "tmux $(tmux -V | awk '{print $2}')"
 else
     info "tmux not found, installing..."
-    if sudo apt-get $APT_OPTS install -y tmux >/dev/null 2>&1; then
+    if sudo apt-get install -y tmux >/dev/null 2>&1; then
         ok "tmux installed"
     else
         warn "Could not install tmux. Sessions won't survive daemon restarts."
@@ -464,14 +456,14 @@ deb http://archive.ubuntu.com/ubuntu/ ${CODENAME}-updates universe
 deb http://security.ubuntu.com/ubuntu/ ${CODENAME}-security universe
 UNIV_EOF
         fi
-        sudo apt-get $APT_OPTS update -qq >/dev/null 2>&1
+        sudo apt-get update -qq >/dev/null 2>&1
         return 0
     }
 
     # apt_install_with_universe_fallback <pkg> -> 0/1, sets INSTALL_OUT
     apt_install_with_universe_fallback() {
         local pkg="$1"
-        if INSTALL_OUT=$(sudo apt-get $APT_OPTS install -y "$pkg" 2>&1); then
+        if INSTALL_OUT=$(sudo apt-get install -y "$pkg" 2>&1); then
             return 0
         fi
         # Recognise the "package not available" failure mode that the
@@ -480,7 +472,7 @@ UNIV_EOF
         if echo "$INSTALL_OUT" | grep -qE 'no installation candidate|Unable to locate package' \
            && [ "$IS_UBUNTU" = true ]; then
             if enable_universe; then
-                if INSTALL_OUT=$(sudo apt-get $APT_OPTS install -y "$pkg" 2>&1); then
+                if INSTALL_OUT=$(sudo apt-get install -y "$pkg" 2>&1); then
                     return 0
                 fi
             fi
@@ -493,7 +485,7 @@ UNIV_EOF
     # run on a machine that's already current; mandatory on one that
     # isn't.
     APT_UPDATE_OUT=""
-    if ! APT_UPDATE_OUT=$(sudo apt-get $APT_OPTS update -qq 2>&1); then
+    if ! APT_UPDATE_OUT=$(sudo apt-get update -qq 2>&1); then
         warn "apt-get update reported errors:"
         echo -e "     ${DIM}${APT_UPDATE_OUT}${NC}"
     fi
@@ -788,8 +780,6 @@ sudo chown -R "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" 2>/dev/null || true
 
 HOOK_CONTEXT="$INSTALL_DIR/agent-skills/hooks/orchestratia-context.sh"
 HOOK_PRETOOLUSE="$INSTALL_DIR/agent-skills/hooks/orchestratia-pretooluse.sh"
-HOOK_STATUSLINE="$INSTALL_DIR/agent-skills/hooks/orchestratia-statusline.sh"
-HOOK_NOTIFICATION="$INSTALL_DIR/agent-skills/hooks/orchestratia-notification.sh"
 
 # Make hook scripts executable (git clone preserves the +x bit but
 # defensive chmod in case someone re-checked out without it).
@@ -831,15 +821,19 @@ print('ok')
 " 2>/dev/null
 }
 
-# Register the Orchestratia statusLine command (Claude Code only).
-# Idempotent: only sets statusLine when it's unset or already points at an
-# orchestratia hook, so we never clobber a user's own status line.
-merge_statusline() {
+# ── Helper: strip stale orchestratia statusLine + Notification entries ──
+# v0.15–v0.19 registered a statusLine command and a Notification hook that
+# point at hook scripts this version no longer ships. merge_json_hooks only
+# manages SessionStart/PreToolUse, so clear these two here on (re)install so
+# they don't dangle at a missing script. Idempotent; only touches entries that
+# reference an orchestratia hook.
+clear_stale_hooks() {
     local SETTINGS_PATH="$1"
-    local STATUSLINE_CMD="$2"
+    [ -f "$SETTINGS_PATH" ] || { echo noop; return 0; }
     sudo -u "$RUN_USER" python3 -c "
 import json, os
 path = '$SETTINGS_PATH'
+changed = False
 settings = {}
 if os.path.exists(path):
     try:
@@ -847,53 +841,27 @@ if os.path.exists(path):
             settings = json.load(f)
     except (json.JSONDecodeError, ValueError):
         settings = {}
-existing = settings.get('statusLine')
-cur_cmd = existing.get('command', '') if isinstance(existing, dict) else ''
-if existing is None or 'orchestratia' in str(cur_cmd):
-    settings['statusLine'] = {'type': 'command', 'command': '$STATUSLINE_CMD', 'padding': 0}
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+sl = settings.get('statusLine')
+if isinstance(sl, dict) and 'orchestratia' in str(sl.get('command', '')):
+    settings.pop('statusLine', None)
+    changed = True
+
+hooks = settings.get('hooks')
+if isinstance(hooks, dict) and isinstance(hooks.get('Notification'), list):
+    kept = [e for e in hooks['Notification'] if 'orchestratia' not in str(e)]
+    if len(kept) != len(hooks['Notification']):
+        changed = True
+        if kept:
+            hooks['Notification'] = kept
+        else:
+            hooks.pop('Notification', None)
+
+if changed:
     with open(path, 'w') as f:
         json.dump(settings, f, indent=2)
         f.write('\n')
-    print('ok')
-else:
-    print('skip')
-" 2>/dev/null
-}
-
-# Register the Orchestratia Notification hook (Claude Code only) with matchers
-# scoped to permission_prompt + elicitation_dialog — the cases where a worker
-# is parked on a prompt it can't answer autonomously. We deliberately do NOT
-# match idle_prompt (known bug: fires after every response). This is how the
-# orchestrator gets WOKEN to peek + answer a stuck worker. Idempotent.
-merge_notification() {
-    local SETTINGS_PATH="$1"
-    local NOTIFICATION_CMD="$2"
-    sudo -u "$RUN_USER" python3 -c "
-import json, os
-path = '$SETTINGS_PATH'
-settings = {}
-if os.path.exists(path):
-    try:
-        with open(path) as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        settings = {}
-hooks = settings.setdefault('hooks', {})
-entries = hooks.setdefault('Notification', [])
-# Drop any prior orchestratia Notification entries (idempotent re-install).
-entries = [e for e in entries if 'orchestratia' not in str(e)]
-for matcher in ('permission_prompt', 'elicitation_dialog'):
-    entries.append({
-        'matcher': matcher,
-        'hooks': [{'type': 'command', 'command': '$NOTIFICATION_CMD', 'timeout': 5000}],
-    })
-hooks['Notification'] = entries
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-print('ok')
+print('cleared' if changed else 'noop')
 " 2>/dev/null
 }
 
@@ -920,11 +888,8 @@ if sudo -u "$RUN_USER" bash -lc 'command -v claude >/dev/null 2>&1'; then
     else
         warn "Could not configure Claude Code hooks"
     fi
-    if merge_statusline "${RUN_HOME}/.claude/settings.json" "$HOOK_STATUSLINE" | grep -q "ok"; then
-        ok "Claude Code statusLine configured"
-    fi
-    if merge_notification "${RUN_HOME}/.claude/settings.json" "$HOOK_NOTIFICATION" | grep -q "ok"; then
-        ok "Claude Code Notification hook configured (worker-attention)"
+    if clear_stale_hooks "${RUN_HOME}/.claude/settings.json" | grep -q cleared; then
+        ok "Removed stale orchestratia statusLine/Notification hooks"
     fi
 fi
 

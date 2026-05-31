@@ -51,24 +51,8 @@ class WindowsSessionBackend:
         rows: int,
         env_vars: dict[str, str] | None,
         project_id: str | None,
-        launch_command: str | None = None,
-        append_bootstrap: bool = True,
     ) -> SessionHandle | None:
-        # Phase 2.5: when launch_command is set, run the agent CLI as the
-        # session's root process (keystroke-free worker spawn). On Windows
-        # PATH is global (no login-shell needed); ConPTY inherits env, so we
-        # spawn the CLI + bootstrap argument directly instead of a shell.
-        # Orchestrators (append_bootstrap=False) launch the CLI with no
-        # bootstrap prompt — interactive, no task.
-        if launch_command:
-            if append_bootstrap:
-                from orchestratia_agent.session_base import WORKER_BOOTSTRAP_PROMPT
-                bootstrap = WORKER_BOOTSTRAP_PROMPT.replace('"', '\\"')
-                shell = f'{launch_command} "{bootstrap}"'
-            else:
-                shell = launch_command
-        else:
-            shell = _detect_shell()
+        shell = _detect_shell()
 
         cwd = working_dir or os.path.expanduser("~")
         if not os.path.isdir(cwd):

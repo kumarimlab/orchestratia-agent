@@ -188,12 +188,7 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
     try:
         resp = await client.post(
             f"{state.hub_url}/api/v1/servers/heartbeat",
-            json={
-                "system_info": get_system_info(),
-                # Phase 2.5: per-agent_type worker-readiness (empty until the
-                # first preflight probe runs). Older hubs ignore this field.
-                "worker_ready": state.worker_ready,
-            },
+            json={"system_info": get_system_info()},
             headers={"X-API-Key": state.api_key},
         )
         resp.raise_for_status()
@@ -201,27 +196,6 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
     except httpx.HTTPError as e:
         log.warning(f"Heartbeat failed: {e}")
         return False
-
-
-def _close_session(state: "DaemonState", session_id: str):
-    """Single source of truth for tearing down a closed session.
-
-    Always unregisters the per-session MCP plane so its loopback URL stops
-    resolving. A leaked instance keeps answering as a now-closed session —
-    e.g. an orchestrator whose spawn/governance tools still post a dead
-    session_id, which the hub then rejects with "not an active orchestrator".
-    Both the live WS loop and the startup recovery scan route through here so
-    the two paths cannot drift apart (the recovery copy previously skipped the
-    MCP teardown, leaking orchestrator planes across session restarts).
-    """
-    session = state.active_sessions.pop(session_id, None)
-    if state.mcp_manager:
-        state.mcp_manager.unregister_session(session_id)
-    if session and getattr(session, "working_directory", None):
-        project_id = getattr(session, "project_id", "") or ""
-        asyncio.create_task(_run_architecture_scan(
-            state, session.working_directory, session_id, project_id, "session_closed",
-        ))
 
 
 async def connect_ws(state: DaemonState):
@@ -578,43 +552,6 @@ def _inject_escape(session: "ManagedSession"):
         session.write_input(b"\x1b")
 
 
-_last_orch_wake: dict[str, float] = {}
-_ORCH_WAKE_DEBOUNCE_S = 8.0
-
-
-def _wake_orchestrator(state: "DaemonState", session_id: str | None, reason: str) -> None:
-    """Wake an idle orchestrator by injecting a turn into its PTY.
-
-    An idle CLI agent does NOT act on MCP resource-list bumps (notify_*_inbox)
-    — those aren't turns — so a pending governance decision or a stuck worker
-    would sit unseen (the orchestrator only notices when it happens to poll).
-    This injects a short directive line + Enter so the orchestrator takes a
-    turn now and reads its inboxes. Debounced: one wake covers all currently
-    pending items, since the orchestrator reads the whole inbox on that turn.
-    """
-    import time
-
-    if not session_id:
-        return
-    session = state.active_sessions.get(session_id)
-    if not session or session.closed:
-        return
-    now = time.monotonic()
-    if now - _last_orch_wake.get(session_id, 0.0) < _ORCH_WAKE_DEBOUNCE_S:
-        return
-    _last_orch_wake[session_id] = now
-    try:
-        _inject_text(
-            session,
-            f"[orchestratia] {reason} — check governance://inbox and "
-            f"notes://inbox and handle the oldest first.",
-            send_enter=True,
-        )
-        log.info(f"woke orchestrator {session_id[:8]}: {reason[:70]}")
-    except Exception:
-        log.exception(f"failed to wake orchestrator {session_id[:8]}")
-
-
 def _inject_task_trigger(state: "DaemonState", session: "ManagedSession", task_id: str):
     """Inject a user prompt into the session to trigger task pickup."""
     message = (
@@ -636,7 +573,16 @@ async def ws_receive_loop(ws, state: DaemonState):
         return sender
 
     def _on_session_close(session_id: str):
-        _close_session(state, session_id)
+        session = state.active_sessions.pop(session_id, None)
+        # Drop the per-session MCP instance so the URL stops resolving.
+        if state.mcp_manager:
+            state.mcp_manager.unregister_session(session_id)
+        # Trigger architecture scan if session had a working directory
+        if session and hasattr(session, 'working_directory') and session.working_directory:
+            project_id = getattr(session, 'project_id', '') or ''
+            asyncio.create_task(_run_architecture_scan(
+                state, session.working_directory, session_id, project_id, "session_closed",
+            ))
 
     sender = _make_ws_sender(state)
 
@@ -660,17 +606,9 @@ async def ws_receive_loop(ws, state: DaemonState):
                 # Orchestrator sessions get the governance MCP toolset +
                 # the orchestrator system prompt written to the workspace.
                 role = msg.get("role") or "worker"
-                # Phase 2.5: orchestrator-spawned workers carry a
-                # launch_command (run the CLI as the session root process,
-                # keystroke-free) and a task_id bound at spawn so
-                # task://current resolves the instant the worker's MCP client
-                # connects — no task_assigned keystroke injection.
-                launch_command = msg.get("launch_command")
-                start_task_id = msg.get("task_id")
                 log.info(
                     f"Hub requests session start: {session_id[:8]} "
-                    f"(agent_type={agent_type or 'auto'}, role={role}"
-                    f"{', launch=' + launch_command if launch_command else ''})"
+                    f"(agent_type={agent_type or 'auto'}, role={role})"
                 )
 
                 try:
@@ -678,75 +616,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                         "ORCHESTRATIA_HUB_URL": state.hub_url,
                         "ORCHESTRATIA_API_KEY": state.api_key,
                         "ORCHESTRATIA_SESSION_ID": session_id,
-                        # Lets the PreToolUse hook reach the loopback
-                        # governance endpoint to route a rule-miss to the
-                        # orchestrator instead of falling back to a prompt.
-                        "ORCHESTRATIA_MCP_PORT": str(state.mcp_port),
-                        # Single source of truth for the session's role
-                        # (hub-stamped; defaults to 'worker'). The PreToolUse
-                        # hook reads it to skip governing the orchestrator
-                        # itself, and the SessionStart hook reads it to inject
-                        # the role-appropriate system prompt. Role thus travels
-                        # with the session's environment — never written to
-                        # disk, never inherited by child sessions via the
-                        # directory tree.
-                        "ORCHESTRATIA_ROLE": role,
                     }
-
-                    # Pre-trust the working dir for Claude Code BEFORE launch:
-                    # a keystroke-free worker can't answer the interactive
-                    # folder-trust dialog, so without this it hangs there
-                    # instead of reading task://current. Must run before spawn
-                    # (the CLI reads trust at startup). No-op for other agents.
-                    try:
-                        from orchestratia_agent.claude_trust import ensure_folder_trusted
-                        ensure_folder_trusted(working_dir, agent_type)
-                    except Exception:
-                        log.exception(
-                            f"claude_trust: pre-trust failed for {session_id[:8]}"
-                        )
-
-                    # cwd-collision fix: give Claude Code an ISOLATED per-session
-                    # MCP config and force it with --strict-mcp-config, so two
-                    # sessions sharing a working dir can't clobber each other's
-                    # cwd .mcp.json. That collision silently handed orchestrators
-                    # a worker's route (worker toolset). Claude-only (the flag is
-                    # Claude-specific); other agents keep cwd-config. Done before
-                    # spawn so the CLI reads it at launch.
-                    if launch_command:
-                        try:
-                            from orchestratia_agent.agent_registry import (
-                                AgentType,
-                                coerce_agent_type,
-                            )
-                            if coerce_agent_type(agent_type) == AgentType.CLAUDE_CODE:
-                                from orchestratia_agent.mcp_server import (
-                                    write_session_mcp_config,
-                                )
-                                _cfg = write_session_mcp_config(
-                                    "127.0.0.1", state.mcp_port, session_id
-                                )
-                                if _cfg:
-                                    launch_command = (
-                                        f"{launch_command} --mcp-config {_cfg} "
-                                        f"--strict-mcp-config"
-                                    )
-                                    log.info(
-                                        f"mcp: per-session config for {session_id[:8]} "
-                                        f"→ {_cfg} (--strict-mcp-config)"
-                                    )
-                        except Exception:
-                            log.exception(
-                                f"mcp: per-session config failed for {session_id[:8]}"
-                            )
 
                     handle = backend.spawn(
                         session_id, working_dir, cols, rows,
                         env_vars=env_vars, project_id=project_id,
-                        launch_command=launch_command,
-                        # Orchestrators launch interactive (no worker bootstrap
-                        # prompt) — they have no task and manage the fleet.
-                        append_bootstrap=(role != "orchestrator"),
                     )
                     if handle:
                         # Compute the resolved working_dir so fs operations
@@ -770,12 +644,10 @@ async def ws_receive_loop(ws, state: DaemonState):
                         # in later. Status is reported back so the dashboard
                         # can show green/amber pips.
                         mcp_status_value: str | None = None
-                        # agent_type "shell" is a plain terminal — no AI agent,
-                        # so no MCP plane (no registration, no config written).
-                        if agent_type != "shell" and state.mcp_manager and state.mcp_enabled:
+                        if state.mcp_manager and state.mcp_enabled:
                             try:
                                 await state.mcp_manager.register_session(
-                                    session_id, task_id=start_task_id, role=role,
+                                    session_id, task_id=None, role=role,
                                 )
                                 from orchestratia_agent.mcp_server import write_mcp_config
                                 mcp_status_value, written_path = write_mcp_config(
@@ -790,14 +662,22 @@ async def ws_receive_loop(ws, state: DaemonState):
                                         f"mcp: {mcp_status_value} {written_path} "
                                         f"(session={session_id[:8]}, agent_type={agent_type or 'auto'}, role={role})"
                                     )
-                                # Role delivery: the orchestrator/worker system
-                                # prompt is injected ephemerally by the
-                                # SessionStart hook (keyed on ORCHESTRATIA_ROLE,
-                                # exported above) — NOT written to disk here.
-                                # Writing a CLAUDE.md into the cwd leaked the
-                                # orchestrator role into every worker under that
-                                # directory and polluted tracked project files;
-                                # see governance_hook.role_system_prompt().
+                                # Phase 2: orchestrator sessions get a
+                                # system-prompt file written to whatever
+                                # location the chosen agent reads (CLAUDE.md,
+                                # GEMINI.md, AGENTS.md, etc.). Idempotent.
+                                if role == "orchestrator" and resolved_cwd:
+                                    try:
+                                        from orchestratia_agent.governance_hook import (
+                                            write_orchestrator_system_prompt,
+                                        )
+                                        write_orchestrator_system_prompt(
+                                            resolved_cwd, agent_type
+                                        )
+                                    except Exception:
+                                        log.exception(
+                                            f"governance: failed to write orchestrator prompt for {session_id[:8]}"
+                                        )
                             except Exception:
                                 log.exception(f"mcp: register/config failed for {session_id[:8]}")
                                 mcp_status_value = "unsupported"
@@ -886,60 +766,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                         session.send_sigwinch()
                         log.info(f"Started reader for recovered session {real_id[:8]}")
 
-                    # Phase 2.5: re-register the MCP plane on recovery. A daemon
-                    # restart reattaches the tmux but otherwise leaves the session
-                    # without its MCP server — task/notes resources, and for an
-                    # orchestrator the whole worker-lifecycle toolset (spawn_worker
-                    # etc.). Rebuild it from the role/agent_type/task the hub sent.
-                    rec_role = msg.get("role") or "worker"
-                    rec_agent_type = msg.get("agent_type")
-                    rec_task_id = msg.get("task_id")
-                    if state.mcp_manager and state.mcp_enabled:
-                        rec_cwd = getattr(session, "working_dir", None) or os.path.expanduser("~")
-                        try:
-                            await state.mcp_manager.register_session(
-                                real_id, task_id=rec_task_id, role=rec_role,
-                            )
-                            from orchestratia_agent.mcp_server import write_mcp_config
-                            mcp_status_value, _ = write_mcp_config(
-                                rec_cwd, "127.0.0.1", state.mcp_port, real_id,
-                                agent_type=rec_agent_type,
-                            )
-                            # Role prompt is re-injected by the SessionStart
-                            # hook on the agent's next launch (keyed on the
-                            # ORCHESTRATIA_ROLE env set at original spawn, which
-                            # persists in the surviving tmux session) — no disk
-                            # write on recovery either.
-                            if mcp_status_value:
-                                asyncio.create_task(_report_mcp_status(state, real_id, mcp_status_value))
-                            log.info(
-                                f"Re-registered MCP for recovered session {real_id[:8]} "
-                                f"(role={rec_role}, agent_type={rec_agent_type or 'auto'})"
-                            )
-                        except Exception:
-                            log.exception(f"mcp: re-register on recovery failed for {real_id[:8]}")
-
             elif msg_type == "session_exit_copy_mode":
                 session_id = msg.get("session_id")
                 session = state.active_sessions.get(session_id)
                 if session and not session.closed:
                     session.exit_copy_mode()
-
-            elif msg_type == "capture_screen":
-                # On-demand live screen capture (orchestrator peek_worker).
-                # Reply with a session_screen message — the hub's existing
-                # handler caches it, which peek then reads. Guarantees a
-                # current screen even for an idle worker whose periodic
-                # (on-change) snapshot has gone stale.
-                session_id = msg.get("session_id")
-                session = state.active_sessions.get(session_id)
-                if session and not session.closed:
-                    lines = session.capture_screen()
-                    await ws_send(state, {
-                        "type": "session_screen",
-                        "session_id": session_id,
-                        "lines": lines or [],
-                    })
 
             elif msg_type == "capture_scrollback":
                 session_id = msg.get("session_id")
@@ -1003,23 +834,6 @@ async def ws_receive_loop(ws, state: DaemonState):
                         # Auto-trigger: inject user message into Claude session
                         _inject_task_trigger(state, session, task_id)
                         log.info(f"Auto-triggered task #{task_id[:8]} in session {target_session_id[:8]}")
-
-            elif msg_type == "task_reassigned":
-                # Phase 2.5 live reassignment — keystroke-free. Update the
-                # worker's MCP task binding and nudge it to re-read
-                # task://current. NEVER inject keystrokes here (that's the
-                # spawn-launch mistake relocated to reassignment).
-                target_session_id = msg.get("session_id")
-                task_id = msg.get("task_id", "")
-                if state.mcp_manager and target_session_id and task_id and state.mcp_enabled:
-                    mcp_sess = state.mcp_manager._sessions.get(target_session_id)
-                    if mcp_sess:
-                        mcp_sess.task_id = task_id
-                    asyncio.create_task(state.mcp_manager.notify_task_changed(target_session_id))
-                    log.info(
-                        f"task_reassigned: session {target_session_id[:8]} -> "
-                        f"task {task_id[:8]} (keystroke-free)"
-                    )
 
             elif msg_type == "task_approved":
                 session_id = msg.get("session_id")
@@ -1427,39 +1241,6 @@ async def ws_receive_loop(ws, state: DaemonState):
                 mgr = getattr(state, "governance_manager", None)
                 if mgr is not None:
                     mgr.handle_orchestrator_request(msg)
-                # WAKE: the MCP inbox bump alone won't make an idle orchestrator
-                # act (it's not a turn), so the decision would sit until the
-                # orchestrator next polls — the 25s race. Inject a turn so it
-                # responds promptly via evaluate_tool_call.
-                # SELF-WAKE GUARD: never wake the orchestrator for its OWN
-                # governed calls. A grandfathered/un-exempt orchestrator routes
-                # its own tool calls (even inbox reads) through governance; waking
-                # itself for those is a feedback loop.
-                _orch_sid = msg.get("orchestrator_session_id")
-                if msg.get("requesting_session_id") != _orch_sid:
-                    _wake_orchestrator(
-                        state,
-                        _orch_sid,
-                        "a worker is waiting on a permission decision",
-                    )
-
-            # Worker-attention: a worker's Notification hook reported it is
-            # parked on a prompt (permission_prompt / elicitation_dialog).
-            # Wake the orchestrator with the actionable directive so it can
-            # peek_worker + send_keys (or escalate) — no MCP resource needed,
-            # the wake line carries everything.
-            elif msg_type == "worker_attention_to_orchestrator":
-                orch_sid = msg.get("orchestrator_session_id")
-                worker_sid = msg.get("worker_session_id") or ""
-                worker_name = msg.get("worker_name") or worker_sid[:8]
-                kind = msg.get("kind") or "input"
-                _wake_orchestrator(
-                    state,
-                    orch_sid,
-                    f"worker '{worker_name}' ({worker_sid[:8]}) is waiting "
-                    f"for {kind} at a prompt; peek_worker it and send_keys to "
-                    f"answer a safe bootstrap prompt, else escalate_to_human",
-                )
 
             elif msg_type == "orchestrator_pointer_changed":
                 # Hub tells us a project's orchestrator pointer changed —
@@ -1507,7 +1288,7 @@ async def report_alive_sessions(state: DaemonState):
         return sender
 
     def _on_session_close(session_id: str):
-        _close_session(state, session_id)
+        state.active_sessions.pop(session_id, None)
 
     sender = _make_ws_sender(state)
 
@@ -1516,14 +1297,10 @@ async def report_alive_sessions(state: DaemonState):
     surviving_ids = backend.discover_surviving_sessions()
     is_pty_host = hasattr(backend, "_connected")  # PtyHostSessionBackend
 
-    # Env vars to inject into recovered sessions (API key may have changed).
-    # ORCHESTRATIA_ROLE is intentionally NOT re-injected here: it's set at
-    # original spawn and persists in the surviving tmux session's environment,
-    # and a reattach can't rewrite an already-running process's env anyway.
+    # Env vars to inject into recovered sessions (API key may have changed)
     recovery_env = {
         "ORCHESTRATIA_HUB_URL": state.hub_url,
         "ORCHESTRATIA_API_KEY": state.api_key,
-        "ORCHESTRATIA_MCP_PORT": str(state.mcp_port),
     }
 
     for sid, s in list(state.active_sessions.items()):

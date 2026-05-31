@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "orchestratia": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp/sessions/dbb9deac-6563-4a30-97c7-c2b5e95c0deb/mcp"
+    }
+  }
+}

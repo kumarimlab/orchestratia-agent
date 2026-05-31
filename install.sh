@@ -136,9 +136,7 @@ pkg_install() {
             return 1
         fi
     else
-        # DPkg::Lock::Timeout: wait for the apt/dpkg lock (held by
-        # unattended-upgrades/cloud-init on fresh boxes) instead of failing.
-        sudo apt-get -o DPkg::Lock::Timeout=300 install -y "$pkg" >/dev/null 2>&1
+        sudo apt-get install -y "$pkg" >/dev/null 2>&1
     fi
 }
 
@@ -896,74 +894,9 @@ step 9 "Setting up AI agent integrations"
 
 HOOK_CONTEXT="$INSTALL_DIR/agent-skills/hooks/orchestratia-context.sh"
 HOOK_PRETOOLUSE="$INSTALL_DIR/agent-skills/hooks/orchestratia-pretooluse.sh"
-HOOK_STATUSLINE="$INSTALL_DIR/agent-skills/hooks/orchestratia-statusline.sh"
-HOOK_NOTIFICATION="$INSTALL_DIR/agent-skills/hooks/orchestratia-notification.sh"
 
 # Make hook scripts executable
 chmod +x "$INSTALL_DIR/agent-skills/hooks/"*.sh 2>/dev/null || true
-
-# ── Helper: register the Orchestratia statusLine command (Claude Code only) ──
-# Idempotent: only sets statusLine when it's unset or already points at an
-# orchestratia hook, so we never clobber a user's own status line.
-merge_statusline() {
-    local SETTINGS_PATH="$1"
-    local STATUSLINE_CMD="$2"
-    sudo -u "$RUN_USER" python3 -c "
-import json, os
-path = '$SETTINGS_PATH'
-settings = {}
-if os.path.exists(path):
-    try:
-        with open(path) as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        settings = {}
-existing = settings.get('statusLine')
-cur_cmd = existing.get('command', '') if isinstance(existing, dict) else ''
-if existing is None or 'orchestratia' in str(cur_cmd):
-    settings['statusLine'] = {'type': 'command', 'command': '$STATUSLINE_CMD', 'padding': 0}
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(settings, f, indent=2)
-        f.write('\n')
-    print('ok')
-else:
-    print('skip')  # user has their own statusLine; leave it alone
-" 2>/dev/null
-}
-
-# ── Helper: register the Orchestratia Notification hook (Claude Code only) ──
-# Matchers scoped to permission_prompt + elicitation_dialog (the parked-on-a-
-# prompt cases). Deliberately NOT idle_prompt (known bug: fires every response).
-# This is how the orchestrator gets woken to peek + answer a stuck worker.
-merge_notification() {
-    local SETTINGS_PATH="$1"
-    local NOTIFICATION_CMD="$2"
-    sudo -u "$RUN_USER" python3 -c "
-import json, os
-path = '$SETTINGS_PATH'
-settings = {}
-if os.path.exists(path):
-    try:
-        with open(path) as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        settings = {}
-hooks = settings.setdefault('hooks', {})
-entries = [e for e in hooks.setdefault('Notification', []) if 'orchestratia' not in str(e)]
-for matcher in ('permission_prompt', 'elicitation_dialog'):
-    entries.append({
-        'matcher': matcher,
-        'hooks': [{'type': 'command', 'command': '$NOTIFICATION_CMD', 'timeout': 5000}],
-    })
-hooks['Notification'] = entries
-os.makedirs(os.path.dirname(path), exist_ok=True)
-with open(path, 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-print('ok')
-" 2>/dev/null
-}
 
 # ── Helper: merge JSON hooks into a settings.json file ──
 merge_json_hooks() {
@@ -1022,12 +955,6 @@ if $CLAUDE_DETECTED; then
         ok "Claude Code hooks configured"
     else
         warn "Could not configure Claude Code hooks"
-    fi
-    if merge_statusline "$CLAUDE_SETTINGS" "$HOOK_STATUSLINE" | grep -q "ok"; then
-        ok "Claude Code statusLine configured"
-    fi
-    if merge_notification "$CLAUDE_SETTINGS" "$HOOK_NOTIFICATION" | grep -q "ok"; then
-        ok "Claude Code Notification hook configured (worker-attention)"
     fi
 fi
 

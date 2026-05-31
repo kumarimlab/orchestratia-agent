@@ -294,19 +294,6 @@ class ManagedSession:
     def write_notification(self, text: str):
         self.backend.write_notification(self.handle, text)
 
-    def capture_screen(self) -> list[str] | None:
-        """One-shot snapshot of the current rendered screen.
-
-        Live capture via the backend (tmux capture-pane on Linux/macOS). Used
-        by the on-demand `capture_screen` request so the orchestrator's
-        peek_worker returns the *current* screen even for an idle/stuck worker
-        whose periodic (on-change) snapshot has gone stale. Falls back to the
-        last snapshot the capture loop produced for non-tmux backends."""
-        lines = self.backend.capture_screen(self.handle)
-        if lines is not None:
-            return lines
-        return getattr(self, "_last_screen", None)
-
     def capture_scrollback(self) -> list[str] | None:
         lines = self.backend.capture_scrollback(self.handle)
         if lines is not None:

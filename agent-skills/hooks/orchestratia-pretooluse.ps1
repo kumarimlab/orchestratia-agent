@@ -82,52 +82,6 @@ for rule in rules:
     reason = f"{'Auto-approved' if action == 'allow' else 'Blocked'} by rule: {matched_rule_name}"
     break
 
-# Rule miss -> route to the orchestrator instead of Claude Code's native
-# prompt (mirrors the POSIX .sh hook). An unattended worker can't answer a
-# native prompt. The worker's own Orchestratia coordination MCP tools
-# (post_note/complete_task/ask_agent/recall/...) are its lifeline -- auto-allow
-# them locally (benign, no shell/FS effect). Everything else is POSTed to the
-# loopback /governance/evaluate, which runs the static deny list and blocks for
-# the orchestrator's evaluate_tool_call verdict. allow/deny are honored;
-# escalate (or any error / unreachable hub) falls back to 'ask' (native prompt).
-agent_name = os.environ.get('ORCHESTRATIA_AGENT_NAME', 'claude')
-if decision == 'ask' and session_id:
-    role = os.environ.get('ORCHESTRATIA_ROLE', 'worker')
-    if tool_name.startswith('mcp__orchestratia__'):
-        decision = 'allow'
-        reason = 'Auto-approved: Orchestratia coordination tool'
-    elif role == 'orchestrator':
-        # The orchestrator is the governor, not the governed: never route its
-        # own calls to /governance/evaluate (that self-loop is the bug we are
-        # fixing). Leave decision='ask' for its human supervisor.
-        reason = 'Orchestrator session: not self-governed'
-    else:
-        try:
-            import urllib.request
-            port = os.environ.get('ORCHESTRATIA_MCP_PORT', '8765')
-            payload = json.dumps({
-                'session_id': session_id,
-                'project_id': project_id,
-                'tool': tool_name,
-                'tool_input': tool_input,
-                'agent_name': agent_name,
-            }).encode()
-            gov_req = urllib.request.Request(
-                'http://127.0.0.1:' + str(port) + '/governance/evaluate',
-                data=payload,
-                headers={'Content-Type': 'application/json'},
-                method='POST',
-            )
-            with urllib.request.urlopen(gov_req, timeout=28) as gov_resp:
-                gov = json.loads(gov_resp.read().decode())
-            gdec = gov.get('decision')
-            if gdec in ('allow', 'deny'):
-                decision = gdec
-                reason = gov.get('reason') or ('Orchestrator governance: ' + gdec)
-            # escalate / unknown -> leave decision='ask' (native prompt fallback)
-        except Exception:
-            pass
-
 # Append log entry
 log_path = os.path.join(tmp_dir, 'orchestratia-permlog.jsonl')
 log_entry = {

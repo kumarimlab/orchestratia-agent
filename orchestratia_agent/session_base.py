@@ -6,17 +6,6 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 
-# Phase 2.5: the fixed bootstrap prompt passed as the agent CLI's first argv
-# argument when a worker is launched as the session's root process. It is a
-# short constant (no ARG_MAX / multiline / quoting risk) — the worker's full
-# task spec flows over MCP via `task://current`, never the command line.
-WORKER_BOOTSTRAP_PROMPT = (
-    "Read your assigned task via the orchestratia `task://current` MCP "
-    "resource and begin. Coordinate through MCP (post_note, ask_agent, "
-    "complete_task); do not wait for terminal input."
-)
-
-
 @dataclass
 class SessionHandle:
     """Opaque handle returned by a SessionBackend after spawning."""
@@ -46,21 +35,8 @@ class SessionBackend(Protocol):
         rows: int,
         env_vars: dict[str, str] | None,
         project_id: str | None,
-        launch_command: str | None = None,
-        append_bootstrap: bool = True,
     ) -> SessionHandle | None:
-        """Spawn a new interactive session. Returns handle or None on failure.
-
-        ``append_bootstrap`` (default True): append the worker bootstrap prompt
-        as a positional arg to ``launch_command``. Set False for orchestrator
-        sessions, which come up interactive with no auto-prompt.
-
-        ``launch_command`` (Phase 2.5): when set, the agent CLI is launched as
-        the session's *root process* (``bash -lc 'exec <launch_command>
-        <bootstrap>'``) instead of a bare login shell — keystroke-free worker
-        spawn. ``None`` keeps the legacy bare-shell behavior for human-started
-        sessions.
-        """
+        """Spawn a new interactive session. Returns handle or None on failure."""
         ...
 
     def reattach(

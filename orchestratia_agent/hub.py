@@ -662,6 +662,17 @@ async def ws_receive_loop(ws, state: DaemonState):
                                         f"mcp: {mcp_status_value} {written_path} "
                                         f"(session={session_id[:8]}, agent_type={agent_type or 'auto'}, role={role})"
                                     )
+                                # Pre-trust the working dir + auto-approve our
+                                # MCP server in ~/.claude.json so Claude Code
+                                # launches keystroke-free — no folder-trust
+                                # dialog and no "New MCP server found" prompt.
+                                try:
+                                    from orchestratia_agent.claude_trust import ensure_folder_trusted
+                                    ensure_folder_trusted(resolved_cwd, agent_type)
+                                except Exception:
+                                    log.exception(
+                                        f"claude_trust: pre-trust failed for {session_id[:8]}"
+                                    )
                                 # Phase 2: orchestrator sessions get a
                                 # system-prompt file written to whatever
                                 # location the chosen agent reads (CLAUDE.md,

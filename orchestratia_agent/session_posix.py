@@ -117,6 +117,13 @@ class PosixSessionBackend:
                         ["tmux", "set-option", "-t", tmux_name, "mouse", "on"],
                         capture_output=True, timeout=2,
                     )
+                    # OSC 52 clipboard passthrough: a mouse-drag selection
+                    # (tmux copy-mode) is copied to the dashboard's system
+                    # clipboard via OSC 52, not just tmux's own paste buffer.
+                    subprocess.run(
+                        ["tmux", "set-option", "-t", tmux_name, "set-clipboard", "on"],
+                        capture_output=True, timeout=2,
+                    )
                     # Disable tmux's right-click context menu (split/select pane etc.)
                     # — it interferes with browser paste in the dashboard terminal
                     subprocess.run(
@@ -168,6 +175,11 @@ class PosixSessionBackend:
                 # Ensure mouse mode is on for reattached sessions
                 subprocess.run(
                     ["tmux", "set-option", "-t", session_name, "mouse", "on"],
+                    capture_output=True, timeout=2,
+                )
+                # OSC 52 clipboard passthrough (see spawn path)
+                subprocess.run(
+                    ["tmux", "set-option", "-t", session_name, "set-clipboard", "on"],
                     capture_output=True, timeout=2,
                 )
                 # Disable tmux's right-click context menu

@@ -164,6 +164,23 @@ class ManagedSession:
                 if self.closed:
                     break
                 try:
+                    # Report alternate-screen (full-screen TUI) state. The dashboard
+                    # can't reliably detect it on a mid-session connect (xterm never
+                    # saw the alt-screen-enter sequence), but tmux can. Drives mobile
+                    # scroll: alt-screen -> PageUp to the app; normal buffer -> scroll
+                    # the dashboard's own scrollback.
+                    alt_fn = getattr(self.backend, "is_alt_screen", None)
+                    if alt_fn is not None:
+                        try:
+                            alt = await loop.run_in_executor(None, alt_fn, self.handle)
+                            await self._ws_send({
+                                "type": "session_mode",
+                                "session_id": self.session_id,
+                                "alt_screen": alt,
+                            })
+                        except Exception:
+                            pass
+
                     lines = await loop.run_in_executor(
                         None, self.backend.capture_screen, self.handle
                     )

@@ -308,6 +308,25 @@ class PosixSessionBackend:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
+    def is_alt_screen(self, handle: SessionHandle) -> bool:
+        """True if the tmux pane is in the alternate screen (full-screen TUI).
+
+        Lets the dashboard pick the right mobile scroll behavior: a full-screen
+        TUI (e.g. newer Claude Code) owns its own scrollback and scrolls on
+        PageUp, while a normal-buffer pane (shell, older inline-rendering Claude
+        Code) keeps its history in the terminal scrollback instead.
+        """
+        if not handle.tmux_name:
+            return False
+        try:
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", handle.tmux_name, "#{alternate_on}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            return result.returncode == 0 and result.stdout.strip() == "1"
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
     def capture_scrollback(self, handle: SessionHandle) -> list[str] | None:
         """Capture full tmux scrollback history (from start to current cursor)."""
         if not handle.tmux_name:

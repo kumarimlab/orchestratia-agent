@@ -238,7 +238,18 @@ class _SessionMCP:
             if not tid:
                 return "error: no task_id (this session has no assigned task — pass task_id explicitly)"
             r = await self._hub_post(f"/api/v1/server/tasks/{tid}/notes", {"content": text})
-            return "ok" if r is not None else "error: hub rejected the note"
+            if r is None:
+                return "error: hub rejected the note"
+            # The hub does not echo an agent's own note back to it, so nothing else
+            # refreshes notes://inbox after a self-post. Bump it here so the agent
+            # sees its own note immediately — otherwise the cached inbox looks stale
+            # and the agent re-posts, creating duplicates.
+            if tid == self.task_id:
+                try:
+                    await self.notify_note_inbox()
+                except Exception:
+                    pass
+            return "ok"
 
         @self.mcp.tool()
         async def complete_task(result: dict[str, Any], ctx: Context = None) -> str:  # type: ignore[assignment]

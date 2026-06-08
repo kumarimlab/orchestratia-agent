@@ -617,6 +617,8 @@ New-Item -ItemType Directory -Force -Path $HookDir | Out-Null
 try {
     Invoke-WebRequest -Uri "$RepoBase/hooks/orchestratia-context.ps1" -OutFile "$HookDir\orchestratia-context.ps1" -UseBasicParsing -TimeoutSec 15
     Invoke-WebRequest -Uri "$RepoBase/hooks/orchestratia-pretooluse.ps1" -OutFile "$HookDir\orchestratia-pretooluse.ps1" -UseBasicParsing -TimeoutSec 15
+    # Shared matcher — the .ps1 hook is a thin wrapper that shells out to this.
+    Invoke-WebRequest -Uri "$RepoBase/hooks/permission_match.py" -OutFile "$HookDir\permission_match.py" -UseBasicParsing -TimeoutSec 15
     Write-Ok "Hook scripts downloaded to $HookDir"
 } catch {
     Write-Warn "Could not download hook scripts: $_"

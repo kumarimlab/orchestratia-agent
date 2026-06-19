@@ -1,19 +1,13 @@
-"""Pre-trust a working directory + pre-approve our MCP server for Claude Code.
+"""Pre-trust a working directory for Claude Code.
 
-Claude Code records two per-folder things in ``~/.claude.json`` under
-``projects[<abs_dir>]``:
+Claude Code records per-folder trust in ``~/.claude.json`` under
+``projects[<abs_dir>].hasTrustDialogAccepted`` — set true so the "Is this a
+project you trust?" dialog never appears, which a daemon-launched
+(keystroke-free) session can't answer.
 
-* ``hasTrustDialogAccepted`` — set true so the "Is this a project you trust?"
-  dialog never appears.
-* ``enabledMcpjsonServers`` — the list of project-scoped (``.mcp.json``) MCP
-  servers the user has approved. Adding ``orchestratia`` here suppresses the
-  "New MCP server found: orchestratia — Use / Use all / Continue without"
-  prompt, which a daemon-launched (keystroke-free) session can't answer.
-
-The daemon writes ``.mcp.json`` into the workspace itself, so pre-approving it
-is the natural companion. Only Claude Code uses this file; other agent types
-are a no-op here. Never raises — a failure must not block a launch (worst case
-the prompt reappears, the prior behavior).
+Only Claude Code uses this file; other agent types are a no-op here. Never
+raises — a failure must not block a launch (worst case the dialog reappears,
+the prior behavior).
 """
 
 from __future__ import annotations
@@ -25,16 +19,13 @@ import tempfile
 
 log = logging.getLogger(__name__)
 
-MCP_SERVER_NAME = "orchestratia"
-
 
 def ensure_folder_trusted(
     working_dir: str | None,
     agent_type: str | None,
     home: str | None = None,
-    mcp_server_name: str = MCP_SERVER_NAME,
 ) -> bool:
-    """Pre-trust ``working_dir`` and pre-approve our MCP server in ``~/.claude.json``.
+    """Pre-trust ``working_dir`` in ``~/.claude.json``.
 
     Returns True if it wrote a change, False otherwise (non-Claude agent,
     missing/invalid dir, unreadable config, or nothing to change). ``home`` is
@@ -75,23 +66,9 @@ def ensure_folder_trusted(
 
         changed = False
 
-        # 1) Folder trust
+        # Folder trust
         if entry.get("hasTrustDialogAccepted") is not True:
             entry["hasTrustDialogAccepted"] = True
-            changed = True
-
-        # 2) Approve our project-scoped MCP server
-        enabled = entry.get("enabledMcpjsonServers")
-        if not isinstance(enabled, list):
-            enabled = []
-        if mcp_server_name not in enabled:
-            enabled.append(mcp_server_name)
-            entry["enabledMcpjsonServers"] = enabled
-            changed = True
-        # ...and make sure it isn't simultaneously disabled
-        disabled = entry.get("disabledMcpjsonServers")
-        if isinstance(disabled, list) and mcp_server_name in disabled:
-            entry["disabledMcpjsonServers"] = [s for s in disabled if s != mcp_server_name]
             changed = True
 
         if not changed:
@@ -114,10 +91,7 @@ def ensure_folder_trusted(
                     os.unlink(tmp)
                 except OSError:
                     pass
-        log.info(
-            "claude_trust: pre-trusted %s + approved MCP '%s' in %s",
-            d, mcp_server_name, cfg_path,
-        )
+        log.info("claude_trust: pre-trusted %s in %s", d, cfg_path)
         return True
     except Exception:
         log.exception("claude_trust: failed to pre-trust working dir")

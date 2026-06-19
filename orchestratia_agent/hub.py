@@ -87,32 +87,6 @@ async def ws_send(state: DaemonState, msg: dict) -> bool:
     return False
 
 
-async def _report_mcp_status(state: DaemonState, session_id: str, status: str) -> None:
-    """PATCH the session's `mcp_status` on the hub. Best-effort.
-
-    Used after `write_mcp_config` so the dashboard can render an MCP-status
-    pip (green for `written`/`merged`, amber for `workspace_readonly`, grey
-    for `skipped`/`unsupported`). Pre-1.5 hubs return 404; we log+continue.
-    """
-    if not state.hub_url or not state.api_key:
-        return
-    url = f"{state.hub_url}/api/v1/server/sessions/{session_id}/mcp-status"
-    try:
-        from orchestratia_agent.tls import httpx_verify
-        async with httpx.AsyncClient(timeout=10, verify=httpx_verify(state=state)) as client:
-            resp = await client.patch(
-                url,
-                headers={"X-API-Key": state.api_key},
-                json={"mcp_status": status},
-            )
-            if resp.status_code == 404:
-                log.debug(f"mcp_status: hub does not yet support PATCH {url} (pre-1.5)")
-            elif resp.status_code >= 400:
-                log.warning(f"mcp_status: hub {resp.status_code} for {session_id[:8]}: {resp.text[:200]}")
-    except Exception:
-        log.debug(f"mcp_status: failed to report for {session_id[:8]}", exc_info=True)
-
-
 async def register_with_hub(
     client: httpx.AsyncClient,
     state: DaemonState,
@@ -574,9 +548,6 @@ async def ws_receive_loop(ws, state: DaemonState):
 
     def _on_session_close(session_id: str):
         session = state.active_sessions.pop(session_id, None)
-        # Drop the per-session MCP instance so the URL stops resolving.
-        if state.mcp_manager:
-            state.mcp_manager.unregister_session(session_id)
         # Trigger architecture scan if session had a working directory
         if session and hasattr(session, 'working_directory') and session.working_directory:
             project_id = getattr(session, 'project_id', '') or ''
@@ -598,13 +569,8 @@ async def ws_receive_loop(ws, state: DaemonState):
                 cols = msg.get("cols", 120)
                 rows = msg.get("rows", 40)
                 project_id = msg.get("project_id")
-                # Hub may supply explicit agent_type; if absent the daemon
-                # falls back to workspace-marker detection inside
-                # write_mcp_config. Cross-agent support per Phase 1.5.
+                # Hub may supply explicit agent_type (used for folder pre-trust).
                 agent_type = msg.get("agent_type")
-                # Phase 2 governance: 'worker' (default) or 'orchestrator'.
-                # Orchestrator sessions get the governance MCP toolset +
-                # the orchestrator system prompt written to the workspace.
                 role = msg.get("role") or "worker"
                 log.info(
                     f"Hub requests session start: {session_id[:8]} "
@@ -637,68 +603,14 @@ async def ws_receive_loop(ws, state: DaemonState):
                         state.active_sessions[session_id] = session
                         await session.start_reader()
 
-                        # Register session with MCP server, write the right
-                        # per-agent config into the workspace so the chosen
-                        # CLI picks up our endpoint on its next launch.
-                        # task_id is unknown at spawn; task_assigned fills it
-                        # in later. Status is reported back so the dashboard
-                        # can show green/amber pips.
-                        mcp_status_value: str | None = None
-                        if state.mcp_manager and state.mcp_enabled:
-                            try:
-                                await state.mcp_manager.register_session(
-                                    session_id, task_id=None, role=role,
-                                )
-                                from orchestratia_agent.mcp_server import write_mcp_config
-                                mcp_status_value, written_path = write_mcp_config(
-                                    resolved_cwd,
-                                    "127.0.0.1",
-                                    state.mcp_port,
-                                    session_id,
-                                    agent_type=agent_type,
-                                )
-                                if written_path:
-                                    log.info(
-                                        f"mcp: {mcp_status_value} {written_path} "
-                                        f"(session={session_id[:8]}, agent_type={agent_type or 'auto'}, role={role})"
-                                    )
-                                # Pre-trust the working dir + auto-approve our
-                                # MCP server in ~/.claude.json so Claude Code
-                                # launches keystroke-free — no folder-trust
-                                # dialog and no "New MCP server found" prompt.
-                                try:
-                                    from orchestratia_agent.claude_trust import ensure_folder_trusted
-                                    ensure_folder_trusted(resolved_cwd, agent_type)
-                                except Exception:
-                                    log.exception(
-                                        f"claude_trust: pre-trust failed for {session_id[:8]}"
-                                    )
-                                # Phase 2: orchestrator sessions get a
-                                # system-prompt file written to whatever
-                                # location the chosen agent reads (CLAUDE.md,
-                                # GEMINI.md, AGENTS.md, etc.). Idempotent.
-                                if role == "orchestrator" and resolved_cwd:
-                                    try:
-                                        from orchestratia_agent.governance_hook import (
-                                            write_orchestrator_system_prompt,
-                                        )
-                                        write_orchestrator_system_prompt(
-                                            resolved_cwd, agent_type
-                                        )
-                                    except Exception:
-                                        log.exception(
-                                            f"governance: failed to write orchestrator prompt for {session_id[:8]}"
-                                        )
-                            except Exception:
-                                log.exception(f"mcp: register/config failed for {session_id[:8]}")
-                                mcp_status_value = "unsupported"
-                        # Best-effort report to the hub so the dashboard
-                        # can show MCP-status pips. The endpoint is added
-                        # in the hub-side Phase 1.5 change; pre-1.5 hubs
-                        # will return 404 and we log+continue.
-                        if mcp_status_value:
-                            asyncio.create_task(
-                                _report_mcp_status(state, session_id, mcp_status_value)
+                        # Pre-trust the working dir so Claude Code launches
+                        # keystroke-free (no folder-trust dialog).
+                        try:
+                            from orchestratia_agent.claude_trust import ensure_folder_trusted
+                            ensure_folder_trusted(resolved_cwd, agent_type)
+                        except Exception:
+                            log.exception(
+                                f"claude_trust: pre-trust failed for {session_id[:8]}"
                             )
 
                         await ws_send(state, {
@@ -811,12 +723,6 @@ async def ws_receive_loop(ws, state: DaemonState):
                 pending_approval = msg.get("pending_approval", False)
                 require_plan = msg.get("require_plan", False)
 
-                # Bind this task to the MCP session so its resources reflect it.
-                if state.mcp_manager and target_session_id and task_id:
-                    mcp_sess = state.mcp_manager._sessions.get(target_session_id)
-                    if mcp_sess:
-                        mcp_sess.task_id = task_id
-
                 session = state.active_sessions.get(target_session_id)
                 if session and not session.closed:
                     if pending_approval:
@@ -888,13 +794,6 @@ async def ws_receive_loop(ws, state: DaemonState):
                 author = msg.get("author", "")
                 task_id = msg.get("task_id", "")
 
-                # MCP push — fires regardless of session liveness in the
-                # daemon's PTY map, because Claude consumes via MCP rather
-                # than via injection. The notification tells Claude to
-                # re-read `notes://inbox` on its next reasoning step.
-                if state.mcp_manager and session_id and state.mcp_enabled:
-                    asyncio.create_task(state.mcp_manager.notify_note_inbox(session_id))
-
                 session = state.active_sessions.get(session_id) if session_id else None
                 if session and not session.closed:
                     if urgent:
@@ -909,12 +808,10 @@ async def ws_receive_loop(ws, state: DaemonState):
                         asyncio.create_task(_urgent_note(session, content, author))
                         log.info(f"Urgent note injected into session {session_id[:8]}")
                     else:
-                        # Non-urgent: MCP push above is now the primary path.
-                        # Keep PTY queue as fallback for older Claude Code
-                        # sessions that don't yet have .mcp.json wired.
+                        # Non-urgent: queue for PTY delivery on next idle flush.
                         pending = state.pending_notes.setdefault(session_id, [])
                         pending.append({"content": content, "author": author})
-                        log.info(f"Non-urgent note queued (mcp+pty) for session {session_id[:8]}")
+                        log.info(f"Non-urgent note queued for session {session_id[:8]}")
 
             # Phase 3a: push-on-mention via the dependency graph. Same MCP
             # delivery semantics as `task_note` but flagged so the agent
@@ -924,10 +821,8 @@ async def ws_receive_loop(ws, state: DaemonState):
                 content = msg.get("content", "")
                 author = msg.get("author", "")
                 mentioned_via = msg.get("mentioned_via", "")
-                if state.mcp_manager and target_session_id and state.mcp_enabled:
-                    asyncio.create_task(state.mcp_manager.notify_note_inbox(target_session_id))
-                # Non-urgent PTY fallback for pre-MCP sessions. Prefix the
-                # body so the receiving agent can tell context apart.
+                # Deliver via the PTY note queue. Prefix the body so the
+                # receiving agent can tell context apart.
                 session = state.active_sessions.get(target_session_id) if target_session_id else None
                 if session and not session.closed:
                     pending = state.pending_notes.setdefault(target_session_id, [])
@@ -950,12 +845,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                 target_session_id = msg.get("target_session_id")
                 question = msg.get("question", "")
                 source = msg.get("source", "")
-                if state.mcp_manager and target_session_id and state.mcp_enabled:
-                    # Surface as a note in the target's inbox — same channel.
-                    # The note content carries enough metadata that the agent
-                    # can decide to respond (or escalate to human).
-                    asyncio.create_task(state.mcp_manager.notify_note_inbox(target_session_id))
-                # PTY fallback: surface the ask inline so non-MCP agents still see it.
+                # Surface the ask inline via the PTY so the agent sees it.
                 session = state.active_sessions.get(target_session_id) if target_session_id else None
                 if session and not session.closed:
                     pending = state.pending_notes.setdefault(target_session_id, [])
@@ -1241,25 +1131,6 @@ async def ws_receive_loop(ws, state: DaemonState):
             elif msg_type == "approval_rules_updated":
                 log.info("Approval rules updated by hub, refreshing cache")
                 asyncio.create_task(_refresh_rules_cache(state))
-
-            # ── Phase 2 governance routing ─────────────────────────
-            elif msg_type == "governance_decision_response_to_worker":
-                mgr = getattr(state, "governance_manager", None)
-                if mgr is not None:
-                    mgr.handle_worker_response(msg)
-
-            elif msg_type == "governance_decision_request_to_orchestrator":
-                mgr = getattr(state, "governance_manager", None)
-                if mgr is not None:
-                    mgr.handle_orchestrator_request(msg)
-
-            elif msg_type == "orchestrator_pointer_changed":
-                # Hub tells us a project's orchestrator pointer changed —
-                # drop the cache so the next decision call refetches.
-                project_id = msg.get("project_id") or ""
-                mgr = getattr(state, "governance_manager", None)
-                if mgr is not None and project_id:
-                    mgr.invalidate_pointer(project_id)
 
             elif msg_type == "scan_architecture":
                 # On-demand scan requested by hub

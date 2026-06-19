@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "orchestratia-agent"
-version = "0.26.0"
+version = "0.27.0"
 description = "Agent daemon and CLI for Orchestratia - AI agent orchestration platform"
 readme = "README.md"
 license = "MIT"
@@ -34,10 +34,7 @@ dependencies = [
     "pyyaml>=6.0",
     "psutil>=6.0",
     "pyte>=0.8.2",
-    # MCP server exposed to local Claude sessions over loopback HTTP/SSE.
-    "mcp>=1.2.0",
-    "uvicorn>=0.30.0",
-    # Phase 1.5 per-agent config writers (ruamel for Aider YAML round-trip,
+    # Per-agent config writers (ruamel for Aider YAML round-trip,
     # tomli_w for Codex TOML; tomllib is stdlib on 3.11+).
     "ruamel.yaml>=0.17.0",
     "tomli_w>=1.0.0",

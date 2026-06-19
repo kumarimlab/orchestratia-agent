@@ -48,16 +48,6 @@ class DaemonState:
     active_sessions: dict[str, ManagedSession] = field(default_factory=dict)
     backend: SessionBackend | None = None
     pending_notes: dict[str, list] = field(default_factory=dict)
-    # MCP server hosted on loopback for local Claude sessions. None until the
-    # daemon starts the bootstrap task in main(). mcp_port/enabled mirror the
-    # config knobs so call-sites don't have to dig through state.config.
-    mcp_manager: object | None = None
-    mcp_port: int = 8765
-    mcp_enabled: bool = True
-    # Phase 2 governance: orchestrates the PreToolUse hook ↔ hub ↔ orchestrator
-    # MCP session round trip. Initialized alongside mcp_manager. None when
-    # MCP is disabled.
-    governance_manager: object | None = None
 
 
 async def main():
@@ -125,12 +115,6 @@ async def main():
         log.error("hub_url not set in config")
         sys.exit(1)
 
-    # MCP server config (loopback Claude-facing plane). Disable with
-    # `mcp_enabled: false` in config to fall back to PTY-only delivery
-    # for compliance/debug, or to free the port.
-    mcp_cfg = state.config.get("mcp", {}) or {}
-    state.mcp_enabled = bool(mcp_cfg.get("enabled", True))
-    state.mcp_port = int(mcp_cfg.get("port", 8765))
 
     # Set up session backend (pty-host on Windows, tmux on Linux)
     state.backend = get_session_backend()
@@ -178,24 +162,9 @@ async def main():
             signal.signal(signal.SIGBREAK, handle_signal)
         else:
             signal.signal(signal.SIGTERM, handle_signal)
-            # SIGHUP rescans every configured repo and rewrites MCP configs.
-            # Useful after the user edits config.yaml (`repos:`) without
-            # wanting a full daemon restart. POSIX-only.
-            def _sighup_rescan(sig, frame):
-                from orchestratia_agent.workspace_scan import scan_and_write
-                log.info("SIGHUP received — rescanning configured repos for MCP configs")
-                try:
-                    scan_and_write(state)
-                except Exception:
-                    log.exception("workspace-scan on SIGHUP failed")
-            if hasattr(signal, "SIGHUP"):
-                signal.signal(signal.SIGHUP, _sighup_rescan)
 
         log.info("Agent daemon running. Heartbeats every 30s, WS auto-reconnect enabled.")
 
-        # Start MCP server (loopback only). Attaching the manager to state
-        # makes it visible to hub.py's session_start handler — that's where
-        # per-session MCPs are registered and .mcp.json is written.
         # ws_send factory — returns a callable bound to whatever ws_connection
         # is currently live. Used by grant_reconcile_loop because the WS can
         # change across reconnects and we don't want a stale sender captured.
@@ -218,26 +187,6 @@ async def main():
             # See _reconcile_grants for the bug class this addresses.
             grant_reconcile_loop(state, _sender_factory),
         ]
-        if state.mcp_enabled:
-            from orchestratia_agent.mcp_server import MCPServerManager
-            from orchestratia_agent.governance_hook import GovernanceManager
-            state.mcp_manager = MCPServerManager(state)
-            # Phase 2: governance routing manager — must exist before any
-            # session registers, so the orchestrator MCP tools can find it.
-            state.governance_manager = GovernanceManager(state)
-            background_tasks.append(state.mcp_manager.serve(host="127.0.0.1", port=state.mcp_port))
-            log.info(f"MCP server enabled on http://127.0.0.1:{state.mcp_port}/mcp/sessions/")
-
-            # Phase 1.5: ensure every configured repo has an MCP config file
-            # pointing at us, even for agents started outside the daemon
-            # (e.g. user-launched `claude` in their own tmux). Idempotent.
-            try:
-                from orchestratia_agent.workspace_scan import scan_and_write
-                scan_and_write(state)
-            except Exception:
-                log.exception("workspace-scan at startup failed (continuing without it)")
-        else:
-            log.info("MCP server disabled by config (mcp.enabled = false)")
 
         try:
             await asyncio.gather(*background_tasks)

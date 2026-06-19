@@ -23,6 +23,18 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("orchestratia-agent")
 
+# ── Output coalescing (see ManagedSession._flush_loop) ──────────────────────
+# The read loop used to emit one base64+JSON `session_output` frame per PTY read.
+# A high-output session (build, log tail, Claude Code spew) then produces a very
+# high frame rate, and since all of a server's sessions share ONE agent→hub
+# WebSocket, the per-frame json.dumps+base64+WS-framing CPU saturates the agent
+# event loop — delaying both output AND input for every session on that server.
+# Instead we batch PTY output into small time windows and send far fewer, larger
+# frames. Interactive echo latency stays ≤ _OUTPUT_COALESCE_S (imperceptible).
+_OUTPUT_COALESCE_S = 0.012            # batch window (12 ms)
+_OUTPUT_MAX_FRAME = 256 * 1024        # max raw bytes per frame; b64 (~341 KB) stays < hub's 1 MB cap
+_OUTPUT_HIGH_WATER = 4 * 1024 * 1024  # pause PTY reads above this → backpressure, bounds memory
+
 
 class VirtualScreen:
     """Virtual terminal emulator using pyte.
@@ -108,9 +120,15 @@ class ManagedSession:
         self.working_dir: str = working_dir or ""
         self.reader_task: asyncio.Task | None = None
         self.capture_task: asyncio.Task | None = None
+        self.flush_task: asyncio.Task | None = None
         self._last_screen: list[str] = []
         self.closed = False
         self._last_output_time: float = 0.0
+        # Output coalescing buffer: the read loop appends here (never blocks on the
+        # WS); _flush_loop drains it in batched frames. See _OUTPUT_* constants.
+        self._out_buf = bytearray()
+        self._out_lock = asyncio.Lock()
+        self._out_event = asyncio.Event()
         # pyte virtual screen for non-tmux platforms (Windows, Linux without tmux)
         self._vscreen = VirtualScreen(cols=handle.cols, rows=handle.rows)
         self._vscreen_lock = asyncio.Lock()
@@ -138,6 +156,9 @@ class ManagedSession:
                 await self.reader_task
             except (asyncio.CancelledError, Exception):
                 pass
+        if self.flush_task and not self.flush_task.done():
+            self.flush_task.cancel()
+        self.flush_task = asyncio.create_task(self._flush_loop())
         self.reader_task = asyncio.create_task(self._read_loop())
         self._start_capture()
 
@@ -229,9 +250,66 @@ class ManagedSession:
         except asyncio.CancelledError:
             pass
 
-    async def _read_loop(self):
-        """Read from the session and relay to the hub as base64.
+    async def _send_output_frame(self, chunk: bytes):
+        """Encode + send one coalesced session_output frame."""
+        await self._ws_send({
+            "type": "session_output",
+            "session_id": self.session_id,
+            "data": base64.b64encode(chunk).decode("ascii"),
+        })
 
+    async def _flush_loop(self):
+        """Drain the output buffer in batched frames.
+
+        Blocks while idle (on _out_event), then accumulates a short window so a
+        burst of PTY reads collapses into one frame. This is what bounds the
+        agent's per-frame CPU under heavy output. Frames are capped at
+        _OUTPUT_MAX_FRAME so a single send never exceeds the hub's size limit.
+        """
+        try:
+            while not self.closed:
+                await self._out_event.wait()
+                # Let more output accumulate so we send fewer, larger frames.
+                await asyncio.sleep(_OUTPUT_COALESCE_S)
+                while True:
+                    async with self._out_lock:
+                        if not self._out_buf:
+                            self._out_event.clear()
+                            break
+                        take = min(len(self._out_buf), _OUTPUT_MAX_FRAME)
+                        chunk = bytes(self._out_buf[:take])
+                        del self._out_buf[:take]
+                        if not self._out_buf:
+                            self._out_event.clear()
+                    # Send outside the lock so the read loop can keep appending.
+                    await self._send_output_frame(chunk)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            if not self.closed:
+                log.error(f"Session {self.session_id[:8]} flush error: {e}")
+
+    async def _final_flush(self):
+        """Send any buffered output that hasn't been flushed yet (on close)."""
+        try:
+            async with self._out_lock:
+                if not self._out_buf:
+                    return
+                pending = bytes(self._out_buf)
+                self._out_buf.clear()
+            for i in range(0, len(pending), _OUTPUT_MAX_FRAME):
+                await self._send_output_frame(pending[i:i + _OUTPUT_MAX_FRAME])
+        except Exception:
+            pass
+
+    async def _read_loop(self):
+        """Read from the session and queue output for the coalescing flusher.
+
+        Appending to the buffer never blocks on the WebSocket, so the PTY is
+        drained promptly (and input handling on the shared WS isn't starved).
+        Backpressure: if the buffer exceeds _OUTPUT_HIGH_WATER (producer
+        outrunning the WS), pause reads until the flusher drains it — this
+        restores the natural backpressure the old per-read `await ws_send` gave.
         Also feeds the pyte virtual screen for non-tmux capture.
         """
         loop = asyncio.get_event_loop()
@@ -246,16 +324,20 @@ class ManagedSession:
                         break
                     if data:
                         self._last_output_time = time.monotonic()
-                        b64 = base64.b64encode(data).decode("ascii")
-                        await self._ws_send({
-                            "type": "session_output",
-                            "session_id": self.session_id,
-                            "data": b64,
-                        })
-                        # Feed pyte virtual screen (non-tmux platforms)
+                        # Feed pyte first (order-preserving) for non-tmux capture.
                         if use_pyte:
                             async with self._vscreen_lock:
                                 self._vscreen.feed(data)
+                        async with self._out_lock:
+                            self._out_buf.extend(data)
+                            over = len(self._out_buf) >= _OUTPUT_HIGH_WATER
+                        self._out_event.set()
+                        # Backpressure: wait for the flusher to drain below the
+                        # high-water mark before reading more (bounds memory).
+                        while over and not self.closed:
+                            await asyncio.sleep(_OUTPUT_COALESCE_S)
+                            async with self._out_lock:
+                                over = len(self._out_buf) >= _OUTPUT_HIGH_WATER
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -267,6 +349,10 @@ class ManagedSession:
             self.closed = True
             if self.capture_task and not self.capture_task.done():
                 self.capture_task.cancel()
+            # Stop the flusher and send any output still buffered before closing.
+            if self.flush_task and not self.flush_task.done():
+                self.flush_task.cancel()
+            await self._final_flush()
             self.backend.close_handle(self.handle)
             await self._ws_send({
                 "type": "session_closed",

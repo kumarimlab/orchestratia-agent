@@ -20,6 +20,7 @@ import websockets
 from orchestratia_agent.config import persist_api_key
 from orchestratia_agent.session import ManagedSession, get_session_backend
 from orchestratia_agent.session_base import SessionBackend
+from orchestratia_agent import privilege
 from orchestratia_agent.system import get_repos_info, get_system_info
 
 if TYPE_CHECKING:
@@ -117,6 +118,9 @@ async def register_with_hub(
             "registration_token": reg_token,
             "machine_id": get_machine_id(),
             "mac_address": get_mac_address(),
+            "capabilities": privilege.merge_capabilities(
+                state.config.get("capabilities"), state.tier_config
+            ),
         }
 
         resp = await client.post(
@@ -162,7 +166,14 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
     try:
         resp = await client.post(
             f"{state.hub_url}/api/v1/servers/heartbeat",
-            json={"system_info": get_system_info()},
+            json={
+                "system_info": get_system_info(),
+                # Re-advertised every beat so `provision-tier` takes effect on
+                # the next heartbeat rather than needing a re-registration.
+                "capabilities": privilege.merge_capabilities(
+                    state.config.get("capabilities"), state.tier_config
+                ),
+            },
             headers={"X-API-Key": state.api_key},
         )
         resp.raise_for_status()

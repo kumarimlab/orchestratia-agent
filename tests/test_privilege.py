@@ -125,6 +125,31 @@ def test_capability_payload_unprovisioned():
     assert payload == {"tiers": ["standard"], "restricted_workspaces": []}
 
 
+def test_capability_merges_into_existing_capabilities():
+    """Advertising privilege must not clobber tags/tools/languages used by
+    the hub's task-matching service."""
+    tc = p.load_tier_config(cfg())
+    existing = {"tags": ["gpu"], "tools": ["claude"]}
+    merged = p.merge_capabilities(existing, tc)
+    assert merged["tags"] == ["gpu"]
+    assert merged["tools"] == ["claude"]
+    assert merged["privilege"]["tiers"] == ["standard", "restricted"]
+
+
+def test_capability_merge_tolerates_none():
+    tc = p.load_tier_config({})
+    merged = p.merge_capabilities(None, tc)
+    assert merged["privilege"]["tiers"] == ["standard"]
+
+
+def test_capability_merge_does_not_mutate_input():
+    """The caller's config dict must not be edited underneath it."""
+    tc = p.load_tier_config(cfg())
+    existing = {"tags": ["gpu"]}
+    p.merge_capabilities(existing, tc)
+    assert "privilege" not in existing
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

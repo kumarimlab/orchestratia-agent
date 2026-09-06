@@ -130,3 +130,15 @@ def capability_payload(tc: TierConfig) -> dict:
         "tiers": available_tiers(tc),
         "restricted_workspaces": list(tc.workspaces),
     }
+
+
+def merge_capabilities(existing: dict | None, tc: TierConfig) -> dict:
+    """Fold the privilege advertisement into the server's capabilities blob.
+
+    capabilities is shared with the hub's task-matching service (tags, tools,
+    languages, max_concurrent_tasks), so this merges rather than replaces.
+    Returns a new dict — the caller's config must not be edited underneath it.
+    """
+    merged = dict(existing or {})
+    merged["privilege"] = capability_payload(tc)
+    return merged

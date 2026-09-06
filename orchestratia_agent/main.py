@@ -48,6 +48,9 @@ class DaemonState:
     active_sessions: dict[str, ManagedSession] = field(default_factory=dict)
     backend: SessionBackend | None = None
     pending_notes: dict[str, list] = field(default_factory=dict)
+    # Which privilege tiers this box can honour. Resolved once from config at
+    # startup so spawn/heartbeat never re-read the file.
+    tier_config: object = None
 
 
 async def main():
@@ -115,6 +118,10 @@ async def main():
         log.error("hub_url not set in config")
         sys.exit(1)
 
+    # Resolve privilege tiers once. A box with no `privilege:` block simply
+    # advertises `standard`, which is what every existing install does.
+    from orchestratia_agent import privilege as _priv
+    state.tier_config = _priv.load_tier_config(state.config)
 
     # Set up session backend (pty-host on Windows, tmux on Linux)
     state.backend = get_session_backend()
@@ -129,6 +136,7 @@ async def main():
     log.info(f"Server name: {state.config.get('server_name', platform.node())}")
     log.info(f"Platform: {platform.system()} {platform.release()}")
     log.info(f"Session backend: {type(state.backend).__name__}")
+    log.info(f"Privilege tiers: {', '.join(_priv.available_tiers(state.tier_config))}")
     if state.backend.supports_persistence():
         backend_name = type(state.backend).__name__
         if "PtyHost" in backend_name:

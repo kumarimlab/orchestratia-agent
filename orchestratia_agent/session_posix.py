@@ -23,6 +23,33 @@ if sys.platform == "win32":
 log = logging.getLogger("orchestratia-agent")
 
 
+def _run_as(handle: SessionHandle) -> str | None:
+    return (handle.extra or {}).get("run_as")
+
+
+def _tmux_argv(run_as: str | None, args: list[str], tmux_path: str = "tmux") -> list[str]:
+    """Build a tmux argv, dropping privilege when the session belongs to another user.
+
+    A tmux server is per-user: its socket lives in /tmp/tmux-<uid>/ and is mode
+    0700. The daemon cannot reach a restricted session's tmux without sudo, so
+    EVERY out-of-band call has to go through here.
+
+    -H rather than -i: -i runs the command through a login shell, which
+    re-parses argv and would corrupt any path or env value containing a space.
+    """
+    if run_as is None:
+        return [tmux_path] + args
+    return ["sudo", "-n", "-u", run_as, "-H", tmux_path] + args
+
+
+def _tmux(handle: SessionHandle, args: list[str], timeout: int = 2, **kw):
+    """Run a tmux command against `handle`'s session, as whoever owns it."""
+    return subprocess.run(
+        _tmux_argv(_run_as(handle), args),
+        capture_output=True, timeout=timeout, **kw,
+    )
+
+
 class PosixSessionBackend:
     """Session backend using fork + pty + optional tmux (Linux and macOS)."""
 
@@ -34,8 +61,30 @@ class PosixSessionBackend:
         rows: int,
         env_vars: dict[str, str] | None,
         project_id: str | None,
+        privilege_tier: str = "standard",
+        tier_config=None,
     ) -> SessionHandle | None:
+        from orchestratia_agent import privilege as _priv
+
+        # Resolve the tier BEFORE forking, so a refusal is a clean "no session"
+        # rather than a half-built one.
+        tc = tier_config or getattr(self, "tier_config", None) or _priv.load_tier_config({})
+        try:
+            run_as = _priv.resolve_user(privilege_tier, tc)
+            cwd = _priv.verify_workspace(privilege_tier, working_dir, tc)
+        except _priv.PrivilegeError as e:
+            # Fail closed. Never downgrade to standard, never fall back to $HOME:
+            # either would be a privilege decision taken by an error branch.
+            log.error(f"Refusing session {session_id[:8]}: {e}")
+            return None
+
         use_tmux = has_tmux()
+        if run_as is not None and not use_tmux:
+            log.error(
+                f"Refusing session {session_id[:8]}: tier {privilege_tier!r} "
+                f"requires tmux, which is not installed"
+            )
+            return None
         tmux_name = f"orc-{session_id[:12]}" if use_tmux else ""
 
         # Platform-aware shell selection
@@ -49,9 +98,13 @@ class PosixSessionBackend:
             if not os.path.isfile(user_shell):
                 user_shell = "/bin/sh"
 
-        # Resolve working directory
-        cwd = working_dir or os.path.expanduser("~")
         if not os.path.isdir(cwd):
+            if run_as is not None:
+                log.error(
+                    f"Refusing session {session_id[:8]}: granted workspace "
+                    f"{cwd} does not exist"
+                )
+                return None
             log.warning(f"Working directory {cwd} doesn't exist, using home")
             cwd = os.path.expanduser("~")
 
@@ -98,7 +151,10 @@ class PosixSessionBackend:
                                 tmux_cmd.extend(["-e", f"{k}={v}"])
                         if project_id:
                             tmux_cmd.extend(["-e", f"ORCHESTRATIA_PROJECT_ID={project_id}"])
-                        os.execvp("tmux", tmux_cmd)
+                        # Drop privilege here, in the child, so the tmux server
+                        # and every process under it belong to the tier's user.
+                        argv = _tmux_argv(run_as, tmux_cmd[1:], tc.tmux_path)
+                        os.execvp(argv[0], argv)
                     else:
                         os.execvp(user_shell, [f"-{os.path.basename(user_shell)}"])
                 except Exception as e:
@@ -108,30 +164,30 @@ class PosixSessionBackend:
                 # Parent process
                 os.close(slave_fd)
                 mode = f"tmux={tmux_name}" if use_tmux else "plain"
-                log.info(f"Spawned PTY session {session_id[:8]}: pid={pid}, cwd={cwd}, mode={mode}")
+                log.info(
+                    f"Spawned PTY session {session_id[:8]}: pid={pid}, cwd={cwd}, "
+                    f"mode={mode}, tier={privilege_tier}, user={run_as or 'daemon'}"
+                )
+
+                handle = SessionHandle(
+                    pid=pid, fd=master_fd, tmux_name=tmux_name,
+                    cols=cols, rows=rows,
+                    extra={"run_as": run_as, "cwd": cwd},
+                )
 
                 # Enable mouse mode so scroll wheel works in dashboards
                 if use_tmux:
                     time.sleep(0.3)  # wait for tmux server to be ready
-                    subprocess.run(
-                        ["tmux", "set-option", "-t", tmux_name, "mouse", "on"],
-                        capture_output=True, timeout=2,
-                    )
+                    _tmux(handle, ["set-option", "-t", tmux_name, "mouse", "on"])
                     # OSC 52 clipboard passthrough: a mouse-drag selection
                     # (tmux copy-mode) is copied to the dashboard's system
                     # clipboard via OSC 52, not just tmux's own paste buffer.
-                    subprocess.run(
-                        ["tmux", "set-option", "-t", tmux_name, "set-clipboard", "on"],
-                        capture_output=True, timeout=2,
-                    )
+                    _tmux(handle, ["set-option", "-t", tmux_name, "set-clipboard", "on"])
                     # Disable tmux's right-click context menu (split/select pane etc.)
                     # — it interferes with browser paste in the dashboard terminal
-                    subprocess.run(
-                        ["tmux", "unbind-key", "-T", "root", "MouseDown3Pane"],
-                        capture_output=True, timeout=2,
-                    )
+                    _tmux(handle, ["unbind-key", "-T", "root", "MouseDown3Pane"])
 
-                return SessionHandle(pid=pid, fd=master_fd, tmux_name=tmux_name, cols=cols, rows=rows)
+                return handle
 
         except Exception as e:
             log.error(f"Failed to spawn PTY session")
@@ -239,10 +295,8 @@ class PosixSessionBackend:
         except (OSError, ProcessLookupError) as e:
             log.warning(f"Resize error (pid={handle.pid}): {e}")
         if handle.tmux_name:
-            subprocess.run(
-                ["tmux", "resize-window", "-t", handle.tmux_name, "-x", str(cols), "-y", str(rows)],
-                capture_output=True, timeout=2,
-            )
+            _tmux(handle, ["resize-window", "-t", handle.tmux_name,
+                           "-x", str(cols), "-y", str(rows)])
 
     def close_graceful(self, handle: SessionHandle) -> None:
         try:
@@ -250,10 +304,7 @@ class PosixSessionBackend:
         except (OSError, ProcessLookupError):
             pass
         if handle.tmux_name:
-            subprocess.run(
-                ["tmux", "kill-session", "-t", handle.tmux_name],
-                capture_output=True, timeout=2,
-            )
+            _tmux(handle, ["kill-session", "-t", handle.tmux_name])
 
     def kill_force(self, handle: SessionHandle) -> None:
         try:
@@ -295,10 +346,8 @@ class PosixSessionBackend:
         if not handle.tmux_name:
             return None
         try:
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", handle.tmux_name, "-p"],
-                capture_output=True, text=True, timeout=3,
-            )
+            result = _tmux(handle, ["capture-pane", "-t", handle.tmux_name, "-p"],
+                           timeout=3, text=True)
             if result.returncode != 0:
                 return None
             lines = result.stdout.split("\n")
@@ -319,10 +368,8 @@ class PosixSessionBackend:
         if not handle.tmux_name:
             return False
         try:
-            result = subprocess.run(
-                ["tmux", "display-message", "-p", "-t", handle.tmux_name, "#{alternate_on}"],
-                capture_output=True, text=True, timeout=3,
-            )
+            result = _tmux(handle, ["display-message", "-p", "-t", handle.tmux_name,
+                                    "#{alternate_on}"], timeout=3, text=True)
             return result.returncode == 0 and result.stdout.strip() == "1"
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
@@ -332,10 +379,8 @@ class PosixSessionBackend:
         if not handle.tmux_name:
             return None
         try:
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", handle.tmux_name, "-p", "-S", "-"],
-                capture_output=True, text=True, timeout=5,
-            )
+            result = _tmux(handle, ["capture-pane", "-t", handle.tmux_name,
+                                    "-p", "-S", "-"], timeout=5, text=True)
             if result.returncode != 0:
                 return None
             lines = result.stdout.split("\n")
@@ -350,10 +395,7 @@ class PosixSessionBackend:
         if not handle.tmux_name:
             return
         try:
-            subprocess.run(
-                ["tmux", "send-keys", "-X", "cancel", "-t", handle.tmux_name],
-                capture_output=True, timeout=2,
-            )
+            _tmux(handle, ["send-keys", "-X", "cancel", "-t", handle.tmux_name])
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 

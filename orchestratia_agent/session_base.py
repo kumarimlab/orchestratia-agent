@@ -16,6 +16,12 @@ class SessionHandle:
     cols: int = 120               # terminal width for pyte virtual screen
     rows: int = 40                # terminal height for pyte virtual screen
     extra: dict = field(default_factory=dict)
+    # extra["run_as"]: the OS user this session's tmux belongs to, or None for
+    # the daemon's own user. Every out-of-band tmux call must honour it — a
+    # tmux server is per-user and its socket is unreachable across the boundary
+    # without sudo, so a missed call breaks silently for restricted sessions
+    # only.
+    # extra["cwd"]:    the authorised working directory, as resolved at spawn.
 
 
 @runtime_checkable
@@ -35,8 +41,14 @@ class SessionBackend(Protocol):
         rows: int,
         env_vars: dict[str, str] | None,
         project_id: str | None,
+        privilege_tier: str = "standard",
+        tier_config: object = None,
     ) -> SessionHandle | None:
-        """Spawn a new interactive session. Returns handle or None on failure."""
+        """Spawn a new interactive session. Returns handle or None on failure.
+
+        privilege_tier selects the OS user; a tier that cannot be honoured is a
+        failure (None), never a silent downgrade to the daemon's own user.
+        """
         ...
 
     def reattach(

@@ -51,7 +51,18 @@ class WindowsSessionBackend:
         rows: int,
         env_vars: dict[str, str] | None,
         project_id: str | None,
+        privilege_tier: str = "standard",
+        tier_config=None,
     ) -> SessionHandle | None:
+        if privilege_tier != "standard":
+            # No sudo/setuid equivalent here, so there is nothing to enforce
+            # with. Refuse rather than accept and run unconfined — a tier that
+            # silently does nothing is worse than one that is unavailable.
+            log.error(
+                f"Refusing session {session_id[:8]}: privilege tier "
+                f"{privilege_tier!r} is not supported on this platform"
+            )
+            return None
         shell = _detect_shell()
 
         cwd = working_dir or os.path.expanduser("~")

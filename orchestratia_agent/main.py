@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import logging
 import os
 import platform
@@ -63,7 +64,25 @@ async def main():
             "  orchestratia-agent                         Start daemon (uses default config)\n"
             "  orchestratia-agent --config /path/to.yaml  Start with custom config\n"
             "  orchestratia-agent --debug                 Start with debug logging\n"
+            "  sudo orchestratia-agent provision-tier \\\n"
+            "       --workspace /srv/acme                 Provision the restricted tier\n"
         ),
+    )
+    parser.add_argument(
+        "provision_tier", nargs="?", choices=["provision-tier"], default=None,
+        help="Provision the restricted privilege tier on this box (needs root)",
+    )
+    parser.add_argument(
+        "--user", default="orc-agent", metavar="NAME",
+        help="Restricted OS user to create (default: orc-agent)",
+    )
+    parser.add_argument(
+        "--workspace", action="append", default=[], metavar="DIR",
+        help="Directory the restricted tier may work in (repeatable)",
+    )
+    parser.add_argument(
+        "--daemon-user", default=None, metavar="NAME",
+        help="User the daemon runs as (default: $SUDO_USER, else current user)",
     )
     parser.add_argument(
         "--config",
@@ -81,6 +100,16 @@ async def main():
 
     state = DaemonState()
     state.config_path = args.config
+
+    if args.provision_tier == "provision-tier":
+        from orchestratia_agent.provision import provision, ProvisionError
+        daemon_user = (args.daemon_user or os.environ.get("SUDO_USER")
+                       or getpass.getuser())
+        try:
+            sys.exit(provision(args.user, args.workspace, daemon_user, args.config))
+        except ProvisionError as e:
+            log.error(f"provision-tier: {e}")
+            sys.exit(1)
 
     if args.register:
         state.config = ensure_config_for_register(state.config_path, args.register)

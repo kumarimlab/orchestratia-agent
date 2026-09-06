@@ -125,6 +125,9 @@ async def main():
 
     # Set up session backend (pty-host on Windows, tmux on Linux)
     state.backend = get_session_backend()
+    # The backend needs the tier config for orphan discovery, which runs before
+    # any session_start message arrives and so cannot be handed one per-call.
+    state.backend.tier_config = state.tier_config
     if hasattr(state.backend, "connect"):
         if not await state.backend.connect():
             log.warning("pty-host connect failed, falling back to direct ConPTY")

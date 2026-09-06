@@ -204,7 +204,13 @@ class PosixSessionBackend:
         cols: int,
         rows: int,
         env_vars: dict[str, str] | None = None,
+        run_as: str | None = None,
     ) -> SessionHandle | None:
+        # A recovered restricted session must come back RESTRICTED. Resolving
+        # the owner here (rather than trusting a caller) means recovery cannot
+        # silently promote a session to the daemon's privilege.
+        if run_as is None:
+            run_as = self.owner_of(session_name)
         try:
             master_fd, slave_fd = pty.openpty()
             fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -220,29 +226,30 @@ class PosixSessionBackend:
                     os.close(master_fd)
                     os.close(slave_fd)
                     os.environ["TERM"] = "xterm-256color"
-                    os.execvp("tmux", ["tmux", "attach-session", "-t", session_name])
+                    argv = _tmux_argv(run_as, ["attach-session", "-t", session_name],
+                                      self._tier_config().tmux_path)
+                    os.execvp(argv[0], argv)
                 except Exception as e:
                     os.write(2, f"Failed to attach tmux: {e}\n".encode())
                     os._exit(1)
             else:
                 os.close(slave_fd)
-                log.info(f"Reattached to tmux session {session_name}: pid={pid}")
+                log.info(
+                    f"Reattached to tmux session {session_name}: pid={pid}, "
+                    f"user={run_as or 'daemon'}"
+                )
+
+                handle = SessionHandle(
+                    pid=pid, fd=master_fd, tmux_name=session_name,
+                    cols=cols, rows=rows, extra={"run_as": run_as},
+                )
 
                 # Ensure mouse mode is on for reattached sessions
-                subprocess.run(
-                    ["tmux", "set-option", "-t", session_name, "mouse", "on"],
-                    capture_output=True, timeout=2,
-                )
+                _tmux(handle, ["set-option", "-t", session_name, "mouse", "on"])
                 # OSC 52 clipboard passthrough (see spawn path)
-                subprocess.run(
-                    ["tmux", "set-option", "-t", session_name, "set-clipboard", "on"],
-                    capture_output=True, timeout=2,
-                )
+                _tmux(handle, ["set-option", "-t", session_name, "set-clipboard", "on"])
                 # Disable tmux's right-click context menu
-                subprocess.run(
-                    ["tmux", "unbind-key", "-T", "root", "MouseDown3Pane"],
-                    capture_output=True, timeout=2,
-                )
+                _tmux(handle, ["unbind-key", "-T", "root", "MouseDown3Pane"])
 
                 # Update env vars in recovered session (API key may have
                 # changed after re-registration / reinstall).
@@ -251,12 +258,9 @@ class PosixSessionBackend:
                 # so stale env vars in the running shell are harmless.
                 if env_vars:
                     for k, v in env_vars.items():
-                        subprocess.run(
-                            ["tmux", "setenv", "-t", session_name, k, v],
-                            capture_output=True, timeout=2,
-                        )
+                        _tmux(handle, ["setenv", "-t", session_name, k, v])
 
-                return SessionHandle(pid=pid, fd=master_fd, tmux_name=session_name, cols=cols, rows=rows)
+                return handle
         except Exception as e:
             log.error(f"Failed to reattach tmux session {session_name}: {e}")
             return None
@@ -336,8 +340,34 @@ class PosixSessionBackend:
         except OSError:
             pass
 
+    def _tier_config(self):
+        from orchestratia_agent import privilege as _priv
+        return getattr(self, "tier_config", None) or _priv.load_tier_config({})
+
     def discover_surviving_sessions(self) -> list[str]:
-        return discover_tmux_sessions()
+        """Find orphaned tmux sessions across every user we may have spawned as.
+
+        Restricted sessions live on a DIFFERENT tmux server. Scanning only our
+        own would silently abandon them on every daemon restart: the hub is
+        told they died while the tmux keeps running unsupervised.
+        """
+        names = list(discover_tmux_sessions())
+        tc = self._tier_config()
+        if tc.restricted_user:
+            for n in discover_tmux_sessions(run_as=tc.restricted_user):
+                if n not in names:
+                    names.append(n)
+        return names
+
+    def owner_of(self, session_name: str) -> str | None:
+        """Which user's tmux server holds this session; None for the daemon's own."""
+        if session_name in discover_tmux_sessions():
+            return None
+        tc = self._tier_config()
+        if tc.restricted_user and session_name in discover_tmux_sessions(
+                run_as=tc.restricted_user):
+            return tc.restricted_user
+        return None
 
     def supports_persistence(self) -> bool:
         return has_tmux()

@@ -52,17 +52,6 @@ def _session_tmux(session, args: list[str], timeout: int = 5):
     return subprocess.run(argv, capture_output=True, timeout=timeout)
 
 
-def _pane_cwd_argv(session, tmux_name: str) -> list[str]:
-    """argv for reading a session's pane cwd, honouring its owning user."""
-    extra = (getattr(getattr(session, "handle", None), "extra", None) or {})
-    run_as = extra.get("run_as")
-    args = ["display-message", "-p", "-t", tmux_name, "#{pane_current_path}"]
-    if run_as is None:
-        return ["tmux"] + args
-    return ["sudo", "-n", "-u", run_as, "-H",
-            extra.get("tmux_path") or "tmux"] + args
-
-
 def _priv_user_for(state, tier: str) -> str | None:
     """OS user for a tier, or None. Never raises into the spawn path."""
     try:
@@ -1706,7 +1695,7 @@ async def ws_connection_loop(state: DaemonState):
         backoff = min(backoff * 2, 30)
 
 
-def _tmux_pane_cwd(tmux_name: str) -> str:
+def _tmux_pane_cwd(tmux_name: str, run_as: str | None = None) -> str:
     """Query tmux for the active pane's current working directory.
 
     Recovered sessions don't carry their original spawn-time cwd through
@@ -1717,8 +1706,13 @@ def _tmux_pane_cwd(tmux_name: str) -> str:
     if not tmux_name:
         return ""
     try:
+        argv = ["tmux", "display-message", "-p", "-t", tmux_name,
+                "#{pane_current_path}"]
+        if run_as is not None:
+            # A restricted session's tmux lives on a different per-user socket.
+            argv = ["sudo", "-n", "-u", run_as, "-H"] + argv
         result = subprocess.run(
-            _pane_cwd_argv(session, tmux_name),
+            argv,
             capture_output=True,
             text=True,
             timeout=2,

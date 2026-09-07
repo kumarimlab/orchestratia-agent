@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from orchestratia_agent import __version__
+from orchestratia_agent import privilege as _priv
 from orchestratia_agent.config import (
     default_config_path,
     ensure_config_for_register,
@@ -113,6 +114,7 @@ async def main():
 
     if args.register:
         state.config = ensure_config_for_register(state.config_path, args.register)
+        state.tier_config = _priv.load_tier_config(state.config)
         state.hub_url = state.config.get("hub_url", "").rstrip("/")
         if not state.hub_url:
             log.error("hub_url not set in config")
@@ -142,15 +144,11 @@ async def main():
         sys.exit(1)
 
     state.hub_url = state.config.get("hub_url", "").rstrip("/")
+    state.tier_config = _priv.load_tier_config(state.config)
 
     if not state.hub_url:
         log.error("hub_url not set in config")
         sys.exit(1)
-
-    # Resolve privilege tiers once. A box with no `privilege:` block simply
-    # advertises `standard`, which is what every existing install does.
-    from orchestratia_agent import privilege as _priv
-    state.tier_config = _priv.load_tier_config(state.config)
 
     # Set up session backend (pty-host on Windows, tmux on Linux)
     state.backend = get_session_backend()

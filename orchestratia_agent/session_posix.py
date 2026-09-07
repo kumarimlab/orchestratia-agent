@@ -27,19 +27,23 @@ def _run_as(handle: SessionHandle) -> str | None:
     return (handle.extra or {}).get("run_as")
 
 
-def _tmux_argv(run_as: str | None, args: list[str], tmux_path: str = "tmux") -> list[str]:
+def _tmux_argv(run_as: str | None, args: list[str], tmux_path: str | None = None) -> list[str]:
     """Build a tmux argv, dropping privilege when the session belongs to another user.
 
     A tmux server is per-user: its socket lives in /tmp/tmux-<uid>/ and is mode
     0700. The daemon cannot reach a restricted session's tmux without sudo, so
     EVERY out-of-band call has to go through here.
 
+    For the daemon's own user this keeps PATH semantics ("tmux"), matching
+    has_tmux()'s PATH probe — an absolute default broke every Homebrew macOS
+    install, where tmux is not in /usr/bin.
+
     -H rather than -i: -i runs the command through a login shell, which
     re-parses argv and would corrupt any path or env value containing a space.
     """
     if run_as is None:
-        return [tmux_path] + args
-    return ["sudo", "-n", "-u", run_as, "-H", tmux_path] + args
+        return ["tmux"] + args
+    return ["sudo", "-n", "-u", run_as, "-H", tmux_path or "tmux"] + args
 
 
 def _tmux(handle: SessionHandle, args: list[str], timeout: int = 2, **kw):

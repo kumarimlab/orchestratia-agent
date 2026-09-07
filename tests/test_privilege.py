@@ -150,6 +150,30 @@ def test_capability_merge_does_not_mutate_input():
     assert "privilege" not in existing
 
 
+def test_default_tmux_path_is_resolved_not_hardcoded():
+    """REGRESSION: a hardcoded /usr/bin/tmux broke every Homebrew macOS install
+    — macOS ships no tmux there, so the daemon exec'd a nonexistent binary while
+    still reporting a successful spawn."""
+    import shutil
+    expected = shutil.which("tmux") or "/usr/bin/tmux"
+    assert p.DEFAULT_TMUX_PATH == expected, p.DEFAULT_TMUX_PATH
+
+
+def test_standard_tier_execs_via_PATH():
+    """REGRESSION: standard sessions must keep PATH semantics, matching
+    has_tmux()'s PATH probe. Only the sudo form needs an absolute path."""
+    tc = p.load_tier_config(cfg())
+    argv = p.tmux_exec_argv(None, ["ls"], tc)
+    assert argv[0] == "tmux", argv
+
+
+def test_restricted_tier_execs_absolute_under_sudo():
+    tc = p.load_tier_config(cfg())
+    argv = p.tmux_exec_argv("orc-agent", ["ls"], tc)
+    assert argv[:5] == ["sudo", "-n", "-u", "orc-agent", "-H"], argv
+    assert argv[5].startswith("/"), "sudo needs an absolute path to match sudoers"
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

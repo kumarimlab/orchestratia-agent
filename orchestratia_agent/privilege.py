@@ -21,7 +21,18 @@ TIER_STANDARD = "standard"
 TIER_RESTRICTED = "restricted"
 VALID_TIERS = (TIER_STANDARD, TIER_RESTRICTED)
 
-DEFAULT_TMUX_PATH = "/usr/bin/tmux"
+def _default_tmux_path() -> str:
+    """Where tmux actually is on THIS box.
+
+    Never hardcode /usr/bin/tmux: macOS ships none there and Homebrew installs
+    to /opt/homebrew/bin. Hardcoding it made the daemon exec a nonexistent
+    binary while still reporting a successful spawn.
+    """
+    import shutil
+    return shutil.which("tmux") or "/usr/bin/tmux"
+
+
+DEFAULT_TMUX_PATH = _default_tmux_path()
 
 
 class PrivilegeError(Exception):
@@ -118,6 +129,18 @@ def sudo_prefix(user: str | None, tc: TierConfig) -> list[str]:
     if user is None:
         return []
     return ["sudo", "-n", "-u", user, "-H"]
+
+
+def tmux_exec_argv(user: str | None, args: list[str], tc: TierConfig) -> list[str]:
+    """Full argv to run tmux, dropping privilege when `user` is set.
+
+    For the daemon's own user this deliberately keeps PATH semantics ("tmux"),
+    matching has_tmux()'s PATH probe. Only the sudo form needs an absolute
+    path, because sudo requires one to match its sudoers rule.
+    """
+    if user is None:
+        return ["tmux"] + args
+    return sudo_prefix(user, tc) + [tc.tmux_path] + args
 
 
 def capability_payload(tc: TierConfig) -> dict:

@@ -29,6 +29,18 @@ if TYPE_CHECKING:
 log = logging.getLogger("orchestratia-agent")
 
 
+def _tier_config(state):
+    """Tier config, resolving lazily if startup has not set it yet.
+
+    register_with_hub runs on a code path that returns before normal startup,
+    so this must never assume the daemon reached its main loop.
+    """
+    tc = getattr(state, "tier_config", None)
+    if tc is None:
+        tc = privilege.load_tier_config(getattr(state, "config", {}) or {})
+    return tc
+
+
 def get_machine_id() -> str:
     """Get a stable OS-level machine identifier.
 
@@ -119,7 +131,7 @@ async def register_with_hub(
             "machine_id": get_machine_id(),
             "mac_address": get_mac_address(),
             "capabilities": privilege.merge_capabilities(
-                state.config.get("capabilities"), state.tier_config
+                state.config.get("capabilities"), _tier_config(state)
             ),
         }
 
@@ -171,7 +183,7 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
                 # Re-advertised every beat so `provision-tier` takes effect on
                 # the next heartbeat rather than needing a re-registration.
                 "capabilities": privilege.merge_capabilities(
-                    state.config.get("capabilities"), state.tier_config
+                    state.config.get("capabilities"), _tier_config(state)
                 ),
             },
             headers={"X-API-Key": state.api_key},

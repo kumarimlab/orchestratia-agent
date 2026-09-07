@@ -1138,7 +1138,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                 request_id = msg.get("request_id")
                 command = msg.get("command", "")
                 if request_id and command:
-                    asyncio.create_task(_handle_remote_exec(sender, request_id, command))
+                    asyncio.create_task(_handle_remote_exec(
+                        sender, request_id, command,
+                        msg.get("privilege_tier") or "standard",
+                        _tier_config(state),
+                    ))
 
             elif msg_type in ("fs_list_dir", "fs_read_file", "fs_write_file", "fs_stat"):
                 # Editor side-panel filesystem ops. All scoped to the
@@ -1796,14 +1800,44 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
     await sender(response)
 
 
-async def _handle_remote_exec(sender, request_id: str, command: str):
-    """Execute a command locally and return the result via WS."""
+async def _handle_remote_exec(sender, request_id: str, command: str,
+                              privilege_tier: str = "standard",
+                              tier_config=None):
+    """Execute a command and return the result via WS.
+
+    Runs at the TARGET SESSION'S tier. Previously every remote_exec ran as the
+    daemon user regardless of which session it belonged to, so a confined
+    session could obtain an unconfined shell through the hub — the kernel
+    enforcement held right up until this one call.
+    """
+    from orchestratia_agent import privilege as _priv
+
+    tc = tier_config or _priv.load_tier_config({})
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        run_as = _priv.resolve_user(privilege_tier, tc)
+    except _priv.PrivilegeError as e:
+        await sender({
+            "type": "remote_exec_result", "request_id": request_id,
+            "exit_code": 126, "stdout": "", "stderr": str(e),
+        })
+        return
+
+    try:
+        if run_as is None:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            # No shell in the DAEMON's context. Hand the command string to a
+            # shell running as the restricted user instead, so the confinement
+            # covers this path too.
+            proc = await asyncio.create_subprocess_exec(
+                *_priv.sudo_prefix(run_as, tc), "/bin/sh", "-c", command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         await sender({
             "type": "remote_exec_result",

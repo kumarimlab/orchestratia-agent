@@ -76,6 +76,25 @@ try:
 except Exception:
     pass
 
+# LAST, so it beats config.yaml. A restricted session cannot normally read
+# config.yaml (different OS user), but if it ever could, silently preferring the
+# SERVER key over this session's scoped one would be an escalation — the caller
+# would hold fleet authority while believing it was confined. Presence of this
+# file means "you are a confined session; use your own credential".
+#
+# Only the PATH is in the environment. Secrets never go in argv or env:
+# /proc/<pid>/cmdline is world-readable, and a tmux server outlives the session
+# it was started for.
+_KEY_FILE = os.environ.get("ORCHESTRATIA_KEY_FILE", "")
+if _KEY_FILE:
+    try:
+        with open(_KEY_FILE) as _fh:
+            _file_key = _fh.read().strip()
+        if _file_key:
+            API_KEY = _file_key
+    except OSError:
+        pass
+
 # JSON output mode (set in main() before command dispatch)
 JSON_MODE = False
 

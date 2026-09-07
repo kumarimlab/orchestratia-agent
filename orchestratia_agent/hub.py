@@ -20,7 +20,7 @@ import websockets
 from orchestratia_agent.config import persist_api_key
 from orchestratia_agent.session import ManagedSession, get_session_backend
 from orchestratia_agent.session_base import SessionBackend
-from orchestratia_agent import privilege
+from orchestratia_agent import privilege, session_env
 from orchestratia_agent.system import get_repos_info, get_system_info
 
 if TYPE_CHECKING:
@@ -61,6 +61,14 @@ def _pane_cwd_argv(session, tmux_name: str) -> list[str]:
         return ["tmux"] + args
     return ["sudo", "-n", "-u", run_as, "-H",
             extra.get("tmux_path") or "tmux"] + args
+
+
+def _priv_user_for(state, tier: str) -> str | None:
+    """OS user for a tier, or None. Never raises into the spawn path."""
+    try:
+        return privilege.resolve_user(tier, _tier_config(state))
+    except Exception:
+        return None
 
 
 def _tier_config(state):
@@ -608,6 +616,8 @@ async def ws_receive_loop(ws, state: DaemonState):
 
     def _on_session_close(session_id: str):
         session = state.active_sessions.pop(session_id, None)
+        # A secret must not outlive the session it was issued for.
+        session_env.clear_session_key(getattr(session, "key_file", None))
         # Trigger architecture scan if session had a working directory
         if session and hasattr(session, 'working_directory') and session.working_directory:
             project_id = getattr(session, 'project_id', '') or ''
@@ -640,15 +650,44 @@ async def ws_receive_loop(ws, state: DaemonState):
                 )
 
                 try:
-                    # A restricted session gets a credential scoped to ITSELF.
-                    # Handing it the server key would let it call back into the
-                    # hub with fleet authority and obtain execution outside its
-                    # tier — the confinement would end at the first HTTP call.
+                    # NO SECRET GOES IN HERE. env_vars becomes `tmux
+                    # new-session -e K=V`, i.e. argv, and /proc/<pid>/cmdline is
+                    # world-readable with no hidepid — and a tmux server
+                    # outlives the session it was started for, so anything put
+                    # here leaks for the life of the server. A production API
+                    # key sat readable by every local account for 14 weeks
+                    # exactly this way.
+                    #
+                    # standard   -> nothing to deliver: the session runs as the
+                    #               daemon's user and the CLI reads config.yaml
+                    #               (0600, same owner) itself.
+                    # restricted -> runs as a different user that cannot read
+                    #               config.yaml, so its scoped token goes to a
+                    #               0600 file ACL'd to that user, and only the
+                    #               PATH travels in argv.
                     env_vars = {
                         "ORCHESTRATIA_HUB_URL": state.hub_url,
-                        "ORCHESTRATIA_API_KEY": msg.get("session_token") or state.api_key,
                         "ORCHESTRATIA_SESSION_ID": session_id,
                     }
+                    key_file = None
+                    session_token = msg.get("session_token")
+                    if session_token and privilege_tier == "restricted":
+                        run_as = _priv_user_for(state, privilege_tier)
+                        key_file = session_env.write_session_key(
+                            session_id, session_token, run_as or "")
+                        if key_file:
+                            env_vars[session_env.ENV_VAR] = key_file
+                        else:
+                            log.error(
+                                f"Refusing session {session_id[:8]}: could not "
+                                f"deliver its scoped key without putting it in argv"
+                            )
+                            await ws_send(state, {
+                                "type": "session_error",
+                                "session_id": session_id,
+                                "error": "could not deliver session credential securely",
+                            })
+                            continue
 
                     handle = backend.spawn(
                         session_id, working_dir, cols, rows,
@@ -673,6 +712,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                             on_close=_on_session_close,
                             working_dir=resolved_cwd,
                         )
+                        session.key_file = key_file
                         state.active_sessions[session_id] = session
                         await session.start_reader()
 
@@ -1260,10 +1300,13 @@ async def report_alive_sessions(state: DaemonState):
     surviving_ids = backend.discover_surviving_sessions()
     is_pty_host = hasattr(backend, "_connected")  # PtyHostSessionBackend
 
-    # Env vars to inject into recovered sessions (API key may have changed)
+    # Injected into recovered sessions. NO SECRET: `tmux setenv K V` puts the
+    # value in that command's argv, and `tmux show-environment` then hands it to
+    # anything that can reach the same tmux server. The API key used to be here
+    # "in case it changed" — but the CLI reads config.yaml and lets it win over
+    # the environment precisely so a rotated key is picked up without this.
     recovery_env = {
         "ORCHESTRATIA_HUB_URL": state.hub_url,
-        "ORCHESTRATIA_API_KEY": state.api_key,
     }
 
     for sid, s in list(state.active_sessions.items()):

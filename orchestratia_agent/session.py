@@ -114,6 +114,9 @@ class ManagedSession:
         self.backend = backend
         self._ws_send = ws_send
         self._on_close = on_close
+        # Path to this session's 0600 key file (restricted tier only), removed
+        # when the session ends so a secret does not outlive its use.
+        self.key_file: str | None = None
         # Filesystem root for this session. Used by fs_handler to sandbox
         # editor read/write operations. Falls back to home dir on recovery
         # when the original cwd wasn't preserved through the daemon restart.

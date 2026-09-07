@@ -640,9 +640,13 @@ async def ws_receive_loop(ws, state: DaemonState):
                 )
 
                 try:
+                    # A restricted session gets a credential scoped to ITSELF.
+                    # Handing it the server key would let it call back into the
+                    # hub with fleet authority and obtain execution outside its
+                    # tier — the confinement would end at the first HTTP call.
                     env_vars = {
                         "ORCHESTRATIA_HUB_URL": state.hub_url,
-                        "ORCHESTRATIA_API_KEY": state.api_key,
+                        "ORCHESTRATIA_API_KEY": msg.get("session_token") or state.api_key,
                         "ORCHESTRATIA_SESSION_ID": session_id,
                     }
 

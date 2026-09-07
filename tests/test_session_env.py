@@ -66,7 +66,7 @@ def test_directory_is_not_listable():
     """0711: reachable by path, not enumerable. Filenames are random anyway,
     but defence in depth costs nothing here."""
     se._ensure_dir()
-    mode = os.stat(se.SECRET_DIR).st_mode & 0o777
+    mode = os.stat(se._ensure_dir()).st_mode & 0o777
     assert mode == 0o711, oct(mode)
 
 

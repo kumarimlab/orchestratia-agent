@@ -24,22 +24,35 @@ import logging
 import os
 import secrets
 import subprocess
+import tempfile
 
 log = logging.getLogger("orchestratia-agent")
-
-# tmpfs-backed and cleared on reboot, which is right for short-lived secrets.
-# 0711: traversable so the target user can reach a known path, not listable so
-# filenames cannot be enumerated. Filenames are random regardless.
-SECRET_DIR = os.path.join("/tmp", f"orchestratia-agent-{os.getuid()}")
 
 ENV_VAR = "ORCHESTRATIA_KEY_FILE"
 
 
+def _secret_dir() -> str:
+    """Per-user directory for short-lived session secrets.
+
+    Computed lazily, NOT at import time: os.getuid() does not exist on Windows,
+    and hub.py imports this module unconditionally — evaluating it at module
+    scope made the whole agent fail to import on Windows.
+
+    tempfile.gettempdir() rather than a hardcoded /tmp so macOS and Windows get
+    their own correct locations. On Linux that is tmpfs, so secrets do not
+    survive a reboot, which is what we want.
+    """
+    uid = getattr(os, "getuid", None)
+    suffix = uid() if uid else os.environ.get("USERNAME", "user")
+    return os.path.join(tempfile.gettempdir(), f"orchestratia-agent-{suffix}")
+
+
 def _ensure_dir() -> str:
-    os.makedirs(SECRET_DIR, mode=0o711, exist_ok=True)
+    d = _secret_dir()
+    os.makedirs(d, mode=0o711, exist_ok=True)
     # makedirs honours umask, so set the mode explicitly.
-    os.chmod(SECRET_DIR, 0o711)
-    return SECRET_DIR
+    os.chmod(d, 0o711)
+    return d
 
 
 def write_session_key(session_id: str, token: str, run_as: str) -> str | None:
@@ -52,8 +65,7 @@ def write_session_key(session_id: str, token: str, run_as: str) -> str | None:
     if not token or not run_as:
         return None
     try:
-        _ensure_dir()
-        path = os.path.join(SECRET_DIR, f"{session_id[:12]}-{secrets.token_hex(8)}")
+        path = os.path.join(_ensure_dir(), f"{session_id[:12]}-{secrets.token_hex(8)}")
         # Create 0600 from the outset — never write then chmod, or the content
         # is briefly readable at whatever the umask happens to be.
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

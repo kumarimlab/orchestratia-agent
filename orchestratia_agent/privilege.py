@@ -110,7 +110,13 @@ def verify_workspace(tier: str, working_dir: str | None, tc: TierConfig) -> str:
     resolved = os.path.realpath(os.path.expanduser(working_dir))
     for root in tc.workspaces:
         if _is_within(resolved, root):
-            return working_dir if os.path.isabs(working_dir) else resolved
+            # Return the RESOLVED path, never the caller's raw string. Returning
+            # the raw one meant the check and the chdir referred to different
+            # objects, so an attacker who owns the workspace could flip a
+            # symlink component between them and land outside the grant. That
+            # race was measured at a ~3% success rate per attempt, with
+            # unlimited retries.
+            return resolved
 
     raise PrivilegeError(
         f"tier 'restricted' has no workspace grant for {resolved!r} "

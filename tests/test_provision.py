@@ -80,10 +80,9 @@ def test_sudoers_line_refuses_bad_tmux_path():
         raise AssertionError(f"tmux path {bad!r} must be refused")
 
 
-def test_acl_commands_grant_and_default():
+def test_acl_commands_grant_the_workspace():
     cmds = pv.acl_commands("orc-agent", "/srv/acme")
-    assert ["setfacl", "-R", "-m", "u:orc-agent:rwX", "/srv/acme"] in cmds
-    assert ["setfacl", "-R", "-d", "-m", "u:orc-agent:rwX", "/srv/acme"] in cmds
+    assert ["setfacl", "-P", "-R", "-m", "u:orc-agent:rwX", "/srv/acme"] in cmds
 
 
 def test_acl_commands_grant_traverse_up_the_parent_chain():
@@ -108,6 +107,59 @@ def test_acl_commands_validate_their_inputs():
     except pv.ProvisionError:
         return
     raise AssertionError("acl_commands must validate the username")
+
+
+def test_rejects_forbidden_subpaths_not_just_exact_matches():
+    """SECURITY: an exact-match guard refused /etc but allowed /etc/cron.d,
+    /etc/sudoers.d and /root/.ssh — each a direct route back to root."""
+    for bad in ["/etc/cron.d", "/etc/sudoers.d", "/root/.ssh", "/usr/local/bin",
+                "/usr/bin", "/etc/systemd/system", "/var/lib/docker"]:
+        _rejects(pv.validate_workspace, bad, f"{bad!r} must be refused")
+
+
+def test_rejects_double_slash_root():
+    """SECURITY+HANG: normpath('//etc') == '//etc' bypassed the guard, and
+    dirname('//') == '//' made the parent walk never terminate."""
+    _rejects(pv.validate_workspace, "//etc", "//etc must be refused")
+
+
+def test_acl_parent_walk_terminates():
+    """Regression for the non-terminating dirname loop."""
+    import signal
+
+    def bail(*_):
+        raise AssertionError("acl_commands did not terminate")
+    signal.signal(signal.SIGALRM, bail)
+    signal.alarm(5)
+    try:
+        cmds = pv.acl_commands("orc-agent", "/srv/acme/deep/nested/path")
+        assert len(cmds) < 20, len(cmds)
+    finally:
+        signal.alarm(0)
+
+
+def test_no_default_acl_is_emitted():
+    """SECURITY: a -d default ACL made DAEMON-created files agent-writable.
+    The daemon executes code from these dirs (build scripts, git hooks), so an
+    agent could rewrite a script the root-equivalent daemon later runs."""
+    cmds = pv.acl_commands("orc-agent", "/srv/acme")
+    assert not any("-d" in c for c in cmds), cmds
+
+
+def test_acl_does_not_follow_symlinks():
+    cmds = pv.acl_commands("orc-agent", "/srv/acme")
+    grant = [c for c in cmds if "rwX" in " ".join(c)][0]
+    assert "-P" in grant, grant
+
+
+def test_rejects_symlinked_workspace():
+    """SECURITY: setfacl FOLLOWS a symlinked argument, so a workspace
+    symlinked to / would ACL the entire filesystem."""
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        link = os.path.join(td, "link")
+        os.symlink("/etc", link)
+        _rejects(pv.validate_workspace, link, "a symlinked workspace must be refused")
 
 
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

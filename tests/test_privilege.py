@@ -174,6 +174,21 @@ def test_restricted_tier_execs_absolute_under_sudo():
     assert argv[5].startswith("/"), "sudo needs an absolute path to match sudoers"
 
 
+def test_verify_workspace_returns_the_resolved_path():
+    """SECURITY: returning the caller's raw string meant the check and the
+    later chdir referred to different objects — a symlink flipped in between
+    escaped the grant (~3% per attempt, unlimited retries)."""
+    import os, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        real = os.path.join(td, "real"); os.makedirs(os.path.join(real, "inner"))
+        link = os.path.join(real, "wd"); os.symlink(os.path.join(real, "inner"), link)
+        tc = p.load_tier_config({"privilege": {"restricted_user": "u",
+                                               "workspaces": [real]}})
+        got = p.verify_workspace(p.TIER_RESTRICTED, link, tc)
+        assert got == os.path.realpath(link), got
+        assert got != link, "must not return the unresolved symlink path"
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

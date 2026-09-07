@@ -79,11 +79,22 @@ VENV_DIR="/opt/orchestratia-venv"
 TOTAL_STEPS=6
 ERRORS=0
 
-# Install from the public GitHub repo by default (the package is not on
-# PyPI). Users can override with ORCHESTRATIA_INSTALL_SOURCE=<spec> for
-# a custom pip spec (e.g. a fork, a PR branch, a pinned tag, or a local
-# checkout path).
-INSTALL_SOURCE="${ORCHESTRATIA_INSTALL_SOURCE:-git+https://github.com/kumarimlab/orchestratia-agent.git@main}"
+# Install from the public GitHub repo (the package is not on PyPI).
+#
+# Pinned to the latest RELEASE TAG, not to @main. Tracking a branch meant a
+# fresh install silently picked up whatever had just been pushed — unreleased,
+# unbuilt, and not what `--version` reported. Windows already installs from
+# releases/latest and macOS from a versioned formula; this makes Linux agree
+# with them, so cutting a tag is what ships code on every platform.
+#
+# The tag is resolved after git is confirmed available (see below), because
+# `git ls-remote` is what does the lookup — no GitHub API, so no rate limits
+# and no token needed.
+AGENT_REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
+# Used only if tag resolution fails. Bump alongside a release.
+FALLBACK_TAG="v0.28.1"
+# Empty unless the user overrode it; resolved later if so.
+INSTALL_SOURCE="${ORCHESTRATIA_INSTALL_SOURCE:-}"
 
 # ── Helper functions ────────────────────────────────────────────────
 
@@ -346,6 +357,23 @@ else
         fatal "Could not install git. Install manually: sudo apt install git"
     fi
 fi
+
+# Resolve the newest release tag now that git is available. sort -V orders
+# versions properly, so v0.9.10 beats v0.9.9 (a plain sort would not).
+if [ -z "$INSTALL_SOURCE" ]; then
+    LATEST_TAG=$(git ls-remote --tags --refs "$AGENT_REPO_URL" 'v*' 2>/dev/null \
+        | awk -F/ '{print $NF}' | sort -V | tail -1)
+    if [ -n "$LATEST_TAG" ]; then
+        ok "Latest release: ${LATEST_TAG}"
+    else
+        LATEST_TAG="$FALLBACK_TAG"
+        warn "Could not reach ${AGENT_REPO_URL} to list releases; using ${LATEST_TAG}"
+    fi
+    INSTALL_SOURCE="git+${AGENT_REPO_URL}@${LATEST_TAG}"
+else
+    info "Using ORCHESTRATIA_INSTALL_SOURCE override: ${INSTALL_SOURCE}"
+fi
+_log_to_file "Resolved INSTALL_SOURCE: ${INSTALL_SOURCE}"
 
 if check_command tmux; then
     ok "tmux $(tmux -V | awk '{print $2}')"

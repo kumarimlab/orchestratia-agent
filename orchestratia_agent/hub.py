@@ -29,6 +29,40 @@ if TYPE_CHECKING:
 log = logging.getLogger("orchestratia-agent")
 
 
+def _session_tmux(session, args: list[str], timeout: int = 5):
+    """Run a tmux command against a ManagedSession's tmux, as whoever owns it.
+
+    A restricted session's tmux lives on a different per-user socket, so a bare
+    `tmux` call here fails with "can't find pane" — and because subprocess.run
+    does not raise on a non-zero exit, the caller logged success and the PTY
+    fallback never fired. Task-trigger injection, note delivery and /esc were
+    all silently dead for restricted sessions.
+
+    Returns the CompletedProcess so callers can CHECK returncode.
+    """
+    import subprocess
+    handle = getattr(session, "handle", None)
+    extra = (getattr(handle, "extra", None) or {})
+    run_as = extra.get("run_as")
+    if run_as is None:
+        argv = ["tmux"] + args
+    else:
+        argv = ["sudo", "-n", "-u", run_as, "-H",
+                extra.get("tmux_path") or "tmux"] + args
+    return subprocess.run(argv, capture_output=True, timeout=timeout)
+
+
+def _pane_cwd_argv(session, tmux_name: str) -> list[str]:
+    """argv for reading a session's pane cwd, honouring its owning user."""
+    extra = (getattr(getattr(session, "handle", None), "extra", None) or {})
+    run_as = extra.get("run_as")
+    args = ["display-message", "-p", "-t", tmux_name, "#{pane_current_path}"]
+    if run_as is None:
+        return ["tmux"] + args
+    return ["sudo", "-n", "-u", run_as, "-H",
+            extra.get("tmux_path") or "tmux"] + args
+
+
 def _tier_config(state):
     """Tier config, resolving lazily if startup has not set it yet.
 
@@ -505,16 +539,18 @@ def _inject_text(session: "ManagedSession", text: str, send_enter: bool = True):
     if tmux_name and sys.platform != "win32":
         try:
             # Send text literally (no key interpretation)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_name, "-l", text],
-                capture_output=True, timeout=5,
-            )
+            r = _session_tmux(session, ["send-keys", "-t", tmux_name, "-l", text])
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"tmux send-keys failed: {r.stderr.decode(errors='replace').strip()}"
+                )
             if send_enter:
                 # Send Enter separately (as a named key, not literal)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", tmux_name, "Enter"],
-                    capture_output=True, timeout=5,
-                )
+                r = _session_tmux(session, ["send-keys", "-t", tmux_name, "Enter"])
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        f"tmux Enter failed: {r.stderr.decode(errors='replace').strip()}"
+                    )
             log.debug(f"Injected text via tmux send-keys -l to {tmux_name}")
         except Exception as e:
             log.warning(f"tmux send-keys failed ({e}), falling back to PTY write")
@@ -538,10 +574,11 @@ def _inject_escape(session: "ManagedSession"):
 
     if tmux_name and sys.platform != "win32":
         try:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", tmux_name, "Escape"],
-                capture_output=True, timeout=5,
-            )
+            r = _session_tmux(session, ["send-keys", "-t", tmux_name, "Escape"])
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"tmux Escape failed: {r.stderr.decode(errors='replace').strip()}"
+                )
         except Exception as e:
             log.warning(f"tmux Escape failed ({e}), falling back to PTY write")
             session.write_input(b"\x1b")
@@ -595,9 +632,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                 # Hub may supply explicit agent_type (used for folder pre-trust).
                 agent_type = msg.get("agent_type")
                 role = msg.get("role") or "worker"
+                privilege_tier = msg.get("privilege_tier") or "standard"
                 log.info(
                     f"Hub requests session start: {session_id[:8]} "
-                    f"(agent_type={agent_type or 'auto'}, role={role})"
+                    f"(agent_type={agent_type or 'auto'}, role={role}, "
+                    f"tier={privilege_tier})"
                 )
 
                 try:
@@ -610,14 +649,21 @@ async def ws_receive_loop(ws, state: DaemonState):
                     handle = backend.spawn(
                         session_id, working_dir, cols, rows,
                         env_vars=env_vars, project_id=project_id,
+                        privilege_tier=privilege_tier,
+                        tier_config=_tier_config(state),
                     )
                     if handle:
                         # Compute the resolved working_dir so fs operations
                         # sandbox correctly. backend.spawn may have fallen
                         # back to $HOME if the requested dir didn't exist.
-                        resolved_cwd = working_dir or os.path.expanduser("~")
-                        if not os.path.isdir(resolved_cwd):
-                            resolved_cwd = os.path.expanduser("~")
+                        # spawn() already resolved and AUTHORISED this. Re-deriving
+                        # it here (with a $HOME fallback) would report a directory
+                        # outside the granted workspaces for a restricted session.
+                        resolved_cwd = (handle.extra or {}).get("cwd") or ""
+                        if not resolved_cwd:
+                            resolved_cwd = working_dir or os.path.expanduser("~")
+                            if not os.path.isdir(resolved_cwd):
+                                resolved_cwd = os.path.expanduser("~")
                         session = ManagedSession(
                             session_id, handle, backend, sender,
                             on_close=_on_session_close,
@@ -645,6 +691,10 @@ async def ws_receive_loop(ws, state: DaemonState):
                             # the hub can populate sessions.working_directory
                             # if it was empty. Source of truth for the editor.
                             "working_dir": resolved_cwd,
+                            # The tier actually honoured and the OS user it ran
+                            # as — what happened, not what was asked for.
+                            "privilege_tier": privilege_tier,
+                            "run_as": (handle.extra or {}).get("run_as"),
                         })
                     else:
                         await ws_send(state, {
@@ -1617,7 +1667,7 @@ def _tmux_pane_cwd(tmux_name: str) -> str:
         return ""
     try:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", tmux_name, "#{pane_current_path}"],
+            _pane_cwd_argv(session, tmux_name),
             capture_output=True,
             text=True,
             timeout=2,

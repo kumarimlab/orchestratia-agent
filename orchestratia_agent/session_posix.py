@@ -49,7 +49,7 @@ def _tmux_argv(run_as: str | None, args: list[str], tmux_path: str | None = None
 def _tmux(handle: SessionHandle, args: list[str], timeout: int = 2, **kw):
     """Run a tmux command against `handle`'s session, as whoever owns it."""
     return subprocess.run(
-        _tmux_argv(_run_as(handle), args),
+        _tmux_argv(_run_as(handle), args, (handle.extra or {}).get("tmux_path")),
         capture_output=True, timeout=timeout, **kw,
     )
 
@@ -176,7 +176,7 @@ class PosixSessionBackend:
                 handle = SessionHandle(
                     pid=pid, fd=master_fd, tmux_name=tmux_name,
                     cols=cols, rows=rows,
-                    extra={"run_as": run_as, "cwd": cwd},
+                    extra={"run_as": run_as, "cwd": cwd, "tmux_path": tc.tmux_path},
                 )
 
                 # Enable mouse mode so scroll wheel works in dashboards
@@ -245,7 +245,9 @@ class PosixSessionBackend:
 
                 handle = SessionHandle(
                     pid=pid, fd=master_fd, tmux_name=session_name,
-                    cols=cols, rows=rows, extra={"run_as": run_as},
+                    cols=cols, rows=rows,
+                    extra={"run_as": run_as,
+                           "tmux_path": self._tier_config().tmux_path},
                 )
 
                 # Ensure mouse mode is on for reattached sessions

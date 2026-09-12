@@ -19,13 +19,48 @@ import os
 import signal
 import socket
 import subprocess
+import time
 
 log = logging.getLogger("orchestratia-agent.code_server")
 
 CODE_SERVER_BIN = "code-server"
 
+# Stop code-server after this much inactivity. Driven by USER ACTIVITY, never by
+# connection presence: code-server keeps its WebSocket open forever, so a
+# presence check would never fire and every host would revert to always-on.
+IDLE_SECONDS = 1800
+
+# Clock seam so the idle logic is testable without sleeping.
+_clock = time.monotonic
+
 # project_id -> subprocess.Popen of the running code-server
 _running: dict[str, subprocess.Popen] = {}
+# project_id -> last user-activity timestamp (monotonic)
+_last_activity: dict[str, float] = {}
+
+
+def _reset_for_test() -> None:
+    _running.clear()
+    _last_activity.clear()
+
+
+def note_activity(project_id: str) -> None:
+    """Record real user activity (called by the relay bridge on each inbound
+    browser frame). Resets the idle clock."""
+    _last_activity[project_id] = _clock()
+
+
+def reap_idle(running: set[str]) -> list[str]:
+    """Project ids whose editor has been idle past IDLE_SECONDS. `running` is the
+    set of projects with a live code-server (so a stale activity entry for an
+    already-stopped project is not returned)."""
+    now = _clock()
+    idle = []
+    for pid in running:
+        last = _last_activity.get(pid)
+        if last is None or (now - last) > IDLE_SECONDS:
+            idle.append(pid)
+    return idle
 
 
 def spawn_argv(user: str, port: int, workspace: str, cfg_dir: str) -> list[str]:
@@ -48,6 +83,26 @@ def spawn_argv(user: str, port: int, workspace: str, cfg_dir: str) -> list[str]:
         "--extensions-dir", os.path.join(cfg_dir, "ext"),
         workspace,
     ]
+
+
+def settings_json() -> dict:
+    """VS Code settings for the editor: the default terminal attaches to the
+    project's governed tmux via `orchestratia-agent orc-attach`, so terminal work
+    flows through the hub (recorded, tiered) instead of being a raw unrecorded
+    shell. Extension auto-update is off (the extensions dir is isolated at spawn;
+    full marketplace lockdown is handled at the process level in start())."""
+    return {
+        "terminal.integrated.defaultProfile.linux": "orchestratia",
+        "terminal.integrated.profiles.linux": {
+            "orchestratia": {
+                "path": "orchestratia-agent",
+                "args": ["orc-attach"],
+            },
+        },
+        "extensions.autoUpdate": False,
+        "extensions.autoCheckUpdates": False,
+        "workbench.startupEditor": "none",
+    }
 
 
 def _free_loopback_port() -> int:
@@ -100,6 +155,7 @@ def start(project_id: str, workspace: str, tc) -> int:
     proc = subprocess.Popen(argv, start_new_session=True)
     proc._orc_port = port   # type: ignore[attr-defined]
     _running[project_id] = proc
+    note_activity(project_id)   # so a just-started editor is not instantly reaped
     log.info("code-server started for project %s as %s on 127.0.0.1:%d",
              project_id[:12], user, port)
     return port
@@ -110,6 +166,7 @@ def stop(project_id: str) -> None:
     `pkill -u <user>`, which would also kill the project user's tmux sessions
     (Spec A recovery reattaches to those)."""
     proc = _running.pop(project_id, None)
+    _last_activity.pop(project_id, None)
     if proc is None or proc.poll() is not None:
         return
     try:

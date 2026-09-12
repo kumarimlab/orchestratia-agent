@@ -70,8 +70,9 @@ async def main():
         ),
     )
     parser.add_argument(
-        "provision_tier", nargs="?", choices=["provision-tier"], default=None,
-        help="Provision a project's restricted privilege tier on this box (needs root)",
+        "provision_tier", nargs="?", choices=["provision-tier", "orc-attach"], default=None,
+        help="provision-tier: provision a project's restricted tier (root). "
+             "orc-attach: attach the editor terminal to the project's tmux.",
     )
     parser.add_argument(
         "--project", default=None, metavar="ID",
@@ -105,6 +106,12 @@ async def main():
 
     state = DaemonState()
     state.config_path = args.config
+
+    if args.provision_tier == "orc-attach":
+        # The editor terminal's default command — attaches to the project's
+        # governed tmux (runs as the project user, sees only its own sessions).
+        from orchestratia_agent.orc_attach import main as orc_attach_main
+        sys.exit(orc_attach_main())
 
     if args.provision_tier == "provision-tier":
         from orchestratia_agent.provision import provision, ProvisionError

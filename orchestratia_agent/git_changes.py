@@ -96,13 +96,12 @@ def _empty_tree(repo: str) -> str:
     return _EMPTY_TREE.get(fmt, _EMPTY_TREE["sha1"])
 
 
-def _git(repo: str, args: list[str], timeout: int = 15) -> tuple[int, str]:
-    """Run a git command in `repo`, hardened against repo-controlled code exec.
-
-    `args` begins with the git subcommand. Diff subcommands additionally get
-    --no-ext-diff/--no-textconv; every command runs with fsmonitor disabled,
-    attributes neutralized (where git supports it), and a locked-down env.
-    """
+def _git_argv(repo: str, args: list[str], run_as: str | None = None) -> list[str]:
+    """The hardened git argv. When run_as is set, wrap in `sudo -n -u <user> -H`
+    so the command — and anything git might execute for this repo — runs as the
+    session's own unprivileged project user rather than the root-equivalent
+    daemon. That is the version-agnostic backstop: even a repo-config exec vector
+    the flags miss then runs as a contained user, not an escalation."""
     pre: list[str] = ["-c", "core.fsmonitor="]
     if _supports_attr_source():
         pre += [f"--attr-source={_empty_tree(repo)}"]
@@ -112,9 +111,18 @@ def _git(repo: str, args: list[str], timeout: int = 15) -> tuple[int, str]:
         # After the subcommand: these are diff options, not top-level git options.
         cmd = [cmd[0], "--no-ext-diff", "--no-textconv"] + cmd[1:]
 
+    base = ["git", "-C", repo] + pre + cmd
+    if run_as:
+        return ["sudo", "-n", "-u", run_as, "-H"] + base
+    return base
+
+
+def _git(repo: str, args: list[str], timeout: int = 15,
+         run_as: str | None = None) -> tuple[int, str]:
+    """Run a hardened git command in `repo`, optionally as `run_as`. See _git_argv."""
     try:
         r = subprocess.run(
-            ["git", "-C", repo] + pre + cmd,
+            _git_argv(repo, args, run_as),
             capture_output=True, text=True, timeout=timeout, env=_hardened_env(),
         )
         return r.returncode, r.stdout
@@ -122,54 +130,64 @@ def _git(repo: str, args: list[str], timeout: int = 15) -> tuple[int, str]:
         return 1, ""
 
 
-def is_git_repo(path: str) -> bool:
+def _should_refuse_filter(run_as: str | None) -> bool:
+    """Whether to refuse inspecting a filter-armed repo.
+
+    Refuse only on git < 2.40 (no --attr-source to neutralize .gitattributes)
+    AND with no unprivileged user to fall back to. When run_as is set the filter
+    driver would run AS that contained user, so there is nothing to refuse."""
+    return (not _supports_attr_source()) and (run_as is None)
+
+
+def is_git_repo(path: str, run_as: str | None = None) -> bool:
     if not path or not os.path.isdir(path):
         return False
-    rc, out = _git(path, ["rev-parse", "--is-inside-work-tree"])
+    rc, out = _git(path, ["rev-parse", "--is-inside-work-tree"], run_as=run_as)
     return rc == 0 and out.strip() == "true"
 
 
-def head_sha(path: str) -> str:
+def head_sha(path: str, run_as: str | None = None) -> str:
     """Current HEAD, or '' — an empty repo with no commits has no HEAD."""
-    rc, out = _git(path, ["rev-parse", "HEAD"])
+    rc, out = _git(path, ["rev-parse", "HEAD"], run_as=run_as)
     return out.strip() if rc == 0 else ""
 
 
-def current_branch(path: str) -> str:
-    rc, out = _git(path, ["rev-parse", "--abbrev-ref", "HEAD"])
+def current_branch(path: str, run_as: str | None = None) -> str:
+    rc, out = _git(path, ["rev-parse", "--abbrev-ref", "HEAD"], run_as=run_as)
     return out.strip() if rc == 0 else ""
 
 
-def baseline(path: str) -> dict:
+def baseline(path: str, run_as: str | None = None) -> dict:
     """Snapshot taken when a session starts, so later diffs have an anchor.
 
     Records whether the tree was ALREADY dirty: without that, pre-existing
     uncommitted work gets attributed to the agent, which is exactly the kind of
     quiet inaccuracy that makes a review surface untrustworthy.
     """
-    if not is_git_repo(path):
+    if not is_git_repo(path, run_as):
         return {"is_repo": False}
     # rev-parse (head/branch) never runs a filter; status can. On a git too old
-    # to neutralize attributes, refuse the status probe if a filter is armed.
-    if not _supports_attr_source() and _armed_filter_driver(path):
+    # to neutralize attributes, refuse the status probe if a filter is armed AND
+    # we have no unprivileged user to run it as.
+    if _should_refuse_filter(run_as) and _armed_filter_driver(path, run_as):
         return {
             "is_repo": True,
-            "head": head_sha(path),
-            "branch": current_branch(path),
+            "head": head_sha(path, run_as),
+            "branch": current_branch(path, run_as),
             "dirty_at_start": False,
             "inspection_limited": "repo defines content filters and this host's "
                                   "git (<2.40) cannot inspect it without running them",
         }
-    rc, status = _git(path, ["status", "--porcelain"])
+    rc, status = _git(path, ["status", "--porcelain"], run_as=run_as)
     return {
         "is_repo": True,
-        "head": head_sha(path),
-        "branch": current_branch(path),
+        "head": head_sha(path, run_as),
+        "branch": current_branch(path, run_as),
         "dirty_at_start": bool(status.strip()),
     }
 
 
-def _armed_filter_driver(path: str) -> bool:
+def _armed_filter_driver(path: str, run_as: str | None = None) -> bool:
     """Does the repo define a filter.*.(clean|smudge|process) exec driver?
 
     On git ≥ 2.40 the answer is irrelevant — --attr-source neutralizes the
@@ -185,7 +203,7 @@ def _armed_filter_driver(path: str) -> bool:
     execution is neither.
     """
     rc, out = _git(path, ["config", "--get-regexp",
-                          r"^filter\..*\.(clean|smudge|process)$"])
+                          r"^filter\..*\.(clean|smudge|process)$"], run_as=run_as)
     return rc == 0 and bool(out.strip())
 
 
@@ -208,7 +226,7 @@ def _parse_porcelain(status_out: str) -> list[dict]:
     return files
 
 
-def collect(path: str, since_sha: str = "") -> dict:
+def collect(path: str, since_sha: str = "", run_as: str | None = None) -> dict:
     """Everything that changed in `path`, optionally since `since_sha`.
 
     Covers all three places work hides: commits made during the session,
@@ -217,14 +235,14 @@ def collect(path: str, since_sha: str = "") -> dict:
     work" is the common case, so that omission would make the feature look
     broken precisely when it worked.
     """
-    if not is_git_repo(path):
+    if not is_git_repo(path, run_as):
         return {"is_repo": False, "error": "not a git repository"}
 
     result: dict = {
         "is_repo": True,
         "path": path,
-        "branch": current_branch(path),
-        "head": head_sha(path),
+        "branch": current_branch(path, run_as),
+        "head": head_sha(path, run_as),
         "since": since_sha,
         "commits": [],
         "files": [],
@@ -236,7 +254,7 @@ def collect(path: str, since_sha: str = "") -> dict:
     # Commits made since the baseline.
     if since_sha:
         rc, out = _git(path, ["log", "--format=%H%x1f%s%x1f%an%x1f%aI",
-                              f"{since_sha}..HEAD"])
+                              f"{since_sha}..HEAD"], run_as=run_as)
         if rc == 0:
             for line in out.strip().splitlines():
                 parts = line.split("\x1f")
@@ -250,14 +268,14 @@ def collect(path: str, since_sha: str = "") -> dict:
     # old for --attr-source we cannot stop that, so refuse rather than execute —
     # commits (from log, above) are still reported, only the working-tree
     # inspection is withheld, with the reason stated.
-    if not _supports_attr_source() and _armed_filter_driver(path):
+    if _should_refuse_filter(run_as) and _armed_filter_driver(path, run_as):
         result["inspection_limited"] = (
             "repo defines content filters and this host's git (<2.40) cannot "
             "inspect the working tree without running them; showing commits only"
         )
         return result
 
-    rc, status = _git(path, ["status", "--porcelain"])
+    rc, status = _git(path, ["status", "--porcelain"], run_as=run_as)
     if rc == 0:
         result["files"] = _parse_porcelain(status)[:MAX_FILES]
 
@@ -268,7 +286,7 @@ def collect(path: str, since_sha: str = "") -> dict:
         diff_args.append(since_sha)
         stat_args.append(since_sha)
 
-    rc, diff = _git(path, diff_args, timeout=30)
+    rc, diff = _git(path, diff_args, timeout=30, run_as=run_as)
     if rc == 0:
         encoded = diff.encode("utf-8", errors="replace")
         if len(encoded) > MAX_DIFF_BYTES:
@@ -277,7 +295,7 @@ def collect(path: str, since_sha: str = "") -> dict:
         else:
             result["diff"] = diff
 
-    rc, numstat = _git(path, stat_args)
+    rc, numstat = _git(path, stat_args, run_as=run_as)
     if rc == 0:
         ins = dels = changed = 0
         for line in numstat.strip().splitlines():

@@ -283,6 +283,22 @@ def test_capability_merge_does_not_mutate_input():
     assert "privilege" not in existing
 
 
+# ── hub wiring seam (T6) ──────────────────────────────────────────────────────
+
+def test_hub_priv_user_for_passes_project_id():
+    from orchestratia_agent import hub
+
+    class FakeState:
+        config = cfg()
+
+    st = FakeState()
+    assert hub._priv_user_for(st, p.TIER_RESTRICTED, PID_A) == "orcp-a1b2c3d45e6f"
+    # unprovisioned project -> None (never raises into the spawn path), which the
+    # spawn path treats as "no restricted user" and refuses downstream.
+    assert hub._priv_user_for(st, p.TIER_RESTRICTED, PID_B) is None
+    assert hub._priv_user_for(st, p.TIER_STANDARD, PID_A) is None
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

@@ -114,6 +114,81 @@ def test_orc_attach_choice():
     ok("many -> present a picker", act == "pick" and payload == ["orc-a", "orc-b"])
 
 
+
+# ── relay bridge: target port is PINNED server-side, never from the message ──
+# (finding #3) — else the relay↔agent link becomes a general loopback-SSRF
+# primitive that could reach any local port.
+
+def test_relay_bridge_pins_the_target_port():
+    import asyncio
+    from orchestratia_agent import relay_client as rc
+
+    opened = {}
+
+    async def fake_open(tunnel_id, host, port, ws_send):
+        opened["host"] = host
+        opened["port"] = port
+
+    activity = {"n": 0}
+    orig = rc.open_tunnel
+    rc.open_tunnel = fake_open
+    try:
+        # A malicious/confused relay asks for port 9999; the agent must ignore it
+        # and open ONLY the port code-server actually bound (41000).
+        asyncio.get_event_loop().run_until_complete(
+            rc.handle_relay_message(
+                {"type": "tunnel_open", "tunnel_id": "t1", "target_port": 9999,
+                 "target_host": "10.0.0.5"},
+                pinned_port=41000,
+                ws_send=lambda m: asyncio.sleep(0),
+                on_activity=lambda: activity.__setitem__("n", activity["n"] + 1),
+            )
+        )
+    finally:
+        rc.open_tunnel = orig
+    ok("target port is the pinned code-server port, not the message's",
+       opened.get("port") == 41000, opened)
+    ok("target host is loopback, not the message's",
+       opened.get("host") == "127.0.0.1", opened)
+    ok("inbound frame counted as activity", activity["n"] == 1)
+
+def test_hub_code_server_start_launches_and_bridges():
+    import asyncio
+    from orchestratia_agent import hub, code_server, relay_client, privilege
+
+    class St:
+        config = {}
+        api_key = "orc_test"
+    st = St()
+
+    from orchestratia_agent import tls
+    started = {}
+    connected = {}
+    real_start, real_connect = code_server.start, relay_client.connect
+    real_bssl = tls.build_ssl_context
+    real_tc = hub._tier_config
+    def _fake_start(pid, wd, tc):
+        started["args"] = (pid, wd)
+        return 41000
+    code_server.start = _fake_start
+    relay_client.connect = lambda sid, url, key, port, on_activity, ssl_ctx: \
+        connected.setdefault("args", (sid, url, port))
+    tls.build_ssl_context = lambda state=None: None   # local import in the handler
+    hub._tier_config = lambda state: privilege.load_tier_config({})
+    try:
+        asyncio.get_event_loop().run_until_complete(hub._handle_code_server_start(
+            st, "sess-1", "pid-A", "/srv/a", "wss://relay.example"))
+    finally:
+        code_server.start, relay_client.connect = real_start, real_connect
+        tls.build_ssl_context, hub._tier_config = real_bssl, real_tc
+
+    ok("code-server started for the project+workspace", started.get("args") == ("pid-A", "/srv/a"))
+    ok("relay bridge connected with the PINNED port",
+       connected.get("args") == ("sess-1", "wss://relay.example", 41000), connected)
+    ok("editor session tracked for reaper teardown",
+       "sess-1" in hub._editor_sessions.get("pid-A", set()))
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

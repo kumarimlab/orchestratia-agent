@@ -124,6 +124,11 @@ def is_running(project_id: str) -> bool:
     return proc is not None and proc.poll() is None
 
 
+def running_projects() -> set[str]:
+    """Projects with a live code-server (for the idle reaper)."""
+    return {pid for pid, proc in _running.items() if proc.poll() is None}
+
+
 def running_port(project_id: str) -> int | None:
     """The loopback port code-server is bound to for this project, or None."""
     proc = _running.get(project_id)

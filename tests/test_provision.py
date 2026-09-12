@@ -111,6 +111,31 @@ def test_workspace_lockdown_validates_the_path():
         raise AssertionError(f"{bad!r} must be refused")
 
 
+def test_sudoers_lines_include_code_server_when_provided():
+    projects = {"p": {"user": "orcp-aaaaaaaaaaaa"}}
+    line = pv.sudoers_lines("ubuntu", projects, "/usr/bin/tmux", "/usr/bin/git",
+                            code_server_path="/usr/bin/code-server")[0]
+    assert line == ("ubuntu ALL=(orcp-aaaaaaaaaaaa) NOPASSWD: "
+                    "/usr/bin/tmux, /usr/bin/git, /usr/bin/code-server"), line
+
+
+def test_sudoers_lines_omit_code_server_when_absent():
+    projects = {"p": {"user": "orcp-aaaaaaaaaaaa"}}
+    line = pv.sudoers_lines("ubuntu", projects, "/usr/bin/tmux", "/usr/bin/git")[0]
+    assert line.endswith("/usr/bin/git"), line
+    assert "code-server" not in line
+
+
+def test_sudoers_lines_reject_bad_code_server_path():
+    try:
+        pv.sudoers_lines("ubuntu", {"p": {"user": "orcp-aaaaaaaaaaaa"}},
+                         "/usr/bin/tmux", "/usr/bin/git",
+                         code_server_path="/usr/bin/code-server; rm -rf /")
+    except pv.ProvisionError:
+        return
+    raise AssertionError("bad code-server path must be refused")
+
+
 def test_collision_guard_refuses_reused_username_for_new_project():
     existing = {"pid-A": {"user": "orcp-aaaaaaaaaaaa"}}
     try:

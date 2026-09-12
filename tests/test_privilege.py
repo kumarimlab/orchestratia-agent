@@ -283,6 +283,20 @@ def test_capability_merge_does_not_mutate_input():
     assert "privilege" not in existing
 
 
+# ── code-server capability (Spec B T3) ───────────────────────────────────────
+
+def test_capability_advertises_code_server_when_available():
+    c = dict(cfg())
+    c["privilege"]["code_server_path"] = "/usr/bin/code-server"
+    merged = p.merge_capabilities({}, p.load_tier_config(c))
+    assert merged["code_server"] == {"projects": [PID_A]}, merged.get("code_server")
+
+
+def test_capability_omits_code_server_when_unavailable():
+    merged = p.merge_capabilities({}, p.load_tier_config(cfg()))
+    assert "code_server" not in merged
+
+
 # ── hub wiring seam (T6) ──────────────────────────────────────────────────────
 
 def test_hub_priv_user_for_passes_project_id():

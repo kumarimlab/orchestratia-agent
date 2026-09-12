@@ -82,6 +82,10 @@ async def main():
         help="Directory the restricted tier may work in (repeatable)",
     )
     parser.add_argument(
+        "--code-server-path", default=None, metavar="PATH",
+        help="code-server binary to enable the editor (default: autodetected)",
+    )
+    parser.add_argument(
         "--daemon-user", default=None, metavar="NAME",
         help="User the daemon runs as (default: $SUDO_USER, else current user)",
     )
@@ -111,7 +115,8 @@ async def main():
         daemon_user = (args.daemon_user or os.environ.get("SUDO_USER")
                        or getpass.getuser())
         try:
-            sys.exit(provision(args.project, args.workspace, daemon_user, args.config))
+            sys.exit(provision(args.project, args.workspace, daemon_user, args.config,
+                               code_server_path=args.code_server_path))
         except ProvisionError as e:
             log.error(f"provision-tier: {e}")
             sys.exit(1)

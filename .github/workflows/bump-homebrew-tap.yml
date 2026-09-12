@@ -76,3 +76,58 @@ jobs:
           git add Formula/orchestratia-agent.rb
           git commit -m "orchestratia-agent ${VERSION}"
           git push
+
+      # The steps above all authenticate with HOMEBREW_TAP_PAT, so they succeed
+      # whether or not anyone else can reach the tap. The tap was in fact
+      # PRIVATE for months while this workflow reported success on every
+      # release — `brew install orchestratiahq/tap/orchestratia-agent` failed
+      # for every user, and nothing surfaced it.
+      #
+      # This step therefore uses NO token. It is the only check here that
+      # proves what a real Mac user experiences.
+      - name: Verify the tap is reachable ANONYMOUSLY
+        env:
+          # Ensure no ambient credentials leak into these commands.
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          TAP_URL="https://github.com/orchestratiahq/homebrew-tap.git"
+
+          echo "==> Anonymous clone (this is what 'brew tap' does)"
+          # Clone rather than hit raw.githubusercontent: the raw CDN caches for
+          # minutes and would give a false failure right after a push.
+          rm -rf /tmp/tapcheck
+          if ! git -c credential.helper= -c http.extraheader= \
+                 clone --depth 1 --quiet "$TAP_URL" /tmp/tapcheck; then
+            echo "::error::The Homebrew tap is NOT publicly readable."
+            echo "::error::'brew install orchestratiahq/tap/orchestratia-agent' will fail for every user."
+            echo "::error::Fix: GitHub -> orchestratiahq/homebrew-tap -> Settings -> change visibility to Public."
+            exit 1
+          fi
+          echo "    ok: anonymous clone succeeded"
+
+          echo "==> Formula reflects v${VERSION}"
+          FORMULA=/tmp/tapcheck/Formula/orchestratia-agent.rb
+          if ! grep -q "archive/refs/tags/v${VERSION}.tar.gz" "$FORMULA"; then
+            echo "::error::Formula does not reference v${VERSION} after the push:"
+            grep -n "url " "$FORMULA" || true
+            exit 1
+          fi
+          echo "    ok: formula points at v${VERSION}"
+
+          echo "==> sha256 in the formula matches the real tarball"
+          # A wrong hash passes every step above and fails only at `brew
+          # install`, which is the same silent-breakage shape as the private tap.
+          EXPECTED=$(grep -oE 'sha256 "[a-f0-9]{64}"' "$FORMULA" | head -1 | grep -oE '[a-f0-9]{64}')
+          curl -fsSL -o /tmp/verify.tar.gz \
+            "https://github.com/kumarimlab/orchestratia-agent/archive/refs/tags/v${VERSION}.tar.gz"
+          ACTUAL=$(sha256sum /tmp/verify.tar.gz | awk '{print $1}')
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::sha256 mismatch — brew install would abort."
+            echo "::error::formula=$EXPECTED actual=$ACTUAL"
+            exit 1
+          fi
+          echo "    ok: sha256 matches ($ACTUAL)"
+
+          echo "==> Tap verified end to end as an unauthenticated user"

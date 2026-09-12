@@ -52,6 +52,16 @@ def _session_tmux(session, args: list[str], timeout: int = 5):
     return subprocess.run(argv, capture_output=True, timeout=timeout)
 
 
+def _git_baseline(working_dir: str) -> dict:
+    """Git anchor for a starting session. Never raises into the spawn path."""
+    try:
+        from orchestratia_agent import git_changes as _gc
+        return _gc.baseline(working_dir)
+    except Exception:  # noqa: BLE001
+        log.exception("git baseline failed")
+        return {"is_repo": False}
+
+
 def _priv_user_for(state, tier: str) -> str | None:
     """OS user for a tier, or None. Never raises into the spawn path."""
     try:
@@ -728,6 +738,10 @@ async def ws_receive_loop(ws, state: DaemonState):
                             # as — what happened, not what was asked for.
                             "privilege_tier": privilege_tier,
                             "run_as": (handle.extra or {}).get("run_as"),
+                            # Anchor for "what changed during this session".
+                            # Without it, a later diff cannot separate the
+                            # agent's work from whatever was already there.
+                            "git_baseline": _git_baseline(resolved_cwd),
                         })
                     else:
                         await ws_send(state, {
@@ -1162,6 +1176,11 @@ async def ws_receive_loop(ws, state: DaemonState):
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, remove_private_key, grant_id)
                     asyncio.create_task(s2s_tunnel.teardown_grant(grant_id))
+
+            elif msg_type == "git_changes":
+                request_id = msg.get("request_id")
+                if request_id:
+                    asyncio.create_task(_handle_git_changes(state, sender, msg))
 
             elif msg_type == "remote_exec":
                 request_id = msg.get("request_id")
@@ -1835,6 +1854,43 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
 
     response = {"type": result_type, "request_id": request_id, **result}
     await sender(response)
+
+
+async def _handle_git_changes(state: DaemonState, sender, msg: dict):
+    """Collect what changed in a session's working directory.
+
+    Runs in a thread: git on a large repo can take seconds and the daemon's
+    event loop also carries every terminal's output. Blocking it here would
+    stall every session on the box to answer one review request.
+    """
+    request_id = msg.get("request_id")
+    session_id = msg.get("session_id") or ""
+    since = msg.get("since") or ""
+    working_dir = msg.get("working_dir") or ""
+
+    # Prefer the hub's stored working_directory; fall back to what spawn
+    # authorised. Never guess — a wrong path silently reports "no changes",
+    # which reads as "the agent did nothing".
+    if not working_dir:
+        sess = state.active_sessions.get(session_id)
+        handle = getattr(sess, "handle", None)
+        working_dir = (getattr(handle, "extra", None) or {}).get("cwd", "") or ""
+
+    try:
+        from orchestratia_agent import git_changes as _gc
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, _gc.collect, working_dir, since
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception(f"git_changes failed for {session_id[:8]}")
+        result = {"is_repo": False, "error": f"{type(e).__name__}: {e}"}
+
+    await sender({
+        "type": "git_changes_result",
+        "request_id": request_id,
+        "session_id": session_id,
+        "changes": result,
+    })
 
 
 async def _handle_remote_exec(sender, request_id: str, command: str,

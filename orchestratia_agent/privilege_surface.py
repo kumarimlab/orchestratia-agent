@@ -31,6 +31,15 @@ PRIVILEGE_CLASSIFICATION = {
     # Execution.
     "remote_exec": TIER_BOUNDED,
 
+    # Review surface. Runs git READ-ONLY commands (status/log/diff) in the
+    # session's own working directory — no writes, no arbitrary argv, and the
+    # path comes from the hub's stored working_directory rather than the
+    # request. Classed tier_bounded because it is scoped to one session's
+    # directory; it should move to executing AS the session's user when the
+    # restricted tier is in real use, so a confined session's diff is read with
+    # its own privileges rather than the daemon's.
+    "git_changes": TIER_BOUNDED,
+
     # Filesystem side-panel — scoped to the session's working_dir.
     # NOTE: these still run IN THE DAEMON PROCESS as the daemon user. They are
     # path-scoped, not privilege-scoped. Tracked as a known gap; see the

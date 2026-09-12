@@ -20,6 +20,7 @@ USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 # An absolute path, no whitespace, no sudoers metacharacters.
 TMUX_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
+GIT_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
 
 # Granting any of these -- OR ANYTHING BENEATH THEM -- would hand back what the
 # tier removes. Checked as ancestors, not as exact strings: an exact-match test
@@ -112,21 +113,47 @@ def validate_workspace(path: str) -> str:
     return resolved
 
 
-def sudoers_line(daemon_user: str, restricted_user: str, tmux_path: str) -> str:
-    """One pinned rule: this daemon user may run THIS binary as THIS user.
+def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: str) -> list[str]:
+    """One pinned, downward-only rule per project user.
 
-    No wildcards, no shell, no ALL target. The caller writes it to a drop-in and
-    validates with `visudo -cf` before moving it into place.
+    Each line permits exactly tmux and git as that project's user — nothing else,
+    no wildcards, no shell, no ALL target. git is included so `git_changes` can
+    inspect a repo AS the session's own unprivileged user (the version-agnostic
+    backstop for the repo-config code-exec class; see the git_changes hardening).
 
-    Note this is a DOWNWARD privilege move — orc-agent has strictly less power
-    than the daemon user — so it is not an escalation vector even though tmux
-    can run arbitrary commands.
+    Still not an escalation: every orcp-* user has strictly LESS power than the
+    daemon user, so letting the daemon run tmux/git as one is a downward move.
+
+    The caller joins these with newlines into a drop-in and validates the whole
+    file with `visudo -cf` before moving it into place — the belt to this
+    braces, because a sudoers newline-injection once shipped here.
     """
     validate_username(daemon_user)
-    validate_username(restricted_user)
     if not isinstance(tmux_path, str) or not TMUX_PATH_RE.match(tmux_path):
         raise ProvisionError(f"invalid tmux path {tmux_path!r}")
-    return f"{daemon_user} ALL=({restricted_user}) NOPASSWD: {tmux_path}"
+    if not isinstance(git_path, str) or not GIT_PATH_RE.match(git_path):
+        raise ProvisionError(f"invalid git path {git_path!r}")
+    lines = []
+    for spec in projects.values():
+        user = validate_username((spec or {}).get("user"))
+        lines.append(f"{daemon_user} ALL=({user}) NOPASSWD: {tmux_path}, {git_path}")
+    return lines
+
+
+def assert_no_collision(user: str, project_id: str, existing_projects: dict) -> None:
+    """Refuse if `user` already belongs to a DIFFERENT project (D3).
+
+    project_username derives the name from 12 hex of the project UUID; a
+    collision is astronomically unlikely but its blast radius is a cross-tenant
+    breach — two projects sharing one UID — so it is asserted, not assumed.
+    Re-provisioning the same project is fine (idempotent).
+    """
+    for pid, spec in (existing_projects or {}).items():
+        if (spec or {}).get("user") == user and pid != project_id:
+            raise ProvisionError(
+                f"username {user!r} already maps to project {pid!r}; refusing to "
+                f"reuse it for {project_id!r} (hash collision — pick distinct projects)"
+            )
 
 
 def acl_commands(user: str, workspace: str) -> list[list[str]]:
@@ -217,13 +244,22 @@ def _run(argv: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return result
 
 
-def provision(restricted_user: str, workspaces: list[str],
+def provision(project_id: str, workspaces: list[str],
               daemon_user: str, config_path: str) -> int:
-    """Create the user, apply ACLs, install sudoers, update config. Root only."""
+    """Provision ONE project's restricted user. Additive, idempotent. Root only.
+
+    Derives the OS user deterministically from project_id, refuses a hash
+    collision with a different project, applies workspace ACLs, and rewrites the
+    sudoers drop-in from ALL provisioned projects (so an existing project's rule
+    survives a new project being added). Merges — never replaces — the projects map.
+    """
     if os.geteuid() != 0:
         raise ProvisionError("provision-tier must be run as root (use sudo)")
 
-    user = validate_username(restricted_user)
+    from orchestratia_agent.privilege import project_username
+    user = project_username(project_id)          # validates the project_id shape
+    validate_username(user)                       # and the derived username
+
     if daemon_user == "root":
         # Reachable from a plain root shell, where $SUDO_USER is unset. The
         # generic validator would say "'root' is not a restricted user", which
@@ -244,20 +280,18 @@ def provision(restricted_user: str, workspaces: list[str],
     tmux_path = shutil.which("tmux")
     if not tmux_path:
         raise ProvisionError("tmux not found; the restricted tier requires it")
+    git_path = shutil.which("git")
+    if not git_path:
+        raise ProvisionError("git not found; the restricted tier requires it")
     if not shutil.which("setfacl"):
         raise ProvisionError(
             "setfacl not found; install the 'acl' package "
             "(apt install acl / brew install acl)"
         )
 
-    # Build the sudoers line FIRST: if any input is bad we want to fail before
-    # creating a user or touching anyone's filesystem.
-    line = sudoers_line(daemon_user, user, tmux_path)
-
-    # Load the config now too, for the same reason. It used to be read at the
-    # very END, where a missing file raised FileNotFoundError (not
-    # ProvisionError) AFTER the user, ACLs and sudoers rule had all been
-    # applied -- a traceback on a half-provisioned box.
+    # Load the config FIRST: everything below either validates against it
+    # (collision guard) or merges into it, and a read error must abort before we
+    # create a user or touch anyone's filesystem — not leave a half-provisioned box.
     from orchestratia_agent.config import load_config, save_config
     try:
         existing_cfg = load_config(config_path) or {}
@@ -266,10 +300,20 @@ def provision(restricted_user: str, workspaces: list[str],
     except Exception as e:  # noqa: BLE001
         raise ProvisionError(f"cannot read config {config_path}: {e}") from e
 
+    priv = dict(existing_cfg.get("privilege") or {})
+    existing_projects = dict(priv.get("projects") or {})
+    assert_no_collision(user, project_id, existing_projects)
+
+    # Merge this project in, then build ALL sudoers lines. Validating the whole
+    # set now means bad input fails before any user/ACL/file change.
+    merged_projects = dict(existing_projects)
+    merged_projects[project_id] = {"user": user, "workspaces": spaces}
+    lines = sudoers_lines(daemon_user, merged_projects, tmux_path, git_path)
+
     # 1. The user: no login password, and explicitly none of the escalation groups.
     if _run(["id", user], check=False).returncode != 0:
         _run(["useradd", "-m", "-s", "/bin/bash",
-              "--comment", "Orchestratia restricted agent", user])
+              "--comment", f"Orchestratia restricted agent (project {project_id})", user])
         print(f"  created user {user}")
     else:
         print(f"  user {user} already exists — converging")
@@ -277,7 +321,7 @@ def provision(restricted_user: str, workspaces: list[str],
     _strip_supplementary_groups(user)
     _assert_unprivileged(user)
 
-    # 2. Workspace ACLs.
+    # 2. Workspace ACLs for THIS project's workspaces.
     home_roots = [h for h in ("/home", "/Users") if os.path.isdir(h)]
     for w in spaces:
         for cmd in acl_commands(user, w):
@@ -291,11 +335,11 @@ def provision(restricted_user: str, workspaces: list[str],
                 f"stay protected. Prefer a workspace outside /home."
             )
 
-    # 3. Sudoers drop-in, validated before it goes live.
+    # 3. Sudoers drop-in (all projects), validated before it goes live.
     tmp = "/etc/sudoers.d/.orchestratia-agent-tiers.tmp"
     final = "/etc/sudoers.d/orchestratia-agent-tiers"
     with open(tmp, "w") as fh:
-        fh.write(line + "\n")
+        fh.write("\n".join(lines) + "\n")
     os.chmod(tmp, 0o440)
     check = _run(["visudo", "-cf", tmp], check=False)
     if check.returncode != 0:
@@ -305,18 +349,20 @@ def provision(restricted_user: str, workspaces: list[str],
         )
     os.replace(tmp, final)
 
-    # 4. Config, so the daemon advertises and can honour the tier.
+    # 4. Config: merge this project into the projects map, pin both binaries.
     cfg = existing_cfg
-    cfg["privilege"] = {
-        "restricted_user": user,
-        "workspaces": spaces,
-        "tmux_path": tmux_path,
-    }
+    priv["projects"] = merged_projects
+    priv["tmux_path"] = tmux_path
+    priv["git_path"] = git_path
+    priv.pop("restricted_user", None)   # drop any legacy flat keys once migrated
+    priv.pop("workspaces", None)
+    cfg["privilege"] = priv
     save_config(config_path, cfg)
 
-    print(f"\n  Restricted user:    {user}")
+    print(f"\n  Project:            {project_id}")
+    print(f"  Restricted user:    {user}")
     print(f"  Workspaces granted: {', '.join(spaces)}")
-    print(f"  Sudoers rule:       {line}")
+    print(f"  Projects on this box: {', '.join(merged_projects)}")
     print("\n  NEXT — authenticate your agent tooling once, as that user:")
     print(f"      sudo -iu {user}")
     print("      claude login      # or: gemini auth / codex login")

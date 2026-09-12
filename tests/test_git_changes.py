@@ -236,6 +236,17 @@ def test_git_argv_no_sudo_when_run_as_none():
     argv = gc._git_argv("/srv/a", ["status", "--porcelain"], run_as=None)
     assert argv[0] != "sudo"
     assert argv[0] == "git"
+    # safe.directory is only added under sudo (dubious-ownership only bites then)
+    assert "safe.directory=/srv/a" not in " ".join(argv)
+
+
+def test_git_argv_trusts_the_repo_path_when_run_as_set():
+    # Run AS the project user, but the workspace is owned by the operator, so git
+    # would refuse without a scoped safe.directory. Scoped to THIS repo, never '*'.
+    argv = gc._git_argv("/srv/a", ["status", "--porcelain"], run_as="orcp-aaaaaaaaaaaa")
+    joined = " ".join(argv)
+    assert "-c safe.directory=/srv/a" in joined, argv
+    assert "safe.directory=*" not in joined
 
 
 def test_diff_flags_still_applied_under_sudo():

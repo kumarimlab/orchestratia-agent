@@ -197,6 +197,24 @@ def acl_commands(user: str, workspace: str) -> list[list[str]]:
     return cmds
 
 
+def workspace_lockdown_command(workspace: str) -> list[str]:
+    """Remove ALL 'other' access from the workspace root dir.
+
+    Per-project users each get --x traverse on the SHARED parent (e.g. /srv), so
+    without this a world-readable workspace (a 0755 git checkout is world-
+    readable) is readable by a sibling project's user — a cross-tenant leak the
+    ACLs alone do not close, because an ACL grants the named user access without
+    removing 'other' access. `chmod o=` on the workspace root blocks traverse-in
+    for everyone who is neither the owner nor the ACL-granted project user; files
+    inside are then unreachable by 'other' regardless of their own mode bits.
+
+    Not recursive: blocking traverse at the root is sufficient and leaves the
+    operator's file modes untouched.
+    """
+    workspace = validate_workspace(workspace)
+    return ["chmod", "o=", workspace]
+
+
 def _strip_supplementary_groups(user: str) -> None:
     """Remove the user from every supplementary group.
 
@@ -326,7 +344,11 @@ def provision(project_id: str, workspaces: list[str],
     for w in spaces:
         for cmd in acl_commands(user, w):
             _run(cmd)
-        print(f"  granted {w}")
+        # Close the cross-tenant read: a sibling project's user has --x on the
+        # shared parent, so a world-readable workspace would otherwise be
+        # readable across tenants. Remove 'other' access on the workspace root.
+        _run(workspace_lockdown_command(w))
+        print(f"  granted {w} (world access removed)")
         if any(_is_within(w, h) for h in home_roots):
             print(
                 f"    WARNING: {w} is inside a user home. Traversing to it "

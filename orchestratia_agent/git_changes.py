@@ -113,6 +113,13 @@ def _git_argv(repo: str, args: list[str], run_as: str | None = None) -> list[str
 
     base = ["git", "-C", repo] + pre + cmd
     if run_as:
+        # The workspace is typically owned by the operator/daemon user and
+        # ACL-granted to the project user, so git run AS the project user would
+        # otherwise refuse with "detected dubious ownership" and the review would
+        # silently come back empty. Trust exactly THIS repo path (not '*'); the
+        # config-exec vectors that dubious-ownership also guards against are
+        # already neutralized above (--no-ext-diff/--no-textconv/fsmonitor/attr-source).
+        base = ["git", "-C", repo, "-c", f"safe.directory={repo}"] + pre + cmd
         return ["sudo", "-n", "-u", run_as, "-H"] + base
     return base
 

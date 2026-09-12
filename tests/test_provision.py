@@ -93,6 +93,24 @@ def test_sudoers_lines_refuses_bad_git_path():
         raise AssertionError(f"git path {bad!r} must be refused")
 
 
+def test_workspace_lockdown_removes_other_access():
+    """A world-readable workspace under a shared parent is readable by a SIBLING
+    project's user (each gets --x traverse on the parent). Removing 'other'
+    access on the workspace root blocks that traverse. Owner and the ACL-granted
+    project user are unaffected (they use owner bits / the named-user ACL)."""
+    cmd = pv.workspace_lockdown_command("/srv/acme")
+    assert cmd == ["chmod", "o=", "/srv/acme"], cmd
+
+
+def test_workspace_lockdown_validates_the_path():
+    for bad in ("relative", "/etc", "/srv/a\n/etc"):
+        try:
+            pv.workspace_lockdown_command(bad)
+        except pv.ProvisionError:
+            continue
+        raise AssertionError(f"{bad!r} must be refused")
+
+
 def test_collision_guard_refuses_reused_username_for_new_project():
     existing = {"pid-A": {"user": "orcp-aaaaaaaaaaaa"}}
     try:

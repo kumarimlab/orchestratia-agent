@@ -134,6 +134,93 @@ def test_branch_is_reported():
     assert gc.collect(d)["branch"] in ("main", "master")
 
 
+# ── Security: a repo must never be able to execute code during review ────────
+# Reviewing a diff is a read-only act. git honours several repo-controlled config
+# keys by running an external program — diff.external, a textconv/filter driver
+# named in .gitattributes, core.fsmonitor. Since collect() runs in the daemon
+# (root-equivalent) process, any of these is a "view the diff -> RCE" primitive,
+# and an escalation the moment a restricted session's workspace is the repo.
+# Each test arms one vector with a sentinel-writing script and asserts collect()
+# did NOT run it. They FAIL against pre-fix code (the sentinel appears).
+
+def _arm(repo, sentinel):
+    """Write a script that touches `sentinel`, return its path. cat keeps git happy
+    when the vector is a filter/textconv (it must still emit content)."""
+    script = os.path.join(repo, "..", f"bomb_{os.path.basename(sentinel)}.sh")
+    script = os.path.abspath(script)
+    with open(script, "w") as f:
+        f.write(f'#!/bin/sh\ntouch {sentinel}\ncat\n')
+    os.chmod(script, 0o755)
+    return script
+
+
+def _sentinel():
+    d = tempfile.mkdtemp(prefix="gcx-sentinel-")
+    return os.path.join(d, "FIRED")
+
+
+def test_diff_external_is_not_executed():
+    d = _repo()
+    base = gc.baseline(d)
+    with open(os.path.join(d, "a.txt"), "a") as f:
+        f.write("change\n")
+    s = _sentinel()
+    _run(d, "config", "diff.external", _arm(d, s))
+    gc.collect(d, base["head"])
+    assert not os.path.exists(s), "diff.external was executed during review — RCE"
+
+
+def test_textconv_driver_is_not_executed():
+    d = _repo()
+    base = gc.baseline(d)
+    with open(os.path.join(d, "a.txt"), "a") as f:
+        f.write("change\n")
+    with open(os.path.join(d, ".gitattributes"), "w") as f:
+        f.write("*.txt diff=pwn\n")
+    s = _sentinel()
+    _run(d, "config", "diff.pwn.textconv", _arm(d, s))
+    gc.collect(d, base["head"])
+    assert not os.path.exists(s), "textconv driver was executed during review — RCE"
+
+
+def test_filter_clean_driver_is_not_executed():
+    d = _repo()
+    base = gc.baseline(d)
+    with open(os.path.join(d, "a.txt"), "a") as f:
+        f.write("change\n")
+    with open(os.path.join(d, ".gitattributes"), "w") as f:
+        f.write("*.txt filter=pwn\n")
+    s = _sentinel()
+    _run(d, "config", "filter.pwn.clean", _arm(d, s))
+    gc.collect(d, base["head"])
+    assert not os.path.exists(s), "filter.clean driver was executed during review — RCE"
+
+
+def test_fsmonitor_hook_is_not_executed():
+    d = _repo()
+    base = gc.baseline(d)
+    with open(os.path.join(d, "a.txt"), "a") as f:
+        f.write("change\n")
+    s = _sentinel()
+    _run(d, "config", "core.fsmonitor", _arm(d, s))
+    gc.collect(d, base["head"])
+    assert not os.path.exists(s), "core.fsmonitor hook was executed during review — RCE"
+
+
+def test_real_diff_survives_the_hardening():
+    """The neutralization must not blind the feature: a genuine change with a
+    benign .gitattributes present must still show up in the diff."""
+    d = _repo()
+    base = gc.baseline(d)
+    with open(os.path.join(d, ".gitattributes"), "w") as f:
+        f.write("*.md text\n")
+    with open(os.path.join(d, "a.txt"), "a") as f:
+        f.write("genuine agent edit\n")
+    r = gc.collect(d, base["head"])
+    assert "genuine agent edit" in r["diff"], "hardening blinded the real diff"
+    assert any(f["path"] == "a.txt" for f in r["files"]), r["files"]
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

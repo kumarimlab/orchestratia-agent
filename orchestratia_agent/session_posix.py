@@ -74,8 +74,8 @@ class PosixSessionBackend:
         # rather than a half-built one.
         tc = tier_config or getattr(self, "tier_config", None) or _priv.load_tier_config({})
         try:
-            run_as = _priv.resolve_user(privilege_tier, tc)
-            cwd = _priv.verify_workspace(privilege_tier, working_dir, tc)
+            run_as = _priv.resolve_user(privilege_tier, project_id, tc)
+            cwd = _priv.verify_workspace(privilege_tier, working_dir, project_id, tc)
         except _priv.PrivilegeError as e:
             # Fail closed. Never downgrade to standard, never fall back to $HOME:
             # either would be a privilege decision taken by an error branch.
@@ -351,16 +351,16 @@ class PosixSessionBackend:
         return getattr(self, "tier_config", None) or _priv.load_tier_config({})
 
     def discover_surviving_sessions(self) -> list[str]:
-        """Find orphaned tmux sessions across every user we may have spawned as.
+        """Find orphaned tmux sessions across the daemon user AND every project user.
 
-        Restricted sessions live on a DIFFERENT tmux server. Scanning only our
-        own would silently abandon them on every daemon restart: the hub is
-        told they died while the tmux keeps running unsupervised.
+        Each per-project user lives on its OWN tmux server. Scanning only one (or
+        only the daemon) would silently abandon the rest on every daemon restart:
+        the hub is told they died while the tmux keeps running unsupervised.
         """
         names = list(discover_tmux_sessions())
         tc = self._tier_config()
-        if tc.restricted_user:
-            for n in discover_tmux_sessions(run_as=tc.restricted_user):
+        for pt in tc.projects.values():
+            for n in discover_tmux_sessions(run_as=pt.user):
                 if n not in names:
                     names.append(n)
         return names
@@ -370,9 +370,9 @@ class PosixSessionBackend:
         if session_name in discover_tmux_sessions():
             return None
         tc = self._tier_config()
-        if tc.restricted_user and session_name in discover_tmux_sessions(
-                run_as=tc.restricted_user):
-            return tc.restricted_user
+        for pt in tc.projects.values():
+            if session_name in discover_tmux_sessions(run_as=pt.user):
+                return pt.user
         return None
 
     def supports_persistence(self) -> bool:

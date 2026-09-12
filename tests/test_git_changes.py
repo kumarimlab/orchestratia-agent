@@ -221,6 +221,60 @@ def test_real_diff_survives_the_hardening():
     assert any(f["path"] == "a.txt" for f in r["files"]), r["files"]
 
 
+# ── run git as the session's project user (Spec A backstop) ──────────────────
+# The version-agnostic containment for the repo-config code-exec class: run git
+# AS the session's unprivileged project user, so even a vector the flags miss
+# executes as that contained user, not the daemon.
+
+def test_git_argv_wraps_in_sudo_when_run_as_set():
+    argv = gc._git_argv("/srv/a", ["status", "--porcelain"], run_as="orcp-aaaaaaaaaaaa")
+    assert argv[:5] == ["sudo", "-n", "-u", "orcp-aaaaaaaaaaaa", "-H"], argv
+    assert "git" in argv and "-C" in argv and "/srv/a" in argv
+
+
+def test_git_argv_no_sudo_when_run_as_none():
+    argv = gc._git_argv("/srv/a", ["status", "--porcelain"], run_as=None)
+    assert argv[0] != "sudo"
+    assert argv[0] == "git"
+    # safe.directory is only added under sudo (dubious-ownership only bites then)
+    assert "safe.directory=/srv/a" not in " ".join(argv)
+
+
+def test_git_argv_trusts_the_repo_path_when_run_as_set():
+    # Run AS the project user, but the workspace is owned by the operator, so git
+    # would refuse without a scoped safe.directory. Scoped to THIS repo, never '*'.
+    argv = gc._git_argv("/srv/a", ["status", "--porcelain"], run_as="orcp-aaaaaaaaaaaa")
+    joined = " ".join(argv)
+    assert "-c safe.directory=/srv/a" in joined, argv
+    assert "safe.directory=*" not in joined
+
+
+def test_diff_flags_still_applied_under_sudo():
+    argv = gc._git_argv("/srv/a", ["diff", "HEAD"], run_as="orcp-aaaaaaaaaaaa")
+    assert "--no-ext-diff" in argv and "--no-textconv" in argv
+    assert argv[:4] == ["sudo", "-n", "-u", "orcp-aaaaaaaaaaaa"], argv
+
+
+def test_old_git_filter_refusal_lifts_only_when_run_as_set():
+    orig = gc._supports_attr_source
+    gc._supports_attr_source = lambda: False   # simulate git < 2.40
+    try:
+        assert gc._should_refuse_filter(run_as=None) is True
+        assert gc._should_refuse_filter(run_as="orcp-aaaaaaaaaaaa") is False
+    finally:
+        gc._supports_attr_source = orig
+
+
+def test_modern_git_never_refuses_filter():
+    orig = gc._supports_attr_source
+    gc._supports_attr_source = lambda: True    # git >= 2.40 neutralizes attributes
+    try:
+        assert gc._should_refuse_filter(run_as=None) is False
+        assert gc._should_refuse_filter(run_as="orcp-aaaaaaaaaaaa") is False
+    finally:
+        gc._supports_attr_source = orig
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

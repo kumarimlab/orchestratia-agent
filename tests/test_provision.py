@@ -58,26 +58,69 @@ def test_accepts_a_normal_workspace():
     assert pv.validate_workspace("/srv/acme") == "/srv/acme"
 
 
-def test_sudoers_line_is_pinned():
-    line = pv.sudoers_line("ubuntu", "orc-agent", "/usr/bin/tmux")
-    assert line == "ubuntu ALL=(orc-agent) NOPASSWD: /usr/bin/tmux", line
+def test_sudoers_lines_one_per_project_with_tmux_and_git():
+    projects = {"pid-A": {"user": "orcp-aaaaaaaaaaaa"},
+                "pid-B": {"user": "orcp-bbbbbbbbbbbb"}}
+    lines = pv.sudoers_lines("ubuntu", projects, "/usr/bin/tmux", "/usr/bin/git")
+    assert len(lines) == 2, lines
+    assert "ubuntu ALL=(orcp-aaaaaaaaaaaa) NOPASSWD: /usr/bin/tmux, /usr/bin/git" in lines
+    assert "ubuntu ALL=(orcp-bbbbbbbbbbbb) NOPASSWD: /usr/bin/tmux, /usr/bin/git" in lines
 
 
-def test_sudoers_line_refuses_bad_input():
+def test_sudoers_lines_refuses_bad_user():
     try:
-        pv.sudoers_line("ubuntu", "orc\nevil", "/usr/bin/tmux")
+        pv.sudoers_lines("ubuntu", {"p": {"user": "orc\nevil"}}, "/usr/bin/tmux", "/usr/bin/git")
     except pv.ProvisionError:
         return
-    raise AssertionError("sudoers_line must validate its inputs")
+    raise AssertionError("sudoers_lines must validate each project user")
 
 
-def test_sudoers_line_refuses_bad_tmux_path():
+def test_sudoers_lines_refuses_bad_tmux_path():
     for bad in ["tmux", "/usr/bin/tmux\nubuntu ALL=(ALL) NOPASSWD: ALL", "/usr/bin/tmux *"]:
         try:
-            pv.sudoers_line("ubuntu", "orc-agent", bad)
+            pv.sudoers_lines("ubuntu", {"p": {"user": "orcp-aaaaaaaaaaaa"}}, bad, "/usr/bin/git")
         except pv.ProvisionError:
             continue
         raise AssertionError(f"tmux path {bad!r} must be refused")
+
+
+def test_sudoers_lines_refuses_bad_git_path():
+    for bad in ["git", "/usr/bin/git; rm -rf /", "/usr/bin/git\nubuntu ALL=(ALL) NOPASSWD: ALL"]:
+        try:
+            pv.sudoers_lines("ubuntu", {"p": {"user": "orcp-aaaaaaaaaaaa"}}, "/usr/bin/tmux", bad)
+        except pv.ProvisionError:
+            continue
+        raise AssertionError(f"git path {bad!r} must be refused")
+
+
+def test_workspace_lockdown_removes_other_access():
+    """A world-readable workspace under a shared parent is readable by a SIBLING
+    project's user (each gets --x traverse on the parent). Removing 'other'
+    access on the workspace root blocks that traverse. Owner and the ACL-granted
+    project user are unaffected (they use owner bits / the named-user ACL)."""
+    cmd = pv.workspace_lockdown_command("/srv/acme")
+    assert cmd == ["chmod", "o=", "/srv/acme"], cmd
+
+
+def test_workspace_lockdown_validates_the_path():
+    for bad in ("relative", "/etc", "/srv/a\n/etc"):
+        try:
+            pv.workspace_lockdown_command(bad)
+        except pv.ProvisionError:
+            continue
+        raise AssertionError(f"{bad!r} must be refused")
+
+
+def test_collision_guard_refuses_reused_username_for_new_project():
+    existing = {"pid-A": {"user": "orcp-aaaaaaaaaaaa"}}
+    try:
+        pv.assert_no_collision("orcp-aaaaaaaaaaaa", "pid-B", existing)
+    except pv.ProvisionError:
+        pass
+    else:
+        raise AssertionError("must refuse a username already mapped to another project")
+    # re-provisioning the SAME project is fine (idempotent)
+    pv.assert_no_collision("orcp-aaaaaaaaaaaa", "pid-A", existing)
 
 
 def test_acl_commands_grant_the_workspace():

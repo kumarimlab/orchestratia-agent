@@ -62,10 +62,15 @@ def _git_baseline(working_dir: str) -> dict:
         return {"is_repo": False}
 
 
-def _priv_user_for(state, tier: str) -> str | None:
-    """OS user for a tier, or None. Never raises into the spawn path."""
+def _priv_user_for(state, tier: str, project_id: str | None) -> str | None:
+    """OS user for a tier+project, or None. Never raises into the spawn path.
+
+    None for a restricted tier means the project is not provisioned; the caller
+    treats that as "cannot deliver a confined session" and refuses rather than
+    running unconfined.
+    """
     try:
-        return privilege.resolve_user(tier, _tier_config(state))
+        return privilege.resolve_user(tier, project_id, _tier_config(state))
     except Exception:
         return None
 
@@ -671,7 +676,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                     key_file = None
                     session_token = msg.get("session_token")
                     if session_token and privilege_tier == "restricted":
-                        run_as = _priv_user_for(state, privilege_tier)
+                        run_as = _priv_user_for(state, privilege_tier, project_id)
                         key_file = session_env.write_session_key(
                             session_id, session_token, run_as or "")
                         if key_file:
@@ -1190,6 +1195,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                         sender, request_id, command,
                         msg.get("privilege_tier") or "standard",
                         _tier_config(state),
+                        msg.get("project_id"),
                     ))
 
             elif msg_type in ("fs_list_dir", "fs_read_file", "fs_write_file", "fs_stat"):
@@ -1871,15 +1877,23 @@ async def _handle_git_changes(state: DaemonState, sender, msg: dict):
     # Prefer the hub's stored working_directory; fall back to what spawn
     # authorised. Never guess — a wrong path silently reports "no changes",
     # which reads as "the agent did nothing".
+    sess = state.active_sessions.get(session_id)
+    handle = getattr(sess, "handle", None)
+    extra = getattr(handle, "extra", None) or {}
     if not working_dir:
-        sess = state.active_sessions.get(session_id)
-        handle = getattr(sess, "handle", None)
-        working_dir = (getattr(handle, "extra", None) or {}).get("cwd", "") or ""
+        working_dir = extra.get("cwd", "") or ""
+
+    # Run git AS the user the session actually spawned as (None for standard).
+    # Reading the stored run_as — rather than re-resolving from tier/project —
+    # guarantees the review runs as the SAME contained user the agent works as,
+    # with no chance of drift. A missing handle falls back to None, where the
+    # in-process git hardening (v0.28.2) still applies.
+    run_as = extra.get("run_as")
 
     try:
         from orchestratia_agent import git_changes as _gc
         result = await asyncio.get_event_loop().run_in_executor(
-            None, _gc.collect, working_dir, since
+            None, lambda: _gc.collect(working_dir, since, run_as)
         )
     except Exception as e:  # noqa: BLE001
         log.exception(f"git_changes failed for {session_id[:8]}")
@@ -1895,19 +1909,20 @@ async def _handle_git_changes(state: DaemonState, sender, msg: dict):
 
 async def _handle_remote_exec(sender, request_id: str, command: str,
                               privilege_tier: str = "standard",
-                              tier_config=None):
+                              tier_config=None, project_id: str | None = None):
     """Execute a command and return the result via WS.
 
-    Runs at the TARGET SESSION'S tier. Previously every remote_exec ran as the
-    daemon user regardless of which session it belonged to, so a confined
-    session could obtain an unconfined shell through the hub — the kernel
-    enforcement held right up until this one call.
+    Runs at the TARGET SESSION'S tier AND project. Previously every remote_exec
+    ran as the daemon user regardless of which session it belonged to, so a
+    confined session could obtain an unconfined shell through the hub — the
+    kernel enforcement held right up until this one call. A restricted tier now
+    resolves the session's own project user; an unprovisioned project is refused.
     """
     from orchestratia_agent import privilege as _priv
 
     tc = tier_config or _priv.load_tier_config({})
     try:
-        run_as = _priv.resolve_user(privilege_tier, tc)
+        run_as = _priv.resolve_user(privilege_tier, project_id, tc)
     except _priv.PrivilegeError as e:
         await sender({
             "type": "remote_exec_result", "request_id": request_id,

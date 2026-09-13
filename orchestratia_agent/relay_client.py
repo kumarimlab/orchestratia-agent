@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 
 import websockets
 
@@ -28,6 +29,56 @@ log = logging.getLogger("orchestratia-agent.relay_client")
 
 # session_id -> {"ws": ws, "task": task}
 _relays: dict[str, dict] = {}
+
+
+# Reconnection policy. A relay restart (deploy, autoheal) must not orphan a live
+# editor: without a retry the browser gets "502 editor is not connected" forever,
+# because nothing re-establishes the link until a new code_server_start.
+BASE_BACKOFF_SECONDS = 1.0
+MAX_BACKOFF_SECONDS = 30.0
+
+# Closes the relay uses to say "this session is not yours / is gone". Retrying
+# those is a pointless login storm — and honouring them is what lets this loop
+# terminate by itself once the editor session ends.
+PERMANENT_CLOSE_CODES = frozenset({4401, 4403})
+
+
+def backoff_for(attempt: int) -> float:
+    """Exponential backoff with jitter.
+
+    The jitter is not decoration: every agent loses its relay socket at the same
+    instant when the relay redeploys, so identical timers would have them all
+    reconnect in lockstep and hammer the tier as it comes back.
+    """
+    capped = min(BASE_BACKOFF_SECONDS * (2 ** max(0, attempt)), MAX_BACKOFF_SECONDS)
+    return capped * (0.5 + random.random() * 0.5)
+
+
+class RetryState:
+    """Backoff that resets once a connection actually succeeds.
+
+    Tracked separately from the loop so "we got through" is an explicit event:
+    an attempt counter that only grows leaves a recovered link crawling at the
+    ceiling for every later blip, which is slowest precisely when things are
+    working again.
+    """
+
+    def __init__(self) -> None:
+        self._attempt = 0
+
+    def failed(self) -> None:
+        self._attempt += 1
+
+    def connected(self) -> None:
+        self._attempt = 0
+
+    def next_delay(self) -> float:
+        return backoff_for(max(0, self._attempt - 1))
+
+
+def should_retry(close_code) -> bool:
+    """False only for closes that mean the session itself is no longer valid."""
+    return close_code not in PERMANENT_CLOSE_CODES
 
 
 async def handle_relay_message(msg: dict, *, pinned_port: int, ws_send, on_activity) -> None:
@@ -51,9 +102,12 @@ async def handle_relay_message(msg: dict, *, pinned_port: int, ws_send, on_activ
         close_tunnel(tid)
 
 
-async def _run(session_id: str, relay_url: str, api_key: str, pinned_port: int,
-               on_activity, ssl_ctx=None) -> None:
-    """Hold the relay WS and pump messages until it closes."""
+async def _attempt(session_id: str, relay_url: str, api_key: str, pinned_port: int,
+                   on_activity, ssl_ctx=None):
+    """One connect+pump cycle -> (connected, close_code).
+
+    `connected` distinguishes "the relay was unreachable" from "we were attached
+    and the link later dropped" — only the latter should reset the backoff."""
     target = f"{relay_url.rstrip('/')}/ws/relay"
     try:
         ws = await websockets.connect(
@@ -61,8 +115,8 @@ async def _run(session_id: str, relay_url: str, api_key: str, pinned_port: int,
             ping_interval=30, ping_timeout=10, max_size=2 ** 22,
         )
     except Exception as e:  # noqa: BLE001
-        log.error("relay connect failed for session %s: %s", session_id[:8], e)
-        return
+        log.warning("relay connect failed for session %s: %s", session_id[:8], e)
+        return False, None
 
     async def ws_send(m: dict) -> bool:
         try:
@@ -83,15 +137,46 @@ async def _run(session_id: str, relay_url: str, api_key: str, pinned_port: int,
                 continue
             await handle_relay_message(msg, pinned_port=pinned_port,
                                        ws_send=ws_send, on_activity=on_activity)
-    except websockets.exceptions.ConnectionClosed:
-        log.info("relay connection closed for session %s", session_id[:8])
+        return True, None
+    except websockets.exceptions.ConnectionClosed as e:
+        code = getattr(e, "code", None) or getattr(getattr(e, "rcvd", None), "code", None)
+        log.info("relay connection closed for session %s (code=%s)", session_id[:8], code)
+        return True, code
     except Exception as e:  # noqa: BLE001
         log.error("relay loop error for session %s: %s", session_id[:8], e)
+        return True, None
     finally:
         try:
             await ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _run(session_id: str, relay_url: str, api_key: str, pinned_port: int,
+               on_activity, ssl_ctx=None) -> None:
+    """Keep the relay link up for as long as this editor session is valid.
+
+    Ends only on a permanent rejection (the relay saying the session is not ours
+    or is gone) or on cancellation from disconnect().
+    """
+    state = RetryState()
+    while True:
+        connected, code = await _attempt(session_id, relay_url, api_key,
+                                         pinned_port, on_activity, ssl_ctx)
+        if not should_retry(code):
+            log.info("relay: session %s rejected (code=%s) — not retrying",
+                     session_id[:8], code)
+            return
+        if connected:
+            state.connected()
+        else:
+            state.failed()
+        delay = state.next_delay()
+        log.info("relay: reconnecting session %s in %.1fs", session_id[:8], delay)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
 
 
 def connect(session_id: str, relay_url: str, api_key: str, pinned_port: int,

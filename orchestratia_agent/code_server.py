@@ -63,6 +63,27 @@ def reap_idle(running: set[str]) -> list[str]:
     return idle
 
 
+def cfg_dir_for(user: str, project_id: str) -> str:
+    """Private code-server state, inside the home of the user it RUNS as.
+
+    This used to be built from os.path.expanduser("~") — the DAEMON's home —
+    while code-server runs as orcp-<project>. The daemon home is 0755 and owned
+    by the daemon user, so code-server could not write there and started
+    degraded: "Could not create socket ... code-server-ipc.sock", and an
+    extensions dir it cannot populate.
+
+    It is also an isolation boundary, not only a permissions one: a single tree
+    under the daemon's home would hold every project's editor state together,
+    which is exactly what the per-project users exist to prevent.
+    """
+    import pwd
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        home = os.path.join("/home", user)
+    return os.path.join(home, ".orchestratia", "code-server", project_id[:12])
+
+
 def spawn_argv(user: str, port: int, workspace: str, cfg_dir: str) -> list[str]:
     """The locked-down argv to launch code-server as `user` on loopback:`port`.
 
@@ -151,8 +172,11 @@ def start(project_id: str, workspace: str, tc) -> int:
     cwd = p.verify_workspace("restricted", workspace, project_id, tc)
 
     port = _free_loopback_port()
-    cfg_dir = os.path.join(os.path.expanduser("~"), ".orchestratia", "code-server", project_id[:12])
-    os.makedirs(cfg_dir, exist_ok=True)
+    cfg_dir = cfg_dir_for(user, project_id)
+    # Deliberately NOT created here. The daemon cannot write into the restricted
+    # user's home (0750, owned by that user), and creating it via sudo would mean
+    # widening the tier sudoers rule beyond tmux/git/code-server for a mkdir.
+    # code-server creates both dirs as itself on first start.
 
     argv = spawn_argv(user, port, cwd, cfg_dir)
     # start_new_session so stop() can signal the whole process group, and so a

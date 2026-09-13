@@ -230,6 +230,30 @@ def test_rejects_symlinked_workspace():
         _rejects(pv.validate_workspace, link, "a symlinked workspace must be refused")
 
 
+
+def test_provision_creates_exactly_the_dir_code_server_will_use():
+    """Provisioning must pre-create the editor state dir, and it must be the SAME
+    path code_server passes as --user-data-dir.
+
+    code-server does not create the parents of --user-data-dir; it warns
+    ("Could not create socket ...") and runs degraded with an unusable
+    extensions dir. The daemon cannot create it either — the project home is
+    0750 owned by that user — and the tier sudoers rule is deliberately limited
+    to tmux/git/code-server, so a `sudo mkdir` is not available and widening the
+    rule for a mkdir would be the wrong trade. Provisioning already runs as
+    root, so that is where the directory belongs.
+
+    The failure mode if these two ever drift is silent: the editor still starts,
+    still serves, and is quietly degraded. So assert they agree.
+    """
+    from orchestratia_agent import code_server as cs
+    user = "orcp-a1b2c3d45e6f"
+    root = pv.editor_state_root(user)
+    assert root.startswith("/home/" + user + "/"), root
+    cfg = cs.cfg_dir_for(user, "01690d2f-47c6-4d37-b787-27904723922b")
+    assert cfg.startswith(root.rstrip("/") + "/"), f"{cfg} not under {root}"
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

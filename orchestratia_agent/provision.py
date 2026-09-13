@@ -269,6 +269,39 @@ def _run(argv: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return result
 
 
+def editor_state_root(user: str) -> str:
+    """Root of the project user's private code-server state.
+
+    MUST stay in step with code_server.cfg_dir_for(), which passes a subdirectory
+    of this as --user-data-dir. code-server does NOT create the parents of that
+    flag: it warns "Could not create socket ..." and runs degraded with an
+    unusable extensions dir. Tests assert the two agree, because the drift
+    failure is silent — the editor still starts and still serves.
+    """
+    import pwd
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        home = os.path.join("/home", user)
+    return os.path.join(home, ".orchestratia", "code-server")
+
+
+def _ensure_editor_state_dir(user: str) -> None:
+    """Create it as root and hand it to the project user.
+
+    Neither the daemon (home is 0750, owned by the project user) nor a sudo call
+    can do this: the tier sudoers rule is deliberately only tmux/git/code-server,
+    and widening it for a mkdir would trade a real boundary for a convenience.
+    Provisioning already runs as root, so it belongs here.
+    """
+    root = editor_state_root(user)
+    os.makedirs(root, exist_ok=True)
+    parent = os.path.dirname(root)
+    _run(["chown", "-R", f"{user}:{user}", parent])
+    os.chmod(root, 0o700)
+    print(f"  editor state dir {root}")
+
+
 def provision(project_id: str, workspaces: list[str],
               daemon_user: str, config_path: str,
               code_server_path: str | None = None) -> int:
@@ -351,6 +384,7 @@ def provision(project_id: str, workspaces: list[str],
     _run(["passwd", "-l", user], check=False)
     _strip_supplementary_groups(user)
     _assert_unprivileged(user)
+    _ensure_editor_state_dir(user)
 
     # 2. Workspace ACLs for THIS project's workspaces.
     home_roots = [h for h in ("/home", "/Users") if os.path.isdir(h)]

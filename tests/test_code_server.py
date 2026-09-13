@@ -189,6 +189,32 @@ def test_hub_code_server_start_launches_and_bridges():
        "sess-1" in hub._editor_sessions.get("pid-A", set()))
 
 
+
+def test_private_dirs_live_in_the_project_users_own_home():
+    """The editor's data/extension dirs must sit under the user code-server RUNS
+    as, not the daemon's home.
+
+    They were built from os.path.expanduser("~"), which is the DAEMON's home.
+    code-server then runs as orcp-<project> and cannot write there (the daemon
+    home is 755 and owned by the daemon user), so it starts degraded: no IPC
+    socket, unusable extensions dir. Observed live on staging 2026-09-13.
+
+    It is also an isolation point, not just a permissions one: one shared tree
+    under the daemon's home would put every project's editor state in the same
+    place, which is precisely what the per-project users exist to prevent.
+    """
+    d = cs.cfg_dir_for("orcp-a1b2c3d45e6f", "01690d2f-47c6-4d37-b787-27904723922b")
+    ok("cfg dir is under the PROJECT user's home",
+       d.startswith("/home/orcp-a1b2c3d45e6f/"), d)
+    ok("cfg dir is NOT under the daemon user's home",
+       os.path.expanduser("~") not in d or not d.startswith(os.path.expanduser("~") + "/"), d)
+    ok("cfg dir is per-project, not shared",
+       "01690d2f-47c" in d, d)
+
+    other = cs.cfg_dir_for("orcp-ffffffffffff", "99999999-4c6d-4d37-b787-279047239999")
+    ok("different projects get different dirs", d != other)
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

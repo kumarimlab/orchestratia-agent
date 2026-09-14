@@ -37,6 +37,15 @@ FORBIDDEN_TREES = (
 # tree would cover every project on the box.
 FORBIDDEN_EXACT = {"/", "/home", "/srv", "/opt", "/tmp", "/var", "/mnt", "/media"}
 
+# Credential STORES, not tool folders: project repos routinely contain `.claude/` and
+# `.orchestratia/` (settings, memory), so those are matched on the secret itself.
+SENSITIVE_ENTRIES = (".ssh", ".gnupg", ".aws", ".kube",
+                     os.path.join(".config", "gcloud"),
+                     os.path.join(".docker", "config.json"),
+                     os.path.join(".claude", ".credentials.json"),
+                     os.path.join(".orchestratia", "ssh_keys"))
+ORCHESTRATIA_PATHS = ("/opt/orchestratia-agent", "/opt/orchestratia-venv")
+
 RESERVED_USERS = {"root", "daemon", "bin", "sys", "adm", "sudo", "docker"}
 
 # NOT a denylist. A denylist of "the dangerous groups" missed lxd (container
@@ -111,7 +120,38 @@ def validate_workspace(path: str) -> str:
                 f"refusing to grant {resolved!r}: it is inside {tree!r}, "
                 f"which would defeat the tier"
             )
+    # A recursive rwX ACL on a home directory hands the restricted user that home's
+    # ~/.ssh — a path to the daemon user and then root. Grant a project folder inside.
+    if resolved in _home_dirs():
+        raise ProvisionError(
+            f"refusing to grant {resolved!r}: it is a user's home directory — granting it "
+            f"would expose ~/.ssh and other credentials; grant a project folder inside it"
+        )
+    _validate_not_orchestratia(resolved)
+    for entry in SENSITIVE_ENTRIES:
+        if os.path.lexists(os.path.join(resolved, entry)):
+            raise ProvisionError(f"refusing to grant {resolved!r}: it contains {entry} (credentials)")
     return resolved
+
+
+def _home_dirs() -> set[str]:
+    """Every login home on the box (plus /root and the caller's own)."""
+    import pwd
+    homes = {"/root"}
+    for pw in pwd.getpwall():
+        if pw.pw_dir and pw.pw_dir.startswith(("/home/", "/Users/")):
+            homes.add(os.path.realpath(pw.pw_dir))
+    try:
+        homes.add(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+    except KeyError:
+        pass
+    return homes
+
+
+def _validate_not_orchestratia(resolved: str) -> None:
+    for root in ORCHESTRATIA_PATHS:
+        if _is_within(resolved, root):
+            raise ProvisionError(f"refusing to grant {resolved!r}: it is part of Orchestratia's own install")
 
 
 def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: str,

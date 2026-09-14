@@ -254,6 +254,57 @@ def test_provision_creates_exactly_the_dir_code_server_will_use():
     assert cfg.startswith(root.rstrip("/") + "/"), f"{cfg} not under {root}"
 
 
+# ── locked-down workspaces must not hand out the daemon user's credentials ────
+# A recursive rwX ACL on /home/<user> gave the restricted user ~/.ssh — a path to
+# the daemon user and from there root. Found 2026-09-14.
+
+def test_workspace_refuses_home_dirs_and_credential_stores():
+    import shutil
+    import tempfile
+    base = tempfile.mkdtemp()
+    home = os.path.join(base, "home-ubuntu")
+    os.makedirs(os.path.join(home, "app"))
+    creds = os.path.join(base, "with-ssh")
+    os.makedirs(os.path.join(creds, ".ssh"))
+    gcloud = os.path.join(base, "with-gcloud")
+    os.makedirs(os.path.join(gcloud, ".config", "gcloud"))
+    claude = os.path.join(base, "with-claude-creds")
+    os.makedirs(os.path.join(claude, ".claude"))
+    open(os.path.join(claude, ".claude", ".credentials.json"), "w").close()
+    repo = os.path.join(base, "repo")
+    os.makedirs(os.path.join(repo, ".claude"))
+    os.makedirs(os.path.join(repo, ".orchestratia", "memory"))
+    saved = pv._home_dirs
+    try:
+        pv._home_dirs = lambda: {home}
+        _rejects(pv.validate_workspace, home, "a user's home directory must be refused")
+        _rejects(pv.validate_workspace, creds, "a folder containing .ssh must be refused")
+        _rejects(pv.validate_workspace, gcloud, "a folder containing .config/gcloud must be refused")
+        _rejects(pv.validate_workspace, claude, "a folder holding Claude credentials must be refused")
+        assert pv.validate_workspace(os.path.join(home, "app")) == os.path.join(home, "app"), \
+            "a project folder inside a home is fine"
+        assert pv.validate_workspace(repo) == repo, \
+            "a repo with project .claude/ and .orchestratia/ folders is fine"
+        os.makedirs(os.path.join(repo, ".orchestratia", "ssh_keys"))
+        _rejects(pv.validate_workspace, repo, "a folder holding Orchestratia ssh keys must be refused")
+    finally:
+        pv._home_dirs = saved
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_workspace_refuses_orchestratia_install_paths():
+    _rejects(pv._validate_not_orchestratia, "/opt/orchestratia-agent", "the agent checkout must be refused")
+    _rejects(pv._validate_not_orchestratia, "/opt/orchestratia-venv/lib", "the agent venv must be refused")
+    pv._validate_not_orchestratia("/opt/orchestratia-agent-extra")   # a sibling name is not inside
+
+
+def test_home_dirs_come_from_the_password_database():
+    import pwd
+    homes = pv._home_dirs()
+    assert "/root" in homes, "/root is a home"
+    assert os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir) in homes, "this user's home is included"
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

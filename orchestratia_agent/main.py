@@ -67,6 +67,8 @@ async def main():
             "  orchestratia-agent --debug                 Start with debug logging\n"
             "  sudo orchestratia-agent provision-tier --project <id> \\\n"
             "       --workspace /srv/acme                 Provision a project's restricted tier\n"
+            "  sudo orchestratia-agent provision-tier --project <id> \\\n"
+            "       --revoke-workspace /srv/acme          Take a workspace grant away\n"
         ),
     )
     parser.add_argument(
@@ -83,6 +85,10 @@ async def main():
     parser.add_argument(
         "--workspace", action="append", default=[], metavar="DIR",
         help="Directory the restricted tier may work in (repeatable)",
+    )
+    parser.add_argument(
+        "--revoke-workspace", action="append", default=[], metavar="DIR",
+        help="Take a workspace grant away from the restricted tier (repeatable)",
     )
     parser.add_argument(
         "--code-server-path", default=None, metavar="PATH",
@@ -127,11 +133,20 @@ async def main():
             sys.exit(1)
 
     if args.provision_tier == "provision-tier":
-        from orchestratia_agent.provision import provision, ProvisionError
+        from orchestratia_agent.provision import provision, revoke, ProvisionError
         if not args.project:
             log.error("provision-tier: --project <id> is required (a restricted "
                       "user belongs to a project)")
             sys.exit(2)
+        if args.revoke_workspace:
+            if args.workspace:
+                log.error("provision-tier: use --workspace or --revoke-workspace, not both")
+                sys.exit(2)
+            try:
+                sys.exit(revoke(args.project, args.revoke_workspace, args.config))
+            except ProvisionError as e:
+                log.error(f"provision-tier: {e}")
+                sys.exit(1)
         daemon_user = (args.daemon_user or os.environ.get("SUDO_USER")
                        or getpass.getuser())
         try:

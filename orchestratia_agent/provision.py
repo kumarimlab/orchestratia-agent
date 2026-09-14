@@ -21,6 +21,7 @@ USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 # An absolute path, no whitespace, no sudoers metacharacters.
 TMUX_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
 GIT_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
+BIN_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")   # code-server et al.
 
 # Granting any of these -- OR ANYTHING BENEATH THEM -- would hand back what the
 # tier removes. Checked as ancestors, not as exact strings: an exact-match test
@@ -113,16 +114,17 @@ def validate_workspace(path: str) -> str:
     return resolved
 
 
-def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: str) -> list[str]:
+def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: str,
+                  code_server_path: str | None = None) -> list[str]:
     """One pinned, downward-only rule per project user.
 
-    Each line permits exactly tmux and git as that project's user — nothing else,
-    no wildcards, no shell, no ALL target. git is included so `git_changes` can
-    inspect a repo AS the session's own unprivileged user (the version-agnostic
-    backstop for the repo-config code-exec class; see the git_changes hardening).
+    Each line permits exactly tmux, git, and (when provided) code-server as that
+    project's user — nothing else, no wildcards, no shell, no ALL target. git is
+    included so `git_changes` can inspect a repo AS the session's own
+    unprivileged user; code-server so the editor runs as that user too.
 
     Still not an escalation: every orcp-* user has strictly LESS power than the
-    daemon user, so letting the daemon run tmux/git as one is a downward move.
+    daemon user, so letting the daemon run these as one is a downward move.
 
     The caller joins these with newlines into a drop-in and validates the whole
     file with `visudo -cf` before moving it into place — the belt to this
@@ -133,10 +135,15 @@ def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: st
         raise ProvisionError(f"invalid tmux path {tmux_path!r}")
     if not isinstance(git_path, str) or not GIT_PATH_RE.match(git_path):
         raise ProvisionError(f"invalid git path {git_path!r}")
+    cmds = f"{tmux_path}, {git_path}"
+    if code_server_path:
+        if not BIN_PATH_RE.match(code_server_path):
+            raise ProvisionError(f"invalid code-server path {code_server_path!r}")
+        cmds += f", {code_server_path}"
     lines = []
     for spec in projects.values():
         user = validate_username((spec or {}).get("user"))
-        lines.append(f"{daemon_user} ALL=({user}) NOPASSWD: {tmux_path}, {git_path}")
+        lines.append(f"{daemon_user} ALL=({user}) NOPASSWD: {cmds}")
     return lines
 
 
@@ -262,8 +269,42 @@ def _run(argv: list[str], check: bool = True) -> subprocess.CompletedProcess:
     return result
 
 
+def editor_state_root(user: str) -> str:
+    """Root of the project user's private code-server state.
+
+    MUST stay in step with code_server.cfg_dir_for(), which passes a subdirectory
+    of this as --user-data-dir. code-server does NOT create the parents of that
+    flag: it warns "Could not create socket ..." and runs degraded with an
+    unusable extensions dir. Tests assert the two agree, because the drift
+    failure is silent — the editor still starts and still serves.
+    """
+    import pwd
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        home = os.path.join("/home", user)
+    return os.path.join(home, ".orchestratia", "code-server")
+
+
+def _ensure_editor_state_dir(user: str) -> None:
+    """Create it as root and hand it to the project user.
+
+    Neither the daemon (home is 0750, owned by the project user) nor a sudo call
+    can do this: the tier sudoers rule is deliberately only tmux/git/code-server,
+    and widening it for a mkdir would trade a real boundary for a convenience.
+    Provisioning already runs as root, so it belongs here.
+    """
+    root = editor_state_root(user)
+    os.makedirs(root, exist_ok=True)
+    parent = os.path.dirname(root)
+    _run(["chown", "-R", f"{user}:{user}", parent])
+    os.chmod(root, 0o700)
+    print(f"  editor state dir {root}")
+
+
 def provision(project_id: str, workspaces: list[str],
-              daemon_user: str, config_path: str) -> int:
+              daemon_user: str, config_path: str,
+              code_server_path: str | None = None) -> int:
     """Provision ONE project's restricted user. Additive, idempotent. Root only.
 
     Derives the OS user deterministically from project_id, refuses a hash
@@ -301,6 +342,10 @@ def provision(project_id: str, workspaces: list[str],
     git_path = shutil.which("git")
     if not git_path:
         raise ProvisionError("git not found; the restricted tier requires it")
+    # code-server is OPTIONAL: if present (or explicitly given) the editor is
+    # enabled for this box's projects; if absent, the tier is tmux+git only and
+    # no editor is advertised.
+    cs_path = code_server_path or shutil.which("code-server")
     if not shutil.which("setfacl"):
         raise ProvisionError(
             "setfacl not found; install the 'acl' package "
@@ -326,7 +371,8 @@ def provision(project_id: str, workspaces: list[str],
     # set now means bad input fails before any user/ACL/file change.
     merged_projects = dict(existing_projects)
     merged_projects[project_id] = {"user": user, "workspaces": spaces}
-    lines = sudoers_lines(daemon_user, merged_projects, tmux_path, git_path)
+    lines = sudoers_lines(daemon_user, merged_projects, tmux_path, git_path,
+                          code_server_path=cs_path)
 
     # 1. The user: no login password, and explicitly none of the escalation groups.
     if _run(["id", user], check=False).returncode != 0:
@@ -338,6 +384,7 @@ def provision(project_id: str, workspaces: list[str],
     _run(["passwd", "-l", user], check=False)
     _strip_supplementary_groups(user)
     _assert_unprivileged(user)
+    _ensure_editor_state_dir(user)
 
     # 2. Workspace ACLs for THIS project's workspaces.
     home_roots = [h for h in ("/home", "/Users") if os.path.isdir(h)]
@@ -376,6 +423,8 @@ def provision(project_id: str, workspaces: list[str],
     priv["projects"] = merged_projects
     priv["tmux_path"] = tmux_path
     priv["git_path"] = git_path
+    if cs_path:
+        priv["code_server_path"] = cs_path      # enables the editor capability
     priv.pop("restricted_user", None)   # drop any legacy flat keys once migrated
     priv.pop("workspaces", None)
     cfg["privilege"] = priv

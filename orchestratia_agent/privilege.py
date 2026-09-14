@@ -85,6 +85,7 @@ class TierConfig:
     projects: dict            # project_id (or LEGACY_KEY) -> ProjectTier
     tmux_path: str
     git_path: str
+    code_server_path: str | None = None   # set iff code-server is available on this box
 
 
 def load_tier_config(cfg: dict) -> TierConfig:
@@ -114,7 +115,8 @@ def load_tier_config(cfg: dict) -> TierConfig:
             "restricted sessions are refused until then"
         )
 
-    return TierConfig(projects=projects, tmux_path=tmux_path, git_path=git_path)
+    return TierConfig(projects=projects, tmux_path=tmux_path, git_path=git_path,
+                      code_server_path=block.get("code_server_path") or None)
 
 
 def _real_projects(tc: TierConfig) -> list[str]:
@@ -251,4 +253,9 @@ def merge_capabilities(existing: dict | None, tc: TierConfig) -> dict:
     """
     merged = dict(existing or {})
     merged["privilege"] = capability_payload(tc)
+    # code-server is a per-box capability (one binary); when present, the editor
+    # is available for every provisioned project. The hub offers the editor only
+    # where this appears (editor_service.has_code_server).
+    if tc.code_server_path:
+        merged["code_server"] = {"projects": _real_projects(tc)}
     return merged

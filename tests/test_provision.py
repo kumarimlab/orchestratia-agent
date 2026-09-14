@@ -111,6 +111,31 @@ def test_workspace_lockdown_validates_the_path():
         raise AssertionError(f"{bad!r} must be refused")
 
 
+def test_sudoers_lines_include_code_server_when_provided():
+    projects = {"p": {"user": "orcp-aaaaaaaaaaaa"}}
+    line = pv.sudoers_lines("ubuntu", projects, "/usr/bin/tmux", "/usr/bin/git",
+                            code_server_path="/usr/bin/code-server")[0]
+    assert line == ("ubuntu ALL=(orcp-aaaaaaaaaaaa) NOPASSWD: "
+                    "/usr/bin/tmux, /usr/bin/git, /usr/bin/code-server"), line
+
+
+def test_sudoers_lines_omit_code_server_when_absent():
+    projects = {"p": {"user": "orcp-aaaaaaaaaaaa"}}
+    line = pv.sudoers_lines("ubuntu", projects, "/usr/bin/tmux", "/usr/bin/git")[0]
+    assert line.endswith("/usr/bin/git"), line
+    assert "code-server" not in line
+
+
+def test_sudoers_lines_reject_bad_code_server_path():
+    try:
+        pv.sudoers_lines("ubuntu", {"p": {"user": "orcp-aaaaaaaaaaaa"}},
+                         "/usr/bin/tmux", "/usr/bin/git",
+                         code_server_path="/usr/bin/code-server; rm -rf /")
+    except pv.ProvisionError:
+        return
+    raise AssertionError("bad code-server path must be refused")
+
+
 def test_collision_guard_refuses_reused_username_for_new_project():
     existing = {"pid-A": {"user": "orcp-aaaaaaaaaaaa"}}
     try:
@@ -203,6 +228,30 @@ def test_rejects_symlinked_workspace():
         link = os.path.join(td, "link")
         os.symlink("/etc", link)
         _rejects(pv.validate_workspace, link, "a symlinked workspace must be refused")
+
+
+
+def test_provision_creates_exactly_the_dir_code_server_will_use():
+    """Provisioning must pre-create the editor state dir, and it must be the SAME
+    path code_server passes as --user-data-dir.
+
+    code-server does not create the parents of --user-data-dir; it warns
+    ("Could not create socket ...") and runs degraded with an unusable
+    extensions dir. The daemon cannot create it either — the project home is
+    0750 owned by that user — and the tier sudoers rule is deliberately limited
+    to tmux/git/code-server, so a `sudo mkdir` is not available and widening the
+    rule for a mkdir would be the wrong trade. Provisioning already runs as
+    root, so that is where the directory belongs.
+
+    The failure mode if these two ever drift is silent: the editor still starts,
+    still serves, and is quietly degraded. So assert they agree.
+    """
+    from orchestratia_agent import code_server as cs
+    user = "orcp-a1b2c3d45e6f"
+    root = pv.editor_state_root(user)
+    assert root.startswith("/home/" + user + "/"), root
+    cfg = cs.cfg_dir_for(user, "01690d2f-47c6-4d37-b787-27904723922b")
+    assert cfg.startswith(root.rstrip("/") + "/"), f"{cfg} not under {root}"
 
 
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

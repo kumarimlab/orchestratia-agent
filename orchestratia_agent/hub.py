@@ -1122,6 +1122,24 @@ async def ws_receive_loop(ws, state: DaemonState):
                         from orchestratia_agent.tunnel import close_tunnel
                         close_tunnel(tunnel_id)
 
+            elif msg_type == "code_server_start":
+                session_id = msg.get("session_id")
+                project_id = msg.get("project_id")
+                working_dir = msg.get("working_directory")
+                relay_url = msg.get("relay_url") or state.config.get("relay_url")
+                if session_id and project_id and working_dir and relay_url:
+                    asyncio.create_task(_handle_code_server_start(
+                        state, session_id, project_id, working_dir, relay_url))
+                else:
+                    log.warning("code_server_start missing fields (need session_id, "
+                                "project_id, working_directory, relay_url)")
+
+            elif msg_type == "code_server_stop":
+                session_id = msg.get("session_id")
+                if session_id:
+                    asyncio.create_task(_handle_code_server_stop(
+                        session_id, msg.get("project_id"), state))
+
             # ── SSH Access Grant Messages ──
             # All ssh_setup helpers are synchronous and shell out to
             # `sudo`. Calling them directly from this async receive loop
@@ -1860,6 +1878,122 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
 
     response = {"type": result_type, "request_id": request_id, **result}
     await sender(response)
+
+
+# Editor project_id -> set of live editor session_ids, so the idle reaper can
+# tear down every relay bridge for a project it stops.
+_editor_sessions: dict[str, set] = {}
+# session_id -> (workspace, run_as). Needed at close to diff against the baseline;
+# the stop message carries only ids.
+_editor_workspaces: dict[str, tuple] = {}
+_editor_reaper_task = None
+
+
+def _ensure_editor_reaper(state: DaemonState):
+    """Start the idle reaper once, lazily (first editor open)."""
+    global _editor_reaper_task
+    if _editor_reaper_task is None or _editor_reaper_task.done():
+        _editor_reaper_task = asyncio.create_task(_editor_reaper_loop(state))
+
+
+async def _editor_reaper_loop(state: DaemonState):
+    """Stop code-servers idle past the threshold and drop their relay bridges.
+
+    Idle is activity-based (code_server.reap_idle) — a presence check would never
+    fire because code-server holds its WS open."""
+    from orchestratia_agent import code_server, relay_client
+    while getattr(state, "running", True):
+        await asyncio.sleep(60)
+        try:
+            for pid in code_server.reap_idle(code_server.running_projects()):
+                for sid in list(_editor_sessions.get(pid, set())):
+                    await relay_client.disconnect(sid)
+                _editor_sessions.pop(pid, None)
+                code_server.stop(pid)
+                log.info("editor idle-stopped: project %s", pid[:12])
+        except Exception:
+            log.exception("editor reaper error")
+
+
+async def _handle_code_server_start(state: DaemonState, session_id: str,
+                                    project_id: str, working_dir: str, relay_url: str):
+    """Start code-server for a project and bridge it to the relay tier."""
+    from orchestratia_agent import code_server, relay_client, privilege
+    tc = _tier_config(state)
+    try:
+        port = code_server.start(project_id, working_dir, tc)
+    except privilege.PrivilegeError as e:
+        log.error("code_server_start refused for %s: %s", session_id[:8], e)
+        return
+    _editor_sessions.setdefault(project_id, set()).add(session_id)
+    # An editor has no PTY recording, so its audit evidence is the git diff it
+    # leaves behind. Capture the BEFORE state now; the hub stores it write-once.
+    # Run as the project user: git in a workspace we do not own can execute
+    # repo-controlled code, which is the whole point of the tier.
+    # code_server.start() resolves the project user internally, so resolve it
+    # again here rather than assume a name: git must run AS that user, not as the
+    # daemon — a workspace we do not own can execute repo-controlled code, which
+    # is the entire reason the tier exists.
+    try:
+        editor_user = privilege.resolve_user("restricted", project_id, tc)
+    except Exception:  # noqa: BLE001
+        editor_user = None
+    _editor_workspaces[session_id] = (working_dir, editor_user)
+    try:
+        from orchestratia_agent import git_changes
+        base = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: git_changes.baseline(working_dir, editor_user))
+        sent_ok = await ws_send(state, {"type": "editor_evidence",
+                                        "session_id": session_id,
+                                        "git_baseline": base})
+        log.info("editor baseline for %s: repo=%s sent=%s",
+                 session_id[:8], base.get("is_repo"), sent_ok)
+    except Exception as e:  # noqa: BLE001
+        log.warning("editor baseline failed for session %s: %s", session_id[:8], e)
+    _ensure_editor_reaper(state)
+    from orchestratia_agent.tls import build_ssl_context
+    ssl_ctx = build_ssl_context(state=state)
+    relay_client.connect(
+        session_id, relay_url, state.api_key, port,
+        on_activity=lambda: code_server.note_activity(project_id),
+        ssl_ctx=ssl_ctx,
+    )
+    log.info("editor started: session %s project %s -> relay", session_id[:8], project_id[:12])
+
+
+async def _handle_code_server_stop(session_id: str, project_id: str | None,
+                                   state=None):
+    """Tear down one editor session's relay bridge; stop code-server when the
+    project has no more live editor sessions."""
+    from orchestratia_agent import code_server, relay_client
+
+    # Snapshot the diff BEFORE tearing anything down — this is the session's only
+    # audit evidence, and a close frequently happens with nobody watching
+    # (idle-stop, grant expiry, revocation), so it has to be pushed rather than
+    # waited for.
+    ws = _editor_workspaces.pop(session_id, None)
+    if ws and state is not None:
+        workspace, run_as = ws
+        try:
+            from orchestratia_agent import git_changes
+            changes = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: git_changes.collect(workspace, "", run_as))
+            sent_ok = await ws_send(state, {"type": "editor_evidence",
+                                            "session_id": session_id,
+                                            "git_changes": changes})
+            log.info("editor diff for %s: files=%d sent=%s", session_id[:8],
+                     len(changes.get("files") or []), sent_ok)
+        except Exception as e:  # noqa: BLE001
+            log.warning("editor diff failed for session %s: %s", session_id[:8], e)
+
+    await relay_client.disconnect(session_id)
+    if project_id:
+        sids = _editor_sessions.get(project_id)
+        if sids:
+            sids.discard(session_id)
+            if not sids:
+                _editor_sessions.pop(project_id, None)
+                code_server.stop(project_id)
 
 
 async def _handle_git_changes(state: DaemonState, sender, msg: dict):

@@ -88,6 +88,12 @@ PRIVILEGE_CLASSIFICATION = {
     # Scanning.
     "scan_architecture": UNCONFINED,
 
+    # code-server editor. start spawns code-server AS the project's restricted
+    # OS user (kernel-bounded to that tier, Spec A) — tier_bounded, not
+    # unconfined. stop only signals that process group; it grants no execution.
+    "code_server_start": TIER_BOUNDED,
+    "code_server_stop": NO_EXECUTION,
+
     # Keepalive.
     "pong": NO_EXECUTION,
 }

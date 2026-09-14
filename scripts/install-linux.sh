@@ -745,6 +745,16 @@ else
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
 fi
 
+# Step 5b: pre-fetch the code editor (optional, non-fatal).
+# The agent downloads a pinned, checksum-verified code-server into the service user's
+# home on first use anyway; doing it here makes the first "Open Editor" instant.
+info "Preparing the code editor (optional)..."
+if sudo -u "$RUN_USER" "$AGENT_BIN" ensure-code-server >/dev/null 2>&1; then
+    ok "Code editor ready"
+else
+    warn "Code editor not pre-installed — it will download the first time you open it"
+fi
+
 # Step 6: AI Agent integration (Claude Code, Gemini CLI, Codex CLI)
 #
 # Architecture: git-clone the repo to /opt/orchestratia-agent and

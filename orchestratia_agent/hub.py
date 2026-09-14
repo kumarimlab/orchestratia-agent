@@ -1880,10 +1880,7 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
     await sender(response)
 
 
-# Editor project_id -> set of live editor session_ids, so the idle reaper can
-# tear down every relay bridge for a project it stops.
-_editor_sessions: dict[str, set] = {}
-# session_id -> (workspace, run_as). Needed at close to diff against the baseline;
+# Editor session_id -> (workspace, run_as). Needed at close to diff against the baseline;
 # the stop message carries only ids.
 _editor_workspaces: dict[str, tuple] = {}
 _editor_reaper_task = None
@@ -1905,12 +1902,10 @@ async def _editor_reaper_loop(state: DaemonState):
     while getattr(state, "running", True):
         await asyncio.sleep(60)
         try:
-            for pid in code_server.reap_idle(code_server.running_projects()):
-                for sid in list(_editor_sessions.get(pid, set())):
-                    await relay_client.disconnect(sid)
-                _editor_sessions.pop(pid, None)
-                code_server.stop(pid)
-                log.info("editor idle-stopped: project %s", pid[:12])
+            for sid in code_server.reap_idle(code_server.running_sessions()):
+                await relay_client.disconnect(sid)
+                code_server.stop(sid)
+                log.info("editor idle-stopped: session %s", sid[:8])
         except Exception:
             log.exception("editor reaper error")
 
@@ -1921,11 +1916,10 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
     from orchestratia_agent import code_server, relay_client, privilege
     tc = _tier_config(state)
     try:
-        port = code_server.start(project_id, working_dir, tc)
+        port = code_server.start(session_id, project_id, working_dir, "restricted", tc)
     except privilege.PrivilegeError as e:
         log.error("code_server_start refused for %s: %s", session_id[:8], e)
         return
-    _editor_sessions.setdefault(project_id, set()).add(session_id)
     # An editor has no PTY recording, so its audit evidence is the git diff it
     # leaves behind. Capture the BEFORE state now; the hub stores it write-once.
     # Run as the project user: git in a workspace we do not own can execute
@@ -1955,7 +1949,7 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
     ssl_ctx = build_ssl_context(state=state)
     relay_client.connect(
         session_id, relay_url, state.api_key, port,
-        on_activity=lambda: code_server.note_activity(project_id),
+        on_activity=lambda: code_server.note_activity(session_id),
         ssl_ctx=ssl_ctx,
     )
     log.info("editor started: session %s project %s -> relay", session_id[:8], project_id[:12])
@@ -1987,13 +1981,7 @@ async def _handle_code_server_stop(session_id: str, project_id: str | None,
             log.warning("editor diff failed for session %s: %s", session_id[:8], e)
 
     await relay_client.disconnect(session_id)
-    if project_id:
-        sids = _editor_sessions.get(project_id)
-        if sids:
-            sids.discard(session_id)
-            if not sids:
-                _editor_sessions.pop(project_id, None)
-                code_server.stop(project_id)
+    code_server.stop(session_id)   # the process stops once no other session uses it
 
 
 async def _handle_git_changes(state: DaemonState, sender, msg: dict):

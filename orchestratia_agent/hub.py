@@ -1934,13 +1934,45 @@ async def _editor_reaper_loop(state: DaemonState):
             log.exception("editor reaper error")
 
 
+# Editor starts still in progress, and those the hub stopped before they finished.
+# A stop can arrive while a start is downloading or waiting for code-server to
+# listen, when there is nothing registered yet for it to stop; without this the start
+# carried on and left an editor running for a session that no longer existed.
+_editor_starts: set[str] = set()
+_editor_starts_stopped: set[str] = set()
+
+
+class _EditorStartStopped(Exception):
+    """The hub stopped this editor while it was starting."""
+
+
+def _raise_if_stopped(session_id: str) -> None:
+    if session_id in _editor_starts_stopped:
+        raise _EditorStartStopped(session_id)
+
+
 async def _handle_code_server_start(state: DaemonState, session_id: str,
                                     project_id: str, working_dir: str, relay_url: str,
                                     tier: str = "restricted"):
     """Start code-server for an editor session and bridge it to the relay tier.
 
     Every outcome is reported to the hub as `editor_status` — a refusal that is only
-    logged leaves the session in `starting` and the user watching a spinner."""
+    logged leaves the session in `starting` and the user watching a spinner. The one
+    exception is a start the hub stopped midway: that session is already closed, so
+    the start is abandoned quietly. Its process (if any) and evidence entry were
+    already released by the stop handler, which runs before the start notices."""
+    _editor_starts.add(session_id)
+    try:
+        await _run_code_server_start(state, session_id, project_id, working_dir, relay_url, tier)
+    except _EditorStartStopped:
+        log.info("editor start for %s abandoned: the session was stopped", session_id[:8])
+    finally:
+        _editor_starts.discard(session_id)
+        _editor_starts_stopped.discard(session_id)
+
+
+async def _run_code_server_start(state: DaemonState, session_id: str, project_id: str,
+                                 working_dir: str, relay_url: str, tier: str):
     from orchestratia_agent import code_server, code_server_install, relay_client, privilege
 
     async def status(st: str, reason: str = "") -> None:
@@ -1952,14 +1984,20 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
         if tier == "standard" and not code_server_install.installed():
             await status("preparing", "Preparing the editor (first time on this server)")
             await asyncio.get_running_loop().run_in_executor(None, code_server_install.ensure)
+        _raise_if_stopped(session_id)
         port = code_server.start(session_id, project_id, working_dir, tier, tc,
                                  hub_url=getattr(state, "hub_url", "") or "")
         await _wait_until_serving(session_id, status)
+    except _EditorStartStopped:
+        raise
     except code_server_install.InstallError as e:
+        _raise_if_stopped(session_id)
         log.error("editor install failed for %s: %s", session_id[:8], e.reason)
         await status("error", e.reason)
         return
     except (code_server.EditorStartError, privilege.PrivilegeError) as e:
+        # A stop mid-wait kills the process, which surfaces here as "exited".
+        _raise_if_stopped(session_id)
         log.error("code_server_start refused for %s: %s", session_id[:8], e)
         code_server.stop(session_id)
         await status("error", str(e))
@@ -1996,6 +2034,7 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
                  session_id[:8], base.get("is_repo"), sent_ok)
     except Exception as e:  # noqa: BLE001
         log.warning("editor baseline failed for session %s: %s", session_id[:8], e)
+    _raise_if_stopped(session_id)          # the baseline above can take a while
     _ensure_editor_reaper(state)
     from orchestratia_agent.tls import build_ssl_context
     ssl_ctx = build_ssl_context(state=state)
@@ -2021,6 +2060,7 @@ async def _wait_until_serving(session_id: str, status) -> None:
     started = loop.time()
     told = False
     while not code_server.check_serving(session_id):
+        _raise_if_stopped(session_id)
         waited = loop.time() - started
         if waited >= code_server.STARTUP_TIMEOUT:
             raise code_server.EditorStartError(
@@ -2036,6 +2076,9 @@ async def _handle_code_server_stop(session_id: str, project_id: str | None,
     """Tear down one editor session's relay bridge; stop code-server when the
     project has no more live editor sessions."""
     from orchestratia_agent import code_server, relay_client
+
+    if session_id in _editor_starts:
+        _editor_starts_stopped.add(session_id)   # the start abandons itself; see above
 
     # Snapshot the diff BEFORE tearing anything down — this is the session's only
     # audit evidence, and a close frequently happens with nobody watching

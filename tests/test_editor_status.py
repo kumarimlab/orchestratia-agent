@@ -180,6 +180,104 @@ def test_editor_that_never_listens_times_out_after_telling_the_user():
         code_server.STARTUP_TIMEOUT, hub.SLOW_START_NOTICE_S = saved
 
 
+# ── a stop that arrives mid-start wins ────────────────────────────────────────
+# Cancelling the dialog during the first download (or while code-server comes up)
+# sent a stop the agent could not act on yet; the start then carried on and left an
+# editor running, workspace open, for a session that no longer existed.
+
+def _run_with_stop_during(h, tier, while_starting):
+    """Run a start; `while_starting(stop)` is handed a coroutine-maker that sends the
+    hub's stop for this session, and decides when to call it."""
+    async def scenario():
+        task = asyncio.ensure_future(
+            hub._handle_code_server_start(St(), "sess-1", "pid-A", "/srv/a", "wss://relay.example", tier))
+        await while_starting(lambda: hub._handle_code_server_stop("sess-1", "pid-A", None))
+        await asyncio.wait_for(task, 5)
+    asyncio.get_event_loop().run_until_complete(scenario())
+
+
+def test_stop_during_first_download_means_nothing_starts():
+    import threading
+    gate, entered = threading.Event(), threading.Event()
+    h = _Harness(installed=False)
+    real_ensure = code_server_install.ensure
+
+    def slow_ensure():
+        entered.set()
+        gate.wait(5)
+        return real_ensure()
+    code_server_install.ensure = slow_ensure
+
+    async def while_starting(stop):
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        await stop()
+        gate.set()
+    try:
+        _run_with_stop_during(h, "standard", while_starting)
+        ok("code-server never started", h.started == [], h.started)
+        ok("never bridged, never reported ready or error",
+           h.connected == [] and h.states() == ["preparing"], (h.connected, h.states()))
+        ok("no evidence entry left behind", "sess-1" not in hub._editor_workspaces)
+    finally:
+        h.close()
+
+
+def test_stop_while_waiting_for_code_server_abandons_the_start():
+    h = _Harness(installed=True, serving=(False,))
+
+    async def while_starting(stop):
+        while not h.started:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.3)
+        await stop()
+    try:
+        _run_with_stop_during(h, "standard", while_starting)
+        ok("never bridged", h.connected == [], h.connected)
+        ok("no ready and no error for a session the hub already closed", h.states() == [], h.states())
+        ok("its process released", "sess-1" in h.stopped, h.stopped)
+        ok("not tracked as in flight afterwards",
+           "sess-1" not in hub._editor_starts and "sess-1" not in hub._editor_starts_stopped)
+    finally:
+        h.close()
+
+
+def test_stop_during_the_git_baseline_means_no_bridge():
+    import threading
+    gate, entered = threading.Event(), threading.Event()
+    h = _Harness(installed=True)
+
+    def slow_baseline(path, run_as=None):
+        entered.set()
+        gate.wait(5)
+        return {"is_repo": False}
+    git_changes.baseline = slow_baseline
+
+    async def while_starting(stop):
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        await stop()
+        gate.set()
+    try:
+        _run_with_stop_during(h, "standard", while_starting)
+        ok("never bridged or reported ready", h.connected == [] and "ready" not in h.states(),
+           (h.connected, h.states()))
+        ok("its process released", "sess-1" in h.stopped, h.stopped)
+    finally:
+        h.close()
+
+
+def test_a_stop_for_an_editor_not_starting_changes_nothing_later():
+    asyncio.get_event_loop().run_until_complete(hub._handle_code_server_stop("sess-9", None, None))
+    h = _Harness(installed=True)
+    try:
+        asyncio.get_event_loop().run_until_complete(
+            hub._handle_code_server_start(St(), "sess-9", "pid-A", "/srv/a", "wss://relay.example", "standard"))
+        ok("an earlier stop does not cancel a later start of the same id", h.states() == ["ready"], h.states())
+    finally:
+        h.close()
+
+
 def test_missing_tier_means_restricted_for_old_hubs():
     msg = {"type": "code_server_start", "session_id": "sess-1", "project_id": "pid-A",
            "working_directory": "/srv/a", "relay_url": "wss://relay.example"}

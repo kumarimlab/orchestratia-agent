@@ -75,6 +75,24 @@ def _priv_user_for(state, tier: str, project_id: str | None) -> str | None:
         return None
 
 
+def _editor_tier_from(msg: dict) -> str:
+    """Pre-0.31 hubs never sent a tier and only offered the locked-down editor."""
+    return "standard" if msg.get("privilege_tier") == "standard" else "restricted"
+
+
+def _editor_capability() -> dict | None:
+    """Advertise the zero-touch editor only where it can actually run (Linux amd64/arm64)."""
+    from orchestratia_agent import code_server_install
+    if platform.system() != "Linux":
+        return None
+    try:
+        code_server_install.arch()
+    except code_server_install.InstallError:
+        return None
+    return {"supported": True, "installed": code_server_install.installed(),
+            "version": code_server_install.VERSION}
+
+
 def _tier_config(state):
     """Tier config, resolving lazily if startup has not set it yet.
 
@@ -177,7 +195,7 @@ async def register_with_hub(
             "machine_id": get_machine_id(),
             "mac_address": get_mac_address(),
             "capabilities": privilege.merge_capabilities(
-                state.config.get("capabilities"), _tier_config(state)
+                state.config.get("capabilities"), _tier_config(state), _editor_capability()
             ),
         }
 
@@ -229,7 +247,7 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
                 # Re-advertised every beat so `provision-tier` takes effect on
                 # the next heartbeat rather than needing a re-registration.
                 "capabilities": privilege.merge_capabilities(
-                    state.config.get("capabilities"), _tier_config(state)
+                    state.config.get("capabilities"), _tier_config(state), _editor_capability()
                 ),
             },
             headers={"X-API-Key": state.api_key},
@@ -1129,10 +1147,15 @@ async def ws_receive_loop(ws, state: DaemonState):
                 relay_url = msg.get("relay_url") or state.config.get("relay_url")
                 if session_id and project_id and working_dir and relay_url:
                     asyncio.create_task(_handle_code_server_start(
-                        state, session_id, project_id, working_dir, relay_url))
+                        state, session_id, project_id, working_dir, relay_url,
+                        _editor_tier_from(msg)))
                 else:
                     log.warning("code_server_start missing fields (need session_id, "
                                 "project_id, working_directory, relay_url)")
+                    if session_id:
+                        await ws_send(state, {"type": "editor_status", "session_id": session_id,
+                                              "state": "error",
+                                              "reason": "the hub sent an incomplete editor request"})
 
             elif msg_type == "code_server_stop":
                 session_id = msg.get("session_id")
@@ -1903,22 +1926,45 @@ async def _editor_reaper_loop(state: DaemonState):
         await asyncio.sleep(60)
         try:
             for sid in code_server.reap_idle(code_server.running_sessions()):
-                await relay_client.disconnect(sid)
-                code_server.stop(sid)
+                await _handle_code_server_stop(sid, None, state)
+                await ws_send(state, {"type": "editor_status", "session_id": sid,
+                                      "state": "stopped", "reason": "idle"})
                 log.info("editor idle-stopped: session %s", sid[:8])
         except Exception:
             log.exception("editor reaper error")
 
 
 async def _handle_code_server_start(state: DaemonState, session_id: str,
-                                    project_id: str, working_dir: str, relay_url: str):
-    """Start code-server for a project and bridge it to the relay tier."""
-    from orchestratia_agent import code_server, relay_client, privilege
+                                    project_id: str, working_dir: str, relay_url: str,
+                                    tier: str = "restricted"):
+    """Start code-server for an editor session and bridge it to the relay tier.
+
+    Every outcome is reported to the hub as `editor_status` — a refusal that is only
+    logged leaves the session in `starting` and the user watching a spinner."""
+    from orchestratia_agent import code_server, code_server_install, relay_client, privilege
+
+    async def status(st: str, reason: str = "") -> None:
+        await ws_send(state, {"type": "editor_status", "session_id": session_id,
+                              "state": st, "reason": reason})
+
     tc = _tier_config(state)
     try:
-        port = code_server.start(session_id, project_id, working_dir, "restricted", tc)
-    except privilege.PrivilegeError as e:
+        if tier == "standard" and not code_server_install.installed():
+            await status("preparing", "Preparing the editor (first time on this server)")
+            await asyncio.get_running_loop().run_in_executor(None, code_server_install.ensure)
+        port = code_server.start(session_id, project_id, working_dir, tier, tc,
+                                 hub_url=getattr(state, "hub_url", "") or "")
+    except code_server_install.InstallError as e:
+        log.error("editor install failed for %s: %s", session_id[:8], e.reason)
+        await status("error", e.reason)
+        return
+    except (code_server.EditorStartError, privilege.PrivilegeError) as e:
         log.error("code_server_start refused for %s: %s", session_id[:8], e)
+        await status("error", str(e))
+        return
+    except Exception as e:  # noqa: BLE001 — any failure must reach the user
+        log.exception("code_server_start failed for %s", session_id[:8])
+        await status("error", f"could not start the editor: {e}")
         return
     # An editor has no PTY recording, so its audit evidence is the git diff it
     # leaves behind. Capture the BEFORE state now; the hub stores it write-once.
@@ -1928,10 +1974,13 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
     # again here rather than assume a name: git must run AS that user, not as the
     # daemon — a workspace we do not own can execute repo-controlled code, which
     # is the entire reason the tier exists.
-    try:
-        editor_user = privilege.resolve_user("restricted", project_id, tc)
-    except Exception:  # noqa: BLE001
-        editor_user = None
+    editor_user = None
+    if tier != "standard":
+        try:
+            editor_user = privilege.resolve_user("restricted", project_id, tc)
+        except Exception:  # noqa: BLE001
+            editor_user = None
+    working_dir = os.path.expanduser(working_dir)
     _editor_workspaces[session_id] = (working_dir, editor_user)
     try:
         from orchestratia_agent import git_changes
@@ -1952,7 +2001,8 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
         on_activity=lambda: code_server.note_activity(session_id),
         ssl_ctx=ssl_ctx,
     )
-    log.info("editor started: session %s project %s -> relay", session_id[:8], project_id[:12])
+    log.info("editor started: session %s project %s (%s) -> relay", session_id[:8], project_id[:12], tier)
+    await status("ready")
 
 
 async def _handle_code_server_stop(session_id: str, project_id: str | None,

@@ -163,6 +163,7 @@ def test_hub_code_server_start_launches_and_bridges():
     class St:
         config = {}
         api_key = "orc_test"
+        ws_connection = None
     st = St()
 
     from orchestratia_agent import tls

@@ -244,18 +244,25 @@ def capability_payload(tc: TierConfig) -> dict:
     }
 
 
-def merge_capabilities(existing: dict | None, tc: TierConfig) -> dict:
-    """Fold the privilege advertisement into the server's capabilities blob.
+def merge_capabilities(existing: dict | None, tc: TierConfig, editor: dict | None = None) -> dict:
+    """Fold the privilege + editor advertisement into the server's capabilities blob.
 
     capabilities is shared with the hub's task-matching service (tags, tools,
     languages, max_concurrent_tasks), so this merges rather than replaces.
     Returns a new dict — the caller's config must not be edited underneath it.
+
+    `code_server.projects` lists locked-down projects (needs a system code-server);
+    `code_server.standard` is the zero-touch editor (the agent's own pinned binary).
     """
     merged = dict(existing or {})
     merged["privilege"] = capability_payload(tc)
-    # code-server is a per-box capability (one binary); when present, the editor
-    # is available for every provisioned project. The hub offers the editor only
-    # where this appears (editor_service.has_code_server).
+    code_server: dict = {}
     if tc.code_server_path:
-        merged["code_server"] = {"projects": _real_projects(tc)}
+        code_server["projects"] = _real_projects(tc)
+    if editor:
+        code_server["standard"] = editor
+    if code_server:
+        merged["code_server"] = code_server
+    else:
+        merged.pop("code_server", None)
     return merged

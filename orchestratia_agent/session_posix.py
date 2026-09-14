@@ -187,6 +187,7 @@ class PosixSessionBackend:
                     # (tmux copy-mode) is copied to the dashboard's system
                     # clipboard via OSC 52, not just tmux's own paste buffer.
                     _tmux(handle, ["set-option", "-t", tmux_name, "set-clipboard", "on"])
+                    _tmux(handle, ["set-option", "-t", tmux_name, "window-size", "latest"])
                     # Disable tmux's right-click context menu (split/select pane etc.)
                     # — it interferes with browser paste in the dashboard terminal
                     _tmux(handle, ["unbind-key", "-T", "root", "MouseDown3Pane"])
@@ -254,6 +255,7 @@ class PosixSessionBackend:
                 _tmux(handle, ["set-option", "-t", session_name, "mouse", "on"])
                 # OSC 52 clipboard passthrough (see spawn path)
                 _tmux(handle, ["set-option", "-t", session_name, "set-clipboard", "on"])
+                _tmux(handle, ["set-option", "-t", session_name, "window-size", "latest"])
                 # Disable tmux's right-click context menu
                 _tmux(handle, ["unbind-key", "-T", "root", "MouseDown3Pane"])
 

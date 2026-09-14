@@ -46,6 +46,19 @@ def _tmux_argv(run_as: str | None, args: list[str], tmux_path: str | None = None
     return ["sudo", "-n", "-u", run_as, "-H", tmux_path or "tmux"] + args
 
 
+def spawn_start_dir(run_as: str | None, cwd: str) -> tuple[str, list[str]]:
+    """Where the spawn child chdirs, and the tmux args that start the session in `cwd`.
+
+    A locked-down session must not chdir as the DAEMON: provision-tier removes 'other'
+    access from each workspace, so a workspace the daemon user does not own refuses it
+    and the session died on spawn (exit 1, no reason). tmux enters the folder itself,
+    as the project user, via -c.
+    """
+    if run_as is None:
+        return cwd, []
+    return "/", ["-c", cwd]
+
+
 def _tmux(handle: SessionHandle, args: list[str], timeout: int = 2, **kw):
     """Run a tmux command against `handle`'s session, as whoever owns it."""
     return subprocess.run(
@@ -131,7 +144,8 @@ class PosixSessionBackend:
                     os.dup2(slave_fd, 2)
                     os.close(master_fd)
                     os.close(slave_fd)
-                    os.chdir(cwd)
+                    start_dir, start_args = spawn_start_dir(run_as, cwd)
+                    os.chdir(start_dir)
                     os.environ["TERM"] = "xterm-256color"
                     os.environ["COLORTERM"] = "truecolor"
 
@@ -145,7 +159,7 @@ class PosixSessionBackend:
                     if use_tmux:
                         tmux_cmd = [
                             "tmux", "new-session", "-s", tmux_name,
-                            "-x", str(cols), "-y", str(rows),
+                            "-x", str(cols), "-y", str(rows), *start_args,
                         ]
                         # Pass env vars into tmux session via -e flags
                         # (tmux server spawns its own shell, so os.environ

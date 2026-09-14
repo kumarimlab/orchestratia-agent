@@ -170,6 +170,7 @@ def test_hub_code_server_start_launches_and_bridges():
     started = {}
     connected = {}
     real_start, real_connect = code_server.start, relay_client.connect
+    real_serving = code_server.check_serving
     real_bssl = tls.build_ssl_context
     real_tc = hub._tier_config
     def _fake_start(sid, pid, wd, tier, tc, *, hub_url=""):
@@ -180,12 +181,14 @@ def test_hub_code_server_start_launches_and_bridges():
         connected.setdefault("args", (sid, url, port))
     tls.build_ssl_context = lambda state=None: None   # local import in the handler
     hub._tier_config = lambda state: privilege.load_tier_config({})
+    code_server.check_serving = lambda sid: True
     try:
         asyncio.get_event_loop().run_until_complete(hub._handle_code_server_start(
             st, "sess-1", "pid-A", "/srv/a", "wss://relay.example"))
     finally:
         code_server.start, relay_client.connect = real_start, real_connect
         tls.build_ssl_context, hub._tier_config = real_bssl, real_tc
+        code_server.check_serving = real_serving
 
     ok("code-server started for the project+workspace", started.get("args") == ("pid-A", "/srv/a"))
     ok("relay bridge connected with the PINNED port",
@@ -352,6 +355,42 @@ def test_standard_refuses_missing_folder_and_missing_binary():
         ok("nothing spawned", spawned == [])
     finally:
         restore()
+
+
+def test_check_serving_answers_from_the_real_port():
+    import socket as _s
+
+    class Proc:
+        def __init__(self, port, rc=None):
+            self._orc_port, self._rc, self.pid = port, rc, 0
+        def poll(self):
+            return self._rc
+    lsn = _s.socket()
+    lsn.bind(("127.0.0.1", 0))
+    port = lsn.getsockname()[1]
+    saved = (dict(cs._running), dict(cs._session_key))
+    try:
+        cs._running["sess-live"] = Proc(port)
+        cs._session_key["sess-live"] = "sess-live"
+        ok("bound but not listening -> not serving", cs.check_serving("sess-live") is False)
+        lsn.listen(1)
+        ok("listening -> serving", cs.check_serving("sess-live") is True)
+        cs._running["project:p"] = Proc(port, rc=3)
+        cs._session_key["sess-dead"] = "project:p"
+        try:
+            cs.check_serving("sess-dead")
+            ok("an exited process raises", False)
+        except cs.EditorStartError as e:
+            ok("an exited process raises with its exit code", "exit code 3" in str(e), str(e))
+        try:
+            cs.check_serving("sess-unknown")
+            ok("an unknown session raises", False)
+        except cs.EditorStartError:
+            ok("an unknown session raises", True)
+    finally:
+        lsn.close()
+        cs._running.clear(); cs._running.update(saved[0])
+        cs._session_key.clear(); cs._session_key.update(saved[1])
 
 
 def test_restricted_sessions_share_one_process_per_project():

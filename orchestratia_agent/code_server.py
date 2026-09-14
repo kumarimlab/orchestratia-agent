@@ -217,6 +217,31 @@ def running_port(session_id: str) -> int | None:
     return getattr(_running[_key(session_id)], "_orc_port", None)
 
 
+# How long a spawned code-server gets to accept connections before the start fails.
+STARTUP_TIMEOUT = 45.0
+
+
+def check_serving(session_id: str) -> bool:
+    """True once this editor's code-server accepts connections on its loopback port.
+
+    The relay bridge and the hub's "ready" wait on this: spawning is not serving, and
+    reporting ready early sent the first page load to a port nothing listened on.
+    A process that has already exited raises, so a crash reaches the user as its
+    reason rather than as a timeout."""
+    key = _session_key.get(session_id)
+    proc = _running.get(key) if key is not None else None
+    if proc is None:
+        raise EditorStartError("the editor is not running")
+    rc = proc.poll()
+    if rc is not None:
+        raise EditorStartError(f"the editor exited while starting (exit code {rc})")
+    try:
+        with socket.create_connection(("127.0.0.1", proc._orc_port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 def start(session_id: str, project_id: str, workspace: str, tier: str, tc, *, hub_url: str = "") -> int:
     """Start (or, for the restricted tier, reuse) code-server for an editor session.
     Returns the loopback port."""

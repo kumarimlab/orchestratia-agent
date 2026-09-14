@@ -26,11 +26,20 @@ class St:
 class _Harness:
     """Stub the side effects of the handler; capture what it sends to the hub."""
 
-    def __init__(self, *, installed=True, start_result=41000, ensure_error=None):
-        self.sent, self.started, self.connected, self.ensured = [], [], [], []
+    def __init__(self, *, installed=True, start_result=41000, ensure_error=None, serving=(True,)):
+        self.sent, self.started, self.connected, self.ensured, self.stopped = [], [], [], [], []
         self.saved = (hub.ws_send, code_server.start, relay_client.connect, tls.build_ssl_context,
                       hub._tier_config, code_server_install.installed, code_server_install.ensure,
-                      git_changes.baseline)
+                      git_changes.baseline, code_server.check_serving, code_server.stop)
+        checks = list(serving)
+
+        def check_serving(sid):
+            # Replays `serving`; the last entry repeats. An exception entry is raised.
+            r = checks.pop(0) if len(checks) > 1 else checks[0]
+            if isinstance(r, Exception):
+                raise r
+            self.sent.append({"type": "_probe", "serving": r, "connected_yet": bool(self.connected)})
+            return r
 
         async def ws_send(state, msg):
             self.sent.append(msg)
@@ -56,6 +65,8 @@ class _Harness:
         code_server_install.installed = lambda version=None: installed
         code_server_install.ensure = ensure
         git_changes.baseline = lambda path, run_as=None: {"is_repo": False}
+        code_server.check_serving = check_serving
+        code_server.stop = lambda sid: self.stopped.append(sid)
 
     def run(self, tier, wd="/srv/a"):
         asyncio.get_event_loop().run_until_complete(
@@ -66,7 +77,8 @@ class _Harness:
 
     def close(self):
         (hub.ws_send, code_server.start, relay_client.connect, tls.build_ssl_context, hub._tier_config,
-         code_server_install.installed, code_server_install.ensure, git_changes.baseline) = self.saved
+         code_server_install.installed, code_server_install.ensure, git_changes.baseline,
+         code_server.check_serving, code_server.stop) = self.saved
 
 
 def test_standard_already_installed_reports_ready_and_bridges():
@@ -119,6 +131,53 @@ def test_start_errors_are_reported():
             ok(f"{label}: nothing bridged", h.connected == [])
         finally:
             h.close()
+
+
+# ── "ready" must mean the editor answers ──────────────────────────────────────
+# The agent used to report ready and bridge the relay straight after spawning, so the
+# first page load could hit a port nothing was listening on yet. Seen on staging.
+
+def test_ready_only_once_the_editor_accepts_connections():
+    h = _Harness(installed=True, serving=(False, False, True))
+    try:
+        h.run("standard")
+        probes = [m for m in h.sent if m.get("type") == "_probe"]
+        ok("polled until serving", [m["serving"] for m in probes] == [False, False, True], probes)
+        ok("relay not bridged before it was serving", not any(m["connected_yet"] for m in probes), probes)
+        ok("then ready and bridged", h.states() == ["ready"] and h.connected == [("sess-1", 41000)], h.sent)
+    finally:
+        h.close()
+
+
+def test_editor_that_exits_while_starting_is_an_error_with_its_reason():
+    h = _Harness(installed=True,
+                 serving=(False, code_server.EditorStartError("the editor exited while starting (exit code 1)")))
+    try:
+        h.run("standard")
+        err = [m for m in h.sent if m.get("state") == "error"]
+        ok("reported as error", h.states() == ["error"], h.states())
+        ok("reason says it exited", err and "exited" in err[0]["reason"], err)
+        ok("nothing bridged", h.connected == [])
+        ok("its session released", h.stopped == ["sess-1"], h.stopped)
+    finally:
+        h.close()
+
+
+def test_editor_that_never_listens_times_out_after_telling_the_user():
+    saved = (code_server.STARTUP_TIMEOUT, hub.SLOW_START_NOTICE_S)
+    code_server.STARTUP_TIMEOUT, hub.SLOW_START_NOTICE_S = 0.6, 0.2
+    h = _Harness(installed=True, serving=(False,))
+    try:
+        h.run("restricted")
+        err = [m for m in h.sent if m.get("state") == "error"]
+        ok("a slow start is announced once, then fails", h.states() == ["preparing", "error"], h.states())
+        prep = [m for m in h.sent if m.get("state") == "preparing"]
+        ok("the notice says it is starting", prep and "Starting" in prep[0]["reason"], prep)
+        ok("reason says it did not start", err and "did not start" in err[0]["reason"], err)
+        ok("nothing bridged, session released", h.connected == [] and h.stopped == ["sess-1"])
+    finally:
+        h.close()
+        code_server.STARTUP_TIMEOUT, hub.SLOW_START_NOTICE_S = saved
 
 
 def test_missing_tier_means_restricted_for_old_hubs():

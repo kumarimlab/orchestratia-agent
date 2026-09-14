@@ -1954,16 +1954,19 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
             await asyncio.get_running_loop().run_in_executor(None, code_server_install.ensure)
         port = code_server.start(session_id, project_id, working_dir, tier, tc,
                                  hub_url=getattr(state, "hub_url", "") or "")
+        await _wait_until_serving(session_id, status)
     except code_server_install.InstallError as e:
         log.error("editor install failed for %s: %s", session_id[:8], e.reason)
         await status("error", e.reason)
         return
     except (code_server.EditorStartError, privilege.PrivilegeError) as e:
         log.error("code_server_start refused for %s: %s", session_id[:8], e)
+        code_server.stop(session_id)
         await status("error", str(e))
         return
     except Exception as e:  # noqa: BLE001 — any failure must reach the user
         log.exception("code_server_start failed for %s", session_id[:8])
+        code_server.stop(session_id)
         await status("error", f"could not start the editor: {e}")
         return
     # An editor has no PTY recording, so its audit evidence is the git diff it
@@ -2003,6 +2006,29 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
     )
     log.info("editor started: session %s project %s (%s) -> relay", session_id[:8], project_id[:12], tier)
     await status("ready")
+
+
+# The dashboard gives up on a start it hears nothing about for 20s, so a slow start
+# says so well before that.
+SLOW_START_NOTICE_S = 5.0
+
+
+async def _wait_until_serving(session_id: str, status) -> None:
+    """Block until code-server accepts connections; raise EditorStartError if it
+    exits first or never does. See code_server.check_serving."""
+    from orchestratia_agent import code_server
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    told = False
+    while not code_server.check_serving(session_id):
+        waited = loop.time() - started
+        if waited >= code_server.STARTUP_TIMEOUT:
+            raise code_server.EditorStartError(
+                f"the editor did not start within {int(code_server.STARTUP_TIMEOUT)}s")
+        if not told and waited >= SLOW_START_NOTICE_S:
+            await status("preparing", "Starting the editor…")
+            told = True
+        await asyncio.sleep(0.1)
 
 
 async def _handle_code_server_stop(session_id: str, project_id: str | None,

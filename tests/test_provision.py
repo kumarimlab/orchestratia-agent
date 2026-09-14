@@ -478,6 +478,51 @@ def test_acl_perms_reads_the_named_user_entry():
     assert pv._acl_perms("user:orcp-aaaaaaaaaaaab:--x\n", "orcp-aaaaaaaaaaaa") is None, "prefix is not a match"
 
 
+def test_locked_down_editor_settings_are_written_as_the_project_user():
+    """The locked-down editor never got its settings: the daemon cannot write into the
+    project user's home, so its VS Code terminal was a plain unrecorded shell. Provisioning
+    (root) writes them — as that user, because the directory is theirs and a root write
+    could be redirected through a symlink they planted."""
+    import json
+    import subprocess
+    import tempfile
+    from orchestratia_agent import code_server as cs
+    calls = []
+    saved = pv.subprocess.run
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    pv.subprocess.run = fake_run
+    try:
+        pv._write_editor_settings("orcp-aaaaaaaaaaaa", "01690d2f-47c6-4d37-b787-27904723922b")
+    finally:
+        pv.subprocess.run = saved
+    assert len(calls) == 1, calls
+    argv, kw = calls[0]
+    assert kw.get("user") == "orcp-aaaaaaaaaaaa" and kw.get("group") == "orcp-aaaaaaaaaaaa", kw
+    assert kw.get("extra_groups") == [], "root's supplementary groups must be dropped"
+    want = os.path.join(cs.cfg_dir_for("orcp-aaaaaaaaaaaa", "01690d2f-47c6-4d37-b787-27904723922b"),
+                        "User", "settings.json")
+    assert want in argv, argv
+    forced = json.loads(argv[-1])
+    assert forced.get("terminal.integrated.defaultProfile.linux") == "orchestratia", forced
+
+    # the script itself: forced keys win, the user's own settings survive
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "cfg", "User", "settings.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            json.dump({"editor.fontSize": 15, "terminal.integrated.defaultProfile.linux": "bash"}, f)
+        subprocess.run([argv[0], "-c", argv[2], path, argv[-1]], check=True)
+        data = json.load(open(path))
+        assert data["editor.fontSize"] == 15, data
+        assert data["terminal.integrated.defaultProfile.linux"] == "orchestratia", data
+        fresh = os.path.join(td, "new", "User", "settings.json")
+        subprocess.run([argv[0], "-c", argv[2], fresh, argv[-1]], check=True)
+        assert json.load(open(fresh))["terminal.integrated.defaultProfile.linux"] == "orchestratia"
+
+
 def test_workspace_refuses_orchestratia_install_paths():
     _rejects(pv._validate_not_orchestratia, "/opt/orchestratia-agent", "the agent checkout must be refused")
     _rejects(pv._validate_not_orchestratia, "/opt/orchestratia-venv/lib", "the agent venv must be refused")

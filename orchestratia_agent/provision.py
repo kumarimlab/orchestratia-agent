@@ -477,6 +477,48 @@ def _ensure_editor_state_dir(user: str) -> None:
     print(f"  editor state dir {root}")
 
 
+# Run as the project user by _write_editor_settings: merge the forced keys into the
+# locked-down editor's settings, keeping the user's own.
+_WRITE_SETTINGS = """\
+import json, os, sys
+path, forced = sys.argv[1], json.loads(sys.argv[2])
+try:
+    with open(path) as f:
+        data = json.load(f)
+    data = data if isinstance(data, dict) else {}
+except (OSError, ValueError):
+    data = {}
+data.update(forced)
+os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp, path)
+"""
+
+
+def _write_editor_settings(user: str, project_id: str) -> None:
+    """Point the locked-down editor's terminal at the Orchestratia session picker.
+
+    Nothing else can: the daemon cannot write into the project user's home, and the
+    tier sudoers rule stays tmux/git/code-server. Without this the editor's terminal was
+    a plain shell, outside the recorded sessions. Written AS the project user, never as
+    root: the directory is theirs, so a root write could be redirected through a symlink
+    they planted. The user may change these settings — they are a default, not a control.
+    """
+    import json
+    import sys
+    from orchestratia_agent import code_server as cs
+    path = os.path.join(cs.cfg_dir_for(user, project_id), "User", "settings.json")
+    result = subprocess.run(
+        [sys.executable, "-c", _WRITE_SETTINGS, path, json.dumps(cs.settings_json("restricted"))],
+        user=user, group=user, extra_groups=[], cwd="/", capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise ProvisionError(f"could not write the editor settings for {user}: {result.stderr.strip()}")
+    print(f"  editor settings {path}")
+
+
 def provision(project_id: str, workspaces: list[str],
               daemon_user: str, config_path: str,
               code_server_path: str | None = None) -> int:
@@ -560,6 +602,8 @@ def provision(project_id: str, workspaces: list[str],
     _strip_supplementary_groups(user)
     _assert_unprivileged(user)
     _ensure_editor_state_dir(user)
+    if cs_path:
+        _write_editor_settings(user, project_id)
 
     # 2. Workspace ACLs for THIS project's workspaces.
     home_roots = [h for h in ("/home", "/Users") if os.path.isdir(h)]

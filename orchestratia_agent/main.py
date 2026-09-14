@@ -70,9 +70,11 @@ async def main():
         ),
     )
     parser.add_argument(
-        "provision_tier", nargs="?", choices=["provision-tier", "orc-attach"], default=None,
+        "provision_tier", nargs="?", choices=["provision-tier", "orc-attach", "ensure-code-server"],
+        default=None,
         help="provision-tier: provision a project's restricted tier (root). "
-             "orc-attach: attach the editor terminal to the project's tmux.",
+             "orc-attach: attach the editor terminal to the project's tmux. "
+             "ensure-code-server: download the pinned editor for this user (no root).",
     )
     parser.add_argument(
         "--project", default=None, metavar="ID",
@@ -112,6 +114,17 @@ async def main():
         # governed tmux (runs as the project user, sees only its own sessions).
         from orchestratia_agent.orc_attach import main as orc_attach_main
         sys.exit(orc_attach_main())
+
+    if args.provision_tier == "ensure-code-server":
+        # Pre-fetch the pinned editor for the user running this (the installer calls
+        # it as the service user). The daemon does the same lazily on first open.
+        from orchestratia_agent import code_server_install as _ci
+        try:
+            print(f"editor ready: {_ci.ensure()}")
+            sys.exit(0)
+        except _ci.InstallError as e:
+            print(f"editor not installed: {e.reason}", file=sys.stderr)
+            sys.exit(1)
 
     if args.provision_tier == "provision-tier":
         from orchestratia_agent.provision import provision, ProvisionError

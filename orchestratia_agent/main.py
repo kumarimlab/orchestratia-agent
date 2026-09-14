@@ -189,6 +189,11 @@ async def main():
 
     state.hub_url = state.config.get("hub_url", "").rstrip("/")
     state.tier_config = _priv.load_tier_config(state.config)
+    from orchestratia_agent.config import config_permission_warning
+    _perm_warning = config_permission_warning(
+        state.config_path, bool((state.config.get("privilege") or {}).get("projects")))
+    if _perm_warning:
+        log.warning(_perm_warning)
 
     if not state.hub_url:
         log.error("hub_url not set in config")

@@ -54,10 +54,70 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _config_owner(existing, directory) -> tuple[int, int]:
+    """Who a config written by root should belong to: an existing non-root owner, else
+    the owner of its directory (the installer gives /etc/orchestratia to the daemon
+    user). Root-owned 0600 would lock the daemon out of its own config."""
+    if existing is not None and existing.st_uid != 0:
+        return existing.st_uid, existing.st_gid
+    return directory.st_uid, directory.st_gid
+
+
 def save_config(path: str, data: dict) -> None:
-    """Write config back to YAML file."""
-    with open(path, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    """Write config atomically, readable by its owner only.
+
+    It holds the server API key. Written 0644 (root-owned, since the installer
+    registers as root), a locked-down project user could read the key and act as the
+    server against the hub. Found on staging, 2026-09-14.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        existing = os.stat(path)
+    except FileNotFoundError:
+        existing = None
+    tmp = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if hasattr(os, "fchown") and os.geteuid() == 0:
+            os.fchown(fd, *_config_owner(existing, os.stat(directory)))
+        with os.fdopen(fd, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def secure_config_file(path: str) -> str:
+    """Make sure nobody but the owner can read the config: "ok", "fixed", or "exposed"
+    (readable by others and not ours to chmod — e.g. root-owned from an old install)."""
+    if sys.platform == "win32":
+        return "ok"
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "ok"
+    if not st.st_mode & 0o077:
+        return "ok"
+    if st.st_uid == os.getuid():
+        os.chmod(path, 0o600)
+        return "fixed"
+    return "exposed"
+
+
+def config_permission_warning(path: str, has_restricted_tier: bool) -> str | None:
+    """Repair the config's mode if we can; otherwise say exactly how, louder when a
+    locked-down tier makes other local users part of the threat model."""
+    if secure_config_file(path) != "exposed":
+        return None
+    fix = f"sudo chown $(whoami) {path} && sudo chmod 600 {path}"
+    if has_restricted_tier:
+        return (f"{path} holds this server's API key and is readable by other users, including "
+                f"the locked-down project users — they can act as this server. Fix now: {fix}")
+    return f"{path} holds this server's API key and is readable by other users. Fix: {fix}"
 
 
 def parse_token_hub_url(token: str) -> str | None:

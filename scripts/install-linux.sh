@@ -642,6 +642,16 @@ else
     info "  - Network issue (can this server reach the hub?)"
 fi
 
+# The config holds this server's API key. Registration runs as root, and an install
+# from before this line left it root-owned and world-readable — readable by every
+# local user, including locked-down project users. The daemon user owns it, nobody
+# else reads it. Also repairs an existing install on upgrade.
+if [ -f "${CONFIG_DIR}/config.yaml" ]; then
+    sudo chown "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}/config.yaml"
+    sudo chmod 0600 "${CONFIG_DIR}/config.yaml"
+fi
+sudo chmod 0750 "$CONFIG_DIR"
+
 # Step 5: Systemd service + agent sudoers
 step 5 "Setting up systemd service"
 

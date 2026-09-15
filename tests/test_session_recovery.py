@@ -74,9 +74,6 @@ def test_owner_of_returns_none_for_daemon_session():
         restore()
 
 
-CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-
-
 def main():
     failures = []
     for fn in CASES:
@@ -93,6 +90,56 @@ def main():
         raise SystemExit(1)
     print(f"ok  {len(CASES)} passed")
 
+
+
+
+# ── window-size must survive a dashboard resize ───────────────────────────────
+# `tmux resize-window -x -y` (how a dashboard resize is applied) forces the
+# session's window-size option to `manual`, pinning the window to that one
+# client's size. Every OTHER client — a VS Code editor terminal attached to the
+# same session, a second viewer — then sees a mismatched, dotted grid. So resize
+# must restore `latest` (follow the active client) afterward. Found on prod,
+# 2026-09-15, attaching an editor terminal to a dashboard-streamed session.
+
+def _record_tmux():
+    calls = []
+    orig = session_posix._tmux
+    session_posix._tmux = lambda handle, args, **kw: calls.append(list(args))
+    return calls, (lambda: setattr(session_posix, "_tmux", orig))
+
+
+def test_resize_restores_window_size_latest_so_other_clients_are_not_dotted():
+    from orchestratia_agent.session_base import SessionHandle
+    calls, restore = _record_tmux()
+    r, w = os.pipe()
+    try:
+        backend = session_posix.PosixSessionBackend()
+        h = SessionHandle(pid=os.getpid(), fd=w, tmux_name="orc-test123456", cols=80, rows=24, extra={})
+        backend.resize(h, 120, 40)
+        rw = ["resize-window", "-t", "orc-test123456", "-x", "120", "-y", "40"]
+        ws = ["set-option", "-t", "orc-test123456", "window-size", "latest"]
+        assert rw in calls, calls
+        assert ws in calls, calls
+        assert calls.index(rw) < calls.index(ws), f"latest must be restored AFTER the resize: {calls}"
+    finally:
+        restore()
+        os.close(r); os.close(w)
+
+
+def test_resize_without_tmux_does_nothing_tmux(): # a plain (non-tmux) pty session
+    from orchestratia_agent.session_base import SessionHandle
+    calls, restore = _record_tmux()
+    r, w = os.pipe()
+    try:
+        session_posix.PosixSessionBackend().resize(
+            SessionHandle(pid=os.getpid(), fd=w, tmux_name="", cols=80, rows=24, extra={}), 120, 40)
+        assert calls == [], calls
+    finally:
+        restore()
+        os.close(r); os.close(w)
+
+
+CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":
     main()

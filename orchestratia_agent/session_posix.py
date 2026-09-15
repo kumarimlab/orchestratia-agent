@@ -323,6 +323,12 @@ class PosixSessionBackend:
         if handle.tmux_name:
             _tmux(handle, ["resize-window", "-t", handle.tmux_name,
                            "-x", str(cols), "-y", str(rows)])
+            # resize-window forces window-size=manual, pinning the window to this
+            # one client's size. A session is often shared — a dashboard viewer AND
+            # a VS Code editor terminal attached at once — so a fixed size makes the
+            # other client see a mismatched, dotted grid. Restore `latest` so the
+            # window follows whichever client is active instead.
+            _tmux(handle, ["set-option", "-t", handle.tmux_name, "window-size", "latest"])
 
     def close_graceful(self, handle: SessionHandle) -> None:
         try:

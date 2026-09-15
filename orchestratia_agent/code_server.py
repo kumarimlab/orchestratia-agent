@@ -33,6 +33,11 @@ log = logging.getLogger("orchestratia-agent.code_server")
 
 CODE_SERVER_BIN = "code-server"
 
+# Bundled Copilot chat extension. It draws the "Build with Agent" panel and opens it
+# on startup; it is useless without a Copilot subscription and only confuses users who
+# work through Orchestratia sessions, so both tiers launch with it disabled.
+CHAT_EXTENSION = "GitHub.copilot-chat"
+
 # Stop code-server after this much inactivity. Driven by USER ACTIVITY, never by
 # connection presence: code-server keeps its WebSocket open forever, so a
 # presence check would never fire and every host would revert to always-on.
@@ -118,6 +123,11 @@ def spawn_argv(user: str, port: int, workspace: str, cfg_dir: str) -> list[str]:
         "--disable-telemetry",
         "--disable-update-check",
         "--disable-workspace-trust",
+        # The bundled Copilot chat extension renders the "Build with Agent" panel and
+        # auto-opens it on startup. It needs a GitHub Copilot subscription to do
+        # anything and only confuses users who drive the box through Orchestratia
+        # sessions, so disable it. (vscode.github / git integration stay.)
+        "--disable-extension", CHAT_EXTENSION,
         "--user-data-dir", cfg_dir,
         "--extensions-dir", os.path.join(cfg_dir, "ext"),
         workspace,
@@ -134,6 +144,7 @@ def spawn_argv_standard(binary: str, port: int, workspace: str, user_data_dir: s
         "--disable-telemetry",
         "--disable-update-check",
         "--disable-workspace-trust",
+        "--disable-extension", CHAT_EXTENSION,   # hide the "Build with Agent" panel
         "--user-data-dir", user_data_dir,
         "--extensions-dir", extensions_dir,
         workspace,

@@ -39,6 +39,8 @@ def test_spawn_argv_is_locked_down_and_runs_as_the_user():
     ok("private user-data + extensions dirs (not the shared marketplace tree)",
        "--user-data-dir" in argv and "--extensions-dir" in argv)
     ok("opens the granted workspace", "/srv/a" in argv)
+    ok("the Copilot 'Build with Agent' chat panel is disabled",
+       "--disable-extension" in argv and "GitHub.copilot-chat" in argv)
 
 
 def test_spawn_argv_standard_user_would_be_a_bug():
@@ -285,6 +287,8 @@ def test_standard_spawns_as_the_daemon_user_per_session():
         ok("project id in env", env.get("ORCHESTRATIA_PROJECT_ID") == "proj-111111111111")
         ok("hub url in env", env.get("ORCHESTRATIA_HUB_URL") == "https://hub.example")
         ok("new process group (stop kills the tree)", spawned[0].kw.get("start_new_session") is True)
+        ok("Copilot 'Build with Agent' chat panel disabled for the standard tier too",
+           "--disable-extension" in a1 and "GitHub.copilot-chat" in a1)
     finally:
         restore()
         shutil.rmtree(ws, ignore_errors=True)

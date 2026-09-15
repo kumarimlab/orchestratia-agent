@@ -67,12 +67,16 @@ async def main():
             "  orchestratia-agent --debug                 Start with debug logging\n"
             "  sudo orchestratia-agent provision-tier --project <id> \\\n"
             "       --workspace /srv/acme                 Provision a project's restricted tier\n"
+            "  sudo orchestratia-agent provision-tier --project <id> \\\n"
+            "       --revoke-workspace /srv/acme          Take a workspace grant away\n"
         ),
     )
     parser.add_argument(
-        "provision_tier", nargs="?", choices=["provision-tier", "orc-attach"], default=None,
+        "provision_tier", nargs="?", choices=["provision-tier", "orc-attach", "ensure-code-server"],
+        default=None,
         help="provision-tier: provision a project's restricted tier (root). "
-             "orc-attach: attach the editor terminal to the project's tmux.",
+             "orc-attach: attach the editor terminal to the project's tmux. "
+             "ensure-code-server: download the pinned editor for this user (no root).",
     )
     parser.add_argument(
         "--project", default=None, metavar="ID",
@@ -81,6 +85,10 @@ async def main():
     parser.add_argument(
         "--workspace", action="append", default=[], metavar="DIR",
         help="Directory the restricted tier may work in (repeatable)",
+    )
+    parser.add_argument(
+        "--revoke-workspace", action="append", default=[], metavar="DIR",
+        help="Take a workspace grant away from the restricted tier (repeatable)",
     )
     parser.add_argument(
         "--code-server-path", default=None, metavar="PATH",
@@ -113,12 +121,32 @@ async def main():
         from orchestratia_agent.orc_attach import main as orc_attach_main
         sys.exit(orc_attach_main())
 
+    if args.provision_tier == "ensure-code-server":
+        # Pre-fetch the pinned editor for the user running this (the installer calls
+        # it as the service user). The daemon does the same lazily on first open.
+        from orchestratia_agent import code_server_install as _ci
+        try:
+            print(f"editor ready: {_ci.ensure()}")
+            sys.exit(0)
+        except _ci.InstallError as e:
+            print(f"editor not installed: {e.reason}", file=sys.stderr)
+            sys.exit(1)
+
     if args.provision_tier == "provision-tier":
-        from orchestratia_agent.provision import provision, ProvisionError
+        from orchestratia_agent.provision import provision, revoke, ProvisionError
         if not args.project:
             log.error("provision-tier: --project <id> is required (a restricted "
                       "user belongs to a project)")
             sys.exit(2)
+        if args.revoke_workspace:
+            if args.workspace:
+                log.error("provision-tier: use --workspace or --revoke-workspace, not both")
+                sys.exit(2)
+            try:
+                sys.exit(revoke(args.project, args.revoke_workspace, args.config))
+            except ProvisionError as e:
+                log.error(f"provision-tier: {e}")
+                sys.exit(1)
         daemon_user = (args.daemon_user or os.environ.get("SUDO_USER")
                        or getpass.getuser())
         try:
@@ -161,6 +189,11 @@ async def main():
 
     state.hub_url = state.config.get("hub_url", "").rstrip("/")
     state.tier_config = _priv.load_tier_config(state.config)
+    from orchestratia_agent.config import config_permission_warning
+    _perm_warning = config_permission_warning(
+        state.config_path, bool((state.config.get("privilege") or {}).get("projects")))
+    if _perm_warning:
+        log.warning(_perm_warning)
 
     if not state.hub_url:
         log.error("hub_url not set in config")
@@ -216,6 +249,24 @@ async def main():
             signal.signal(signal.SIGBREAK, handle_signal)
         else:
             signal.signal(signal.SIGTERM, handle_signal)
+
+        # Stop code-server processes a previous daemon left orphaned (an upgrade loses
+        # the in-memory editor map while the children keep running). Once, at startup,
+        # before any editor can be reopened — so every match is genuinely an orphan.
+        if sys.platform != "win32":
+            try:
+                from orchestratia_agent import code_server
+                swept = code_server.reap_orphans()
+                if swept["stopped"]:
+                    log.info(f"Stopped {len(swept['stopped'])} orphaned editor process(es) from a previous run")
+                for pid, uid in swept["unkillable"]:
+                    log.warning(
+                        f"Orphaned locked-down editor pid={pid} (uid={uid}) survived a restart and "
+                        f"cannot be stopped by this daemon; it will free its port when that user's "
+                        f"session ends or the box reboots."
+                    )
+            except Exception as e:  # noqa: BLE001 — a cleanup failure must not stop the daemon
+                log.warning(f"Editor orphan sweep failed: {e}")
 
         log.info("Agent daemon running. Heartbeats every 30s, WS auto-reconnect enabled.")
 

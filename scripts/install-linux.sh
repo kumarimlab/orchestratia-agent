@@ -642,6 +642,16 @@ else
     info "  - Network issue (can this server reach the hub?)"
 fi
 
+# The config holds this server's API key. Registration runs as root, and an install
+# from before this line left it root-owned and world-readable — readable by every
+# local user, including locked-down project users. The daemon user owns it, nobody
+# else reads it. Also repairs an existing install on upgrade.
+if [ -f "${CONFIG_DIR}/config.yaml" ]; then
+    sudo chown "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}/config.yaml"
+    sudo chmod 0600 "${CONFIG_DIR}/config.yaml"
+fi
+sudo chmod 0750 "$CONFIG_DIR"
+
 # Step 5: Systemd service + agent sudoers
 step 5 "Setting up systemd service"
 
@@ -743,6 +753,16 @@ else
     STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo "unknown")
     warn "Service status: ${STATUS}"
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"
+fi
+
+# Step 5b: pre-fetch the code editor (optional, non-fatal).
+# The agent downloads a pinned, checksum-verified code-server into the service user's
+# home on first use anyway; doing it here makes the first "Open Editor" instant.
+info "Preparing the code editor (optional)..."
+if sudo -u "$RUN_USER" "$AGENT_BIN" ensure-code-server >/dev/null 2>&1; then
+    ok "Code editor ready"
+else
+    warn "Code editor not pre-installed — it will download the first time you open it"
 fi
 
 # Step 6: AI Agent integration (Claude Code, Gemini CLI, Codex CLI)

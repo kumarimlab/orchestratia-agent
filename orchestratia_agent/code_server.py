@@ -1,25 +1,33 @@
 """code-server (VS Code in the browser) lifecycle — agent side.
 
-One code-server process per project, launched on demand as the project's
-restricted OS user, bound to loopback, reachable only through the relay tunnel.
-The daemon (root-equivalent) never runs it directly.
+Two tiers, one session-keyed API:
+  * standard (default): one code-server process PER EDITOR SESSION, run as the
+    daemon user — the same power as a normal terminal session — from the pinned
+    binary the agent downloads itself (code_server_install). Settings and
+    extensions persist per project; each session gets its own user-data-dir so two
+    VS Code servers never contend for one.
+  * restricted: one process PER PROJECT, launched as the project's restricted OS
+    user via sudo (Spec A/B), shared by that project's editor sessions.
 
-Security posture (see the Spec B design doc):
+Security posture (see the Spec B and zero-touch editor design docs):
   * `--auth none` is safe ONLY because it binds 127.0.0.1 and the sole path in
     is the agent's outbound tunnel to the relay. NEVER bind a routable address.
-  * runs as `orcp-<project>` via sudo (kernel confinement from Spec A).
-  * private user-data/extensions dirs — not a shared marketplace tree.
-  * the terminal and proxy are handled in start()/config, not here.
+  * the relay decides what code-server's port proxy may reach, per tier.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import time
+
+from orchestratia_agent import code_server_install
+from orchestratia_agent import privilege as p
 
 log = logging.getLogger("orchestratia-agent.code_server")
 
@@ -32,35 +40,47 @@ IDLE_SECONDS = 1800
 
 # Clock seam so the idle logic is testable without sleeping.
 _clock = time.monotonic
+_STATE_ROOT_OVERRIDE: str | None = None
 
-# project_id -> subprocess.Popen of the running code-server
-_running: dict[str, subprocess.Popen] = {}
-# project_id -> last user-activity timestamp (monotonic)
-_last_activity: dict[str, float] = {}
+# A "key" owns one process: standard -> the editor session id;
+# restricted -> "project:<id>" (shared by that project's editor sessions).
+_running: dict[str, subprocess.Popen] = {}      # key -> process
+_session_key: dict[str, str] = {}               # editor session id -> key
+_key_meta: dict[str, dict] = {}                 # key -> {"tier", "project_id", "udd"}
+_last_activity: dict[str, float] = {}           # key -> monotonic time
+
+
+class EditorStartError(Exception):
+    """The editor could not be started; str(e) is shown to the user."""
 
 
 def _reset_for_test() -> None:
     _running.clear()
+    _session_key.clear()
+    _key_meta.clear()
     _last_activity.clear()
 
 
-def note_activity(project_id: str) -> None:
+def _key(session_id: str) -> str:
+    return _session_key.get(session_id, session_id)
+
+
+def note_activity(session_id: str) -> None:
     """Record real user activity (called by the relay bridge on each inbound
-    browser frame). Resets the idle clock."""
-    _last_activity[project_id] = _clock()
+    browser frame). Resets the idle clock of the process serving this session."""
+    _last_activity[_key(session_id)] = _clock()
 
 
 def reap_idle(running: set[str]) -> list[str]:
-    """Project ids whose editor has been idle past IDLE_SECONDS. `running` is the
-    set of projects with a live code-server (so a stale activity entry for an
-    already-stopped project is not returned)."""
+    """Editor session ids whose process has been idle past IDLE_SECONDS. `running`
+    is the set of live sessions (so a stale activity entry is not returned)."""
     now = _clock()
     idle = []
-    for pid in running:
-        last = _last_activity.get(pid)
+    for sid in running:
+        last = _last_activity.get(_key(sid))
         if last is None or (now - last) > IDLE_SECONDS:
-            idle.append(pid)
-    return idle
+            idle.append(sid)
+    return sorted(idle)
 
 
 def cfg_dir_for(user: str, project_id: str) -> str:
@@ -85,13 +105,11 @@ def cfg_dir_for(user: str, project_id: str) -> str:
 
 
 def spawn_argv(user: str, port: int, workspace: str, cfg_dir: str) -> list[str]:
-    """The locked-down argv to launch code-server as `user` on loopback:`port`.
+    """The LOCKED-DOWN argv: code-server as the restricted `user` on loopback:`port`.
 
-    Split out so it is testable without launching anything. `user` is always a
-    restricted project user — editors are restricted-only, so this always drops
+    Split out so it is testable without launching anything. Always drops
     privilege with `sudo -n -u <user> -H` (never -i: a login shell would
     re-parse a workspace path with spaces)."""
-    from orchestratia_agent import privilege as p
     tc = p.load_tier_config({})
     return p.sudo_prefix(user, tc) + [
         CODE_SERVER_BIN,
@@ -106,12 +124,27 @@ def spawn_argv(user: str, port: int, workspace: str, cfg_dir: str) -> list[str]:
     ]
 
 
-def settings_json() -> dict:
-    """VS Code settings for the editor: the default terminal attaches to the
-    project's governed tmux via `orchestratia-agent orc-attach`, so terminal work
-    flows through the hub (recorded, tiered) instead of being a raw unrecorded
-    shell. Extension auto-update is off (the extensions dir is isolated at spawn;
-    full marketplace lockdown is handled at the process level in start())."""
+def spawn_argv_standard(binary: str, port: int, workspace: str, user_data_dir: str,
+                        extensions_dir: str) -> list[str]:
+    """The standard editor's argv: the pinned binary, as the daemon user, loopback only."""
+    return [
+        binary,
+        "--auth", "none",
+        "--bind-addr", f"127.0.0.1:{port}",
+        "--disable-telemetry",
+        "--disable-update-check",
+        "--disable-workspace-trust",
+        "--user-data-dir", user_data_dir,
+        "--extensions-dir", extensions_dir,
+        workspace,
+    ]
+
+
+def settings_json(tier: str) -> dict:
+    """VS Code settings forced on every editor: the default terminal is the
+    Orchestratia session picker (`orchestratia-agent orc-attach`), so terminal work
+    flows through recorded sessions instead of a raw shell. Extension auto-update
+    is off."""
     return {
         "terminal.integrated.defaultProfile.linux": "orchestratia",
         "terminal.integrated.profiles.linux": {
@@ -124,6 +157,33 @@ def settings_json() -> dict:
         "extensions.autoCheckUpdates": False,
         "workbench.startupEditor": "none",
     }
+
+
+def write_settings(user_data_dir: str, tier: str, saved: str | None = None) -> str:
+    """Write <udd>/User/settings.json: the project's saved settings, ours forced on top."""
+    data: dict = {}
+    if saved and os.path.exists(saved):
+        try:
+            with open(saved) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data.update(loaded)
+        except (OSError, ValueError):
+            log.warning("ignoring unreadable saved editor settings at %s", saved)
+    data.update(settings_json(tier))
+    path = os.path.join(user_data_dir, "User", "settings.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def _state_root() -> str:
+    return _STATE_ROOT_OVERRIDE or os.path.expanduser("~/.local/share/orchestratia/editor")
+
+
+def standard_state_dir(project_id: str) -> str:
+    return os.path.join(_state_root(), project_id[:12])
 
 
 def _free_loopback_port() -> int:
@@ -140,66 +200,226 @@ def _free_loopback_port() -> int:
         s.close()
 
 
-def is_running(project_id: str) -> bool:
-    proc = _running.get(project_id)
+def is_running(session_id: str) -> bool:
+    proc = _running.get(_key(session_id)) if session_id in _session_key else None
     return proc is not None and proc.poll() is None
 
 
-def running_projects() -> set[str]:
-    """Projects with a live code-server (for the idle reaper)."""
-    return {pid for pid, proc in _running.items() if proc.poll() is None}
+def running_sessions() -> set[str]:
+    """Editor sessions whose process is live (for the idle reaper)."""
+    return {sid for sid in _session_key if is_running(sid)}
 
 
-def running_port(project_id: str) -> int | None:
-    """The loopback port code-server is bound to for this project, or None."""
-    proc = _running.get(project_id)
-    if proc is None or proc.poll() is not None:
+def running_port(session_id: str) -> int | None:
+    """The loopback port serving this editor session, or None."""
+    if not is_running(session_id):
         return None
-    return getattr(proc, "_orc_port", None)
+    return getattr(_running[_key(session_id)], "_orc_port", None)
 
 
-def start(project_id: str, workspace: str, tc) -> int:
-    """Start (or reuse) code-server for a project. Returns the loopback port.
+# How long a spawned code-server gets to accept connections before the start fails.
+STARTUP_TIMEOUT = 45.0
 
-    Resolves the project's restricted user and verifies the workspace via the
-    Spec A gate — a project with no provisioned user cannot get an editor."""
-    from orchestratia_agent import privilege as p
 
-    if is_running(project_id):
-        return running_port(project_id)
+def check_serving(session_id: str) -> bool:
+    """True once this editor's code-server accepts connections on its loopback port.
 
-    user = p.resolve_user("restricted", project_id, tc)   # raises if unprovisioned
-    cwd = p.verify_workspace("restricted", workspace, project_id, tc)
+    The relay bridge and the hub's "ready" wait on this: spawning is not serving, and
+    reporting ready early sent the first page load to a port nothing listened on.
+    A process that has already exited raises, so a crash reaches the user as its
+    reason rather than as a timeout."""
+    key = _session_key.get(session_id)
+    proc = _running.get(key) if key is not None else None
+    if proc is None:
+        raise EditorStartError("the editor is not running")
+    rc = proc.poll()
+    if rc is not None:
+        raise EditorStartError(f"the editor exited while starting (exit code {rc})")
+    try:
+        with socket.create_connection(("127.0.0.1", proc._orc_port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
+
+def start(session_id: str, project_id: str, workspace: str, tier: str, tc, *, hub_url: str = "") -> int:
+    """Start (or, for the restricted tier, reuse) code-server for an editor session.
+    Returns the loopback port."""
+    if tier == "standard":
+        return _start_standard(session_id, project_id, workspace, hub_url)
+    return _start_restricted(session_id, project_id, workspace, tc)
+
+
+def _start_standard(session_id: str, project_id: str, workspace: str, hub_url: str) -> int:
+    folder = os.path.expanduser(workspace or "~")
+    if not os.path.isdir(folder):
+        raise EditorStartError(f"folder {folder} does not exist on this server")
+    if not code_server_install.installed():
+        raise EditorStartError("the editor is not installed on this server yet")
+    state = standard_state_dir(project_id)
+    ext = os.path.join(state, "ext")
+    udd = os.path.join(state, "sessions", session_id[:12])
+    os.makedirs(ext, exist_ok=True)
+    write_settings(udd, "standard", saved=os.path.join(state, "settings.json"))
     port = _free_loopback_port()
-    cfg_dir = cfg_dir_for(user, project_id)
-    # Deliberately NOT created here. The daemon cannot write into the restricted
-    # user's home (0750, owned by that user), and creating it via sudo would mean
-    # widening the tier sudoers rule beyond tmux/git/code-server for a mkdir.
-    # code-server creates both dirs as itself on first start.
-
-    argv = spawn_argv(user, port, cwd, cfg_dir)
-    # start_new_session so stop() can signal the whole process group, and so a
-    # daemon exit does not take code-server's children with it unintentionally.
-    proc = subprocess.Popen(argv, start_new_session=True)
+    env = dict(os.environ)
+    env.update({
+        "ORCHESTRATIA_EDITOR_SESSION_ID": session_id,
+        "ORCHESTRATIA_PROJECT_ID": project_id,
+        "ORCHESTRATIA_HUB_URL": hub_url,
+    })
+    argv = spawn_argv_standard(code_server_install.binary_path(), port, folder, udd, ext)
+    # start_new_session so stop() can signal the whole process group.
+    proc = subprocess.Popen(argv, start_new_session=True, env=env)
     proc._orc_port = port   # type: ignore[attr-defined]
-    _running[project_id] = proc
-    note_activity(project_id)   # so a just-started editor is not instantly reaped
-    log.info("code-server started for project %s as %s on 127.0.0.1:%d",
-             project_id[:12], user, port)
+    _running[session_id] = proc
+    _session_key[session_id] = session_id
+    _key_meta[session_id] = {"tier": "standard", "project_id": project_id, "udd": udd}
+    _last_activity[session_id] = _clock()   # so a just-started editor is not instantly reaped
+    log.info("code-server started for session %s (standard) on 127.0.0.1:%d", session_id[:8], port)
     return port
 
 
-def stop(project_id: str) -> None:
-    """Stop code-server for a project. Signals ONLY this process group — never
-    `pkill -u <user>`, which would also kill the project user's tmux sessions
-    (Spec A recovery reattaches to those)."""
-    proc = _running.pop(project_id, None)
-    _last_activity.pop(project_id, None)
-    if proc is None or proc.poll() is not None:
-        return
+def _start_restricted(session_id: str, project_id: str, workspace: str, tc) -> int:
+    key = f"project:{project_id}"
+    proc = _running.get(key)
+    if proc is not None and proc.poll() is None:
+        _session_key[session_id] = key
+        _last_activity[key] = _clock()
+        return proc._orc_port   # type: ignore[attr-defined]
+
+    user = p.resolve_user("restricted", project_id, tc)   # raises if unprovisioned
+    cwd = p.verify_workspace("restricted", workspace, project_id, tc)
+    port = _free_loopback_port()
+    # The cfg dir is deliberately NOT created here: the daemon cannot write into the
+    # restricted user's home, and widening the tier sudoers rule for a mkdir would
+    # trade a real boundary for a convenience. code-server creates it as itself.
+    argv = spawn_argv(user, port, cwd, cfg_dir_for(user, project_id))
+    proc = subprocess.Popen(argv, start_new_session=True)
+    proc._orc_port = port   # type: ignore[attr-defined]
+    _running[key] = proc
+    _session_key[session_id] = key
+    _key_meta[key] = {"tier": "restricted", "project_id": project_id, "udd": None}
+    _last_activity[key] = _clock()
+    log.info("code-server started for project %s as %s on 127.0.0.1:%d", project_id[:12], user, port)
+    return port
+
+
+# The two roots a code-server --user-data-dir sits under, one per tier. Matching on
+# these (not just "code-server") means a stranger's own code-server install is left
+# alone. Standard lives in the daemon's home; restricted in each project user's home.
+_STANDARD_UDD_MARKER = os.sep + os.path.join("orchestratia", "editor") + os.sep
+_RESTRICTED_UDD_MARKER = os.sep + os.path.join(".orchestratia", "code-server") + os.sep
+
+
+def classify_editor_proc(argv: list[str]) -> dict | None:
+    """If `argv` is one of OUR code-server main processes, return {tier, port, udd}.
+
+    A main process has both --bind-addr and --user-data-dir; the workers (agentHost,
+    fileWatcher, ...) do not, so they are skipped — stopping the main one takes its
+    group down. Returns None for anything else, including a code-server that is not
+    ours (its user-data-dir is not under an Orchestratia editor root)."""
+    if not argv or "--user-data-dir" not in argv or "--bind-addr" not in argv:
+        return None
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        pass
-    log.info("code-server stopped for project %s", project_id[:12])
+        udd = argv[argv.index("--user-data-dir") + 1]
+        addr = argv[argv.index("--bind-addr") + 1]
+        port = int(addr.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    if _STANDARD_UDD_MARKER in udd:
+        tier = "standard"
+    elif _RESTRICTED_UDD_MARKER in udd:
+        tier = "restricted"
+    else:
+        return None
+    return {"tier": tier, "port": port, "udd": udd}
+
+
+def _proc_iter():
+    """Yield (pid, uid, argv) for every process on the box. cmdline is world-readable,
+    so this sees other users' code-server too (which the daemon then cannot signal)."""
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+            uid = os.stat(f"/proc/{pid}").st_uid
+        except OSError:
+            continue
+        yield pid, uid, argv
+
+
+def reap_orphans(*, proc_iter=None, own_uid=None, pgid_of=None, kill=None) -> dict:
+    """Stop editor code-server processes left running by a PREVIOUS daemon.
+
+    The live-editor map is in-memory, so an agent restart (an upgrade, most often)
+    loses it while the code-server children — spawned with start_new_session — keep
+    running, orphaned: the tab is already dead (its relay bridge is gone) but the
+    process holds a port and the workspace open forever, and a later stop can't find
+    it. Called ONCE at startup, before any editor is (re)started, so every match is by
+    definition an orphan.
+
+    Only the daemon's OWN processes (the standard, zero-touch tier) can be signalled;
+    a project user's restricted process belongs to another uid and is reported so the
+    hub reaper / an operator can see it. A process this daemon is already tracking is
+    never touched (defensive — nothing should be tracked yet at startup)."""
+    proc_iter = proc_iter or _proc_iter
+    own_uid = os.geteuid() if own_uid is None else own_uid
+    pgid_of = pgid_of or os.getpgid
+    kill = kill or os.killpg
+    tracked = {m.get("udd") for m in _key_meta.values() if m.get("udd")}
+    stopped = []
+    # A locked-down editor appears twice — the root `sudo` monitor and the code-server
+    # it dropped to — both carrying our --user-data-dir. Report each workspace once, as
+    # the real (non-root) process, so the operator sees one line per orphaned editor.
+    foreign: dict[str, tuple[int, int]] = {}
+    for pid, uid, argv in proc_iter():
+        info = classify_editor_proc(argv)
+        if info is None or info["udd"] in tracked:
+            continue
+        if uid != own_uid:
+            prev = foreign.get(info["udd"])
+            if prev is None or (prev[1] == 0 and uid != 0):
+                foreign[info["udd"]] = (pid, uid)
+            continue
+        try:
+            kill(pgid_of(pid), signal.SIGTERM)
+            stopped.append(pid)
+        except (OSError, ProcessLookupError):
+            pass
+    return {"stopped": stopped, "unkillable": list(foreign.values())}
+
+
+def stop(session_id: str) -> None:
+    """End an editor session. Stops its process once no other session uses it.
+
+    Signals ONLY that process group — never `pkill -u <user>`, which would also
+    kill tmux sessions running as the same user. For the standard tier the
+    session's settings are saved back to the project before its dir is removed."""
+    key = _session_key.pop(session_id, None)
+    if key is None or key in _session_key.values():
+        return
+    proc = _running.pop(key, None)
+    meta = _key_meta.pop(key, {})
+    _last_activity.pop(key, None)
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    udd = meta.get("udd")
+    if meta.get("tier") == "standard" and udd:
+        src = os.path.join(udd, "User", "settings.json")
+        dst = os.path.join(standard_state_dir(meta["project_id"]), "settings.json")
+        try:
+            if os.path.exists(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(src, dst)
+        except OSError:
+            log.warning("could not save editor settings for session %s", session_id[:8])
+        finally:
+            shutil.rmtree(udd, ignore_errors=True)
+    log.info("code-server stopped for %s", key if key.startswith("project:") else f"session {key[:8]}")

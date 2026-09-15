@@ -37,6 +37,15 @@ FORBIDDEN_TREES = (
 # tree would cover every project on the box.
 FORBIDDEN_EXACT = {"/", "/home", "/srv", "/opt", "/tmp", "/var", "/mnt", "/media"}
 
+# Credential STORES, not tool folders: project repos routinely contain `.claude/` and
+# `.orchestratia/` (settings, memory), so those are matched on the secret itself.
+SENSITIVE_ENTRIES = (".ssh", ".gnupg", ".aws", ".kube",
+                     os.path.join(".config", "gcloud"),
+                     os.path.join(".docker", "config.json"),
+                     os.path.join(".claude", ".credentials.json"),
+                     os.path.join(".orchestratia", "ssh_keys"))
+ORCHESTRATIA_PATHS = ("/opt/orchestratia-agent", "/opt/orchestratia-venv")
+
 RESERVED_USERS = {"root", "daemon", "bin", "sys", "adm", "sudo", "docker"}
 
 # NOT a denylist. A denylist of "the dangerous groups" missed lxd (container
@@ -111,7 +120,81 @@ def validate_workspace(path: str) -> str:
                 f"refusing to grant {resolved!r}: it is inside {tree!r}, "
                 f"which would defeat the tier"
             )
+    _validate_not_home_internals(resolved)
+    _validate_not_orchestratia(resolved)
+    for entry in SENSITIVE_ENTRIES:
+        if os.path.lexists(os.path.join(resolved, entry)):
+            raise ProvisionError(f"refusing to grant {resolved!r}: it contains {entry} (credentials)")
+    # ...and never one INSIDE a store: refusing only the folder that contains .ssh let
+    # `--workspace /home/dev/.ssh` through, ACL'ing the daemon user's private key.
+    parts = _casefolded_parts(resolved)
+    for entry in SENSITIVE_ENTRIES:
+        e = _casefolded_parts(entry)
+        if any(parts[i:i + len(e)] == e for i in range(len(parts) - len(e) + 1)):
+            raise ProvisionError(f"refusing to grant {resolved!r}: it is inside {entry} (credentials)")
     return resolved
+
+
+def _casefolded_parts(path: str) -> list[str]:
+    # Case-folded because macOS homes are case-insensitive: ~/.SSH is ~/.ssh there.
+    return [p.casefold() for p in path.split(os.sep) if p]
+
+
+def _validate_not_home_internals(resolved: str) -> None:
+    """A home, anything above one, and the parts of one its owner depends on.
+
+    A recursive rwX ACL on a home hands over its ~/.ssh — a path to that user and then
+    root. The same holds one level down: the top-level dot-folders hold credentials and
+    programs the owner runs (~/.config/gh tokens, ~/.local/share/orchestratia/code-server),
+    and ~/bin is on the owner's PATH. A project folder inside a home is fine.
+    """
+    for home in _home_dirs():
+        if resolved == home:
+            raise ProvisionError(
+                f"refusing to grant {resolved!r}: it is a user's home directory — granting it "
+                f"would expose ~/.ssh and other credentials; grant a project folder inside it"
+            )
+        if _is_within(home, resolved):
+            raise ProvisionError(
+                f"refusing to grant {resolved!r}: it contains the home directory {home!r}"
+            )
+        if _is_within(resolved, home):
+            first = os.path.relpath(resolved, home).split(os.sep)[0]
+            if first.startswith(".") or first.casefold() == "bin":
+                raise ProvisionError(
+                    f"refusing to grant {resolved!r}: {os.path.join(home, first)!r} holds that "
+                    f"user's credentials, settings or programs; grant a project folder instead"
+                )
+
+
+def _home_dirs(entries=None) -> set[str]:
+    """Every person's home on the box, plus /root and the caller's own.
+
+    A person is a login account — uid 1000 and up (not nobody) — or any account housed
+    under /home or /Users. Service accounts are not: www-data's /var/www must stay
+    grantable as a place projects live.
+    """
+    import pwd
+    homes = {"/root"}
+    for pw in (pwd.getpwall() if entries is None else entries):
+        home = pw.pw_dir
+        if not home or home == "/":
+            continue
+        person = 1000 <= pw.pw_uid < 65534 or home.startswith(("/home/", "/Users/"))
+        if person and os.path.isdir(home):
+            homes.add(os.path.realpath(home))
+    if entries is None:
+        try:
+            homes.add(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+        except KeyError:
+            pass
+    return homes
+
+
+def _validate_not_orchestratia(resolved: str) -> None:
+    for root in ORCHESTRATIA_PATHS:
+        if _is_within(resolved, root):
+            raise ProvisionError(f"refusing to grant {resolved!r}: it is part of Orchestratia's own install")
 
 
 def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: str,
@@ -202,6 +285,98 @@ def acl_commands(user: str, workspace: str) -> list[list[str]]:
         cmds.append(["setfacl", "-m", f"u:{user}:--x", parent])
         parent = nxt
     return cmds
+
+
+def merge_project_workspaces(existing_projects: dict, project_id: str, user: str,
+                             spaces: list[str]) -> dict:
+    """Add `spaces` to the project's recorded workspaces. Never drops one.
+
+    The config is the only record of what was granted. Replacing the list left the
+    dropped folders' ACLs on disk with nothing showing them — found on staging as a
+    locked-down user still able to read the daemon user's SSH key. Removal is the
+    explicit --revoke-workspace, which takes the access away along with the record.
+
+    A recorded grant that validation now refuses blocks re-provisioning until it is
+    revoked, rather than being carried forward as if it were fine.
+    """
+    merged = {pid: dict(spec or {}) for pid, spec in (existing_projects or {}).items()}
+    recorded = list((merged.get(project_id) or {}).get("workspaces") or [])
+    for w in recorded:
+        try:
+            validate_workspace(w)
+        except ProvisionError as e:
+            raise ProvisionError(
+                f"project {project_id} already has a grant that is no longer allowed ({e}). "
+                f"Remove it first: sudo orchestratia-agent provision-tier --project {project_id} "
+                f"--revoke-workspace {w}"
+            ) from e
+    for w in spaces:
+        if w not in recorded:
+            recorded.append(w)
+    merged[project_id] = {**(merged.get(project_id) or {}), "user": user, "workspaces": recorded}
+    return merged
+
+
+def _normalise_for_revoke(path: str) -> str:
+    """Shape checks only. Removing access must work for exactly the paths that
+    validate_workspace would now refuse, so its policy checks do not apply here."""
+    if not isinstance(path, str) or any(c in path for c in "\n\r\t\0"):
+        raise ProvisionError(f"invalid workspace {path!r}: control characters")
+    if not path.startswith("/"):
+        raise ProvisionError(f"workspace {path!r} must be an absolute path")
+    normalised = os.path.normpath(path)
+    while normalised.startswith("//"):
+        normalised = normalised[1:]
+    if normalised == "/":
+        raise ProvisionError("refusing to revoke '/': name the workspace that was granted")
+    # setfacl -P silently SKIPS a symlink argument and exits 0, which would report a
+    # revoke that never happened.
+    if os.path.islink(normalised):
+        raise ProvisionError(f"refusing to revoke {normalised!r}: it is a symlink; name the real path")
+    if os.path.lexists(normalised) and os.path.realpath(normalised) != normalised:
+        raise ProvisionError(
+            f"refusing to revoke {normalised!r}: it resolves to {os.path.realpath(normalised)!r}"
+        )
+    return normalised
+
+
+def revoke_commands(user: str, workspace: str, remaining: list[str]) -> list[list[str]]:
+    """Take one workspace grant away: its recursive ACL and its parents' traverse.
+
+    A parent's traverse entry may also serve a workspace that stays, and a remaining
+    workspace inside the revoked tree loses its own grant to the recursive removal. So
+    what remains is re-applied afterwards — fully where it overlaps the revoked tree,
+    traverse-only elsewhere (a recursive re-grant of an unrelated repo is just slow).
+    """
+    user = validate_username(user)
+    workspace = _normalise_for_revoke(workspace)
+    for w in remaining:
+        if _is_within(workspace, w):
+            raise ProvisionError(
+                f"refusing to revoke {workspace!r}: it is inside the workspace {w!r}, whose "
+                f"grant still covers it; revoke {w!r} instead"
+            )
+    cmds = [["setfacl", "-P", "-R", "-x", f"u:{user}", workspace]]
+    parent = os.path.dirname(workspace)
+    while True:
+        nxt = os.path.dirname(parent)
+        if parent == nxt:
+            break
+        cmds.append(["setfacl", "-x", f"u:{user}", parent])
+        parent = nxt
+    for w in remaining:
+        grant = acl_commands(user, w)
+        cmds.extend(grant if _is_within(w, workspace) else grant[1:])
+    return cmds
+
+
+def _acl_perms(getfacl_output: str, user: str) -> str | None:
+    """The named user's permission triple in `getfacl` output, or None."""
+    prefix = f"user:{user}:"
+    for line in getfacl_output.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):len(prefix) + 3]
+    return None
 
 
 def workspace_lockdown_command(workspace: str) -> list[str]:
@@ -302,6 +477,48 @@ def _ensure_editor_state_dir(user: str) -> None:
     print(f"  editor state dir {root}")
 
 
+# Run as the project user by _write_editor_settings: merge the forced keys into the
+# locked-down editor's settings, keeping the user's own.
+_WRITE_SETTINGS = """\
+import json, os, sys
+path, forced = sys.argv[1], json.loads(sys.argv[2])
+try:
+    with open(path) as f:
+        data = json.load(f)
+    data = data if isinstance(data, dict) else {}
+except (OSError, ValueError):
+    data = {}
+data.update(forced)
+os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp, path)
+"""
+
+
+def _write_editor_settings(user: str, project_id: str) -> None:
+    """Point the locked-down editor's terminal at the Orchestratia session picker.
+
+    Nothing else can: the daemon cannot write into the project user's home, and the
+    tier sudoers rule stays tmux/git/code-server. Without this the editor's terminal was
+    a plain shell, outside the recorded sessions. Written AS the project user, never as
+    root: the directory is theirs, so a root write could be redirected through a symlink
+    they planted. The user may change these settings — they are a default, not a control.
+    """
+    import json
+    import sys
+    from orchestratia_agent import code_server as cs
+    path = os.path.join(cs.cfg_dir_for(user, project_id), "User", "settings.json")
+    result = subprocess.run(
+        [sys.executable, "-c", _WRITE_SETTINGS, path, json.dumps(cs.settings_json("restricted"))],
+        user=user, group=user, extra_groups=[], cwd="/", capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise ProvisionError(f"could not write the editor settings for {user}: {result.stderr.strip()}")
+    print(f"  editor settings {path}")
+
+
 def provision(project_id: str, workspaces: list[str],
               daemon_user: str, config_path: str,
               code_server_path: str | None = None) -> int:
@@ -310,7 +527,8 @@ def provision(project_id: str, workspaces: list[str],
     Derives the OS user deterministically from project_id, refuses a hash
     collision with a different project, applies workspace ACLs, and rewrites the
     sudoers drop-in from ALL provisioned projects (so an existing project's rule
-    survives a new project being added). Merges — never replaces — the projects map.
+    survives a new project being added). Merges — never replaces — the projects map,
+    and adds to (never replaces) the project's workspaces: see merge_project_workspaces.
     """
     if os.geteuid() != 0:
         raise ProvisionError("provision-tier must be run as root (use sudo)")
@@ -369,8 +587,7 @@ def provision(project_id: str, workspaces: list[str],
 
     # Merge this project in, then build ALL sudoers lines. Validating the whole
     # set now means bad input fails before any user/ACL/file change.
-    merged_projects = dict(existing_projects)
-    merged_projects[project_id] = {"user": user, "workspaces": spaces}
+    merged_projects = merge_project_workspaces(existing_projects, project_id, user, spaces)
     lines = sudoers_lines(daemon_user, merged_projects, tmux_path, git_path,
                           code_server_path=cs_path)
 
@@ -385,6 +602,8 @@ def provision(project_id: str, workspaces: list[str],
     _strip_supplementary_groups(user)
     _assert_unprivileged(user)
     _ensure_editor_state_dir(user)
+    if cs_path:
+        _write_editor_settings(user, project_id)
 
     # 2. Workspace ACLs for THIS project's workspaces.
     home_roots = [h for h in ("/home", "/Users") if os.path.isdir(h)]
@@ -432,11 +651,73 @@ def provision(project_id: str, workspaces: list[str],
 
     print(f"\n  Project:            {project_id}")
     print(f"  Restricted user:    {user}")
-    print(f"  Workspaces granted: {', '.join(spaces)}")
+    print(f"  Workspaces granted: {', '.join(merged_projects[project_id]['workspaces'])}")
     print(f"  Projects on this box: {', '.join(merged_projects)}")
     print("\n  NEXT — authenticate your agent tooling once, as that user:")
     print(f"      sudo -iu {user}")
     print("      claude login      # or: gemini auth / codex login")
+    print("\n  Then restart the daemon:")
+    print("      sudo systemctl restart orchestratia-agent\n")
+    return 0
+
+
+def revoke(project_id: str, workspaces: list[str], config_path: str) -> int:
+    """Take workspace grants away from ONE project's restricted user. Root only.
+
+    Removes the ACLs, re-applies what the project keeps, verifies the result with
+    getfacl rather than trusting setfacl's exit code, then drops the record. A path
+    the config does not list is still cleaned: that is exactly the grant that was
+    left behind when re-provisioning used to replace the list.
+    """
+    if os.geteuid() != 0:
+        raise ProvisionError("provision-tier must be run as root (use sudo)")
+    from orchestratia_agent.privilege import project_username
+    user = validate_username(project_username(project_id))
+    if not workspaces:
+        raise ProvisionError("at least one --revoke-workspace is required")
+    if not shutil.which("setfacl") or not shutil.which("getfacl"):
+        raise ProvisionError("setfacl/getfacl not found; install the 'acl' package")
+
+    from orchestratia_agent.config import load_config, save_config
+    try:
+        cfg = load_config(config_path) or {}
+    except Exception as e:  # noqa: BLE001
+        raise ProvisionError(f"cannot read config {config_path}: {e}") from e
+    priv = dict(cfg.get("privilege") or {})
+    projects = dict(priv.get("projects") or {})
+    spec = dict(projects.get(project_id) or {})
+    if not spec:
+        raise ProvisionError(f"project {project_id} has no restricted tier on this box")
+
+    recorded = list(spec.get("workspaces") or [])
+    targets = [_normalise_for_revoke(w) for w in workspaces]
+    remaining = [w for w in recorded if w not in targets]
+    plans = [(t, revoke_commands(user, t, remaining)) for t in targets]   # all refusals first
+
+    for target, cmds in plans:
+        for cmd in cmds:
+            if "-x" in cmd and not os.path.lexists(cmd[-1]):
+                continue                      # a folder deleted since it was granted
+            _run(cmd)
+        if os.path.lexists(target):
+            perms = _acl_perms(_run(["getfacl", "-p", target]).stdout or "", user)
+            # Traverse is still expected when a kept workspace lies inside the target.
+            needs_traverse = any(_is_within(w, target) for w in remaining)
+            if perms is not None and not (needs_traverse and perms == "--x"):
+                raise ProvisionError(f"{target} still grants {user} {perms} after the revoke")
+        note = "" if target in recorded else " (not in the config — cleared anyway)"
+        print(f"  revoked {target}{note}")
+        if os.path.lexists(target):
+            print(f"    world access on {target} stays removed; restore it with chmod o+rX if needed")
+
+    spec["workspaces"] = remaining
+    projects[project_id] = spec
+    priv["projects"] = projects
+    cfg["privilege"] = priv
+    save_config(config_path, cfg)
+    print(f"\n  Project:            {project_id}")
+    print(f"  Restricted user:    {user}")
+    print(f"  Workspaces granted: {', '.join(remaining) or '(none)'}")
     print("\n  Then restart the daemon:")
     print("      sudo systemctl restart orchestratia-agent\n")
     return 0

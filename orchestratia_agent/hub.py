@@ -75,6 +75,24 @@ def _priv_user_for(state, tier: str, project_id: str | None) -> str | None:
         return None
 
 
+def _editor_tier_from(msg: dict) -> str:
+    """Pre-0.31 hubs never sent a tier and only offered the locked-down editor."""
+    return "standard" if msg.get("privilege_tier") == "standard" else "restricted"
+
+
+def _editor_capability() -> dict | None:
+    """Advertise the zero-touch editor only where it can actually run (Linux amd64/arm64)."""
+    from orchestratia_agent import code_server_install
+    if platform.system() != "Linux":
+        return None
+    try:
+        code_server_install.arch()
+    except code_server_install.InstallError:
+        return None
+    return {"supported": True, "installed": code_server_install.installed(),
+            "version": code_server_install.VERSION}
+
+
 def _tier_config(state):
     """Tier config, resolving lazily if startup has not set it yet.
 
@@ -177,7 +195,7 @@ async def register_with_hub(
             "machine_id": get_machine_id(),
             "mac_address": get_mac_address(),
             "capabilities": privilege.merge_capabilities(
-                state.config.get("capabilities"), _tier_config(state)
+                state.config.get("capabilities"), _tier_config(state), _editor_capability()
             ),
         }
 
@@ -229,7 +247,7 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
                 # Re-advertised every beat so `provision-tier` takes effect on
                 # the next heartbeat rather than needing a re-registration.
                 "capabilities": privilege.merge_capabilities(
-                    state.config.get("capabilities"), _tier_config(state)
+                    state.config.get("capabilities"), _tier_config(state), _editor_capability()
                 ),
             },
             headers={"X-API-Key": state.api_key},
@@ -1129,10 +1147,15 @@ async def ws_receive_loop(ws, state: DaemonState):
                 relay_url = msg.get("relay_url") or state.config.get("relay_url")
                 if session_id and project_id and working_dir and relay_url:
                     asyncio.create_task(_handle_code_server_start(
-                        state, session_id, project_id, working_dir, relay_url))
+                        state, session_id, project_id, working_dir, relay_url,
+                        _editor_tier_from(msg)))
                 else:
                     log.warning("code_server_start missing fields (need session_id, "
                                 "project_id, working_directory, relay_url)")
+                    if session_id:
+                        await ws_send(state, {"type": "editor_status", "session_id": session_id,
+                                              "state": "error",
+                                              "reason": "the hub sent an incomplete editor request"})
 
             elif msg_type == "code_server_stop":
                 session_id = msg.get("session_id")
@@ -1880,10 +1903,7 @@ async def _handle_fs_request(state: DaemonState, sender, msg_type: str, request_
     await sender(response)
 
 
-# Editor project_id -> set of live editor session_ids, so the idle reaper can
-# tear down every relay bridge for a project it stops.
-_editor_sessions: dict[str, set] = {}
-# session_id -> (workspace, run_as). Needed at close to diff against the baseline;
+# Editor session_id -> (workspace, run_as). Needed at close to diff against the baseline;
 # the stop message carries only ids.
 _editor_workspaces: dict[str, tuple] = {}
 _editor_reaper_task = None
@@ -1905,27 +1925,88 @@ async def _editor_reaper_loop(state: DaemonState):
     while getattr(state, "running", True):
         await asyncio.sleep(60)
         try:
-            for pid in code_server.reap_idle(code_server.running_projects()):
-                for sid in list(_editor_sessions.get(pid, set())):
-                    await relay_client.disconnect(sid)
-                _editor_sessions.pop(pid, None)
-                code_server.stop(pid)
-                log.info("editor idle-stopped: project %s", pid[:12])
+            for sid in code_server.reap_idle(code_server.running_sessions()):
+                await _handle_code_server_stop(sid, None, state)
+                await ws_send(state, {"type": "editor_status", "session_id": sid,
+                                      "state": "stopped", "reason": "idle"})
+                log.info("editor idle-stopped: session %s", sid[:8])
         except Exception:
             log.exception("editor reaper error")
 
 
+# Editor starts still in progress, and those the hub stopped before they finished.
+# A stop can arrive while a start is downloading or waiting for code-server to
+# listen, when there is nothing registered yet for it to stop; without this the start
+# carried on and left an editor running for a session that no longer existed.
+_editor_starts: set[str] = set()
+_editor_starts_stopped: set[str] = set()
+
+
+class _EditorStartStopped(Exception):
+    """The hub stopped this editor while it was starting."""
+
+
+def _raise_if_stopped(session_id: str) -> None:
+    if session_id in _editor_starts_stopped:
+        raise _EditorStartStopped(session_id)
+
+
 async def _handle_code_server_start(state: DaemonState, session_id: str,
-                                    project_id: str, working_dir: str, relay_url: str):
-    """Start code-server for a project and bridge it to the relay tier."""
-    from orchestratia_agent import code_server, relay_client, privilege
+                                    project_id: str, working_dir: str, relay_url: str,
+                                    tier: str = "restricted"):
+    """Start code-server for an editor session and bridge it to the relay tier.
+
+    Every outcome is reported to the hub as `editor_status` — a refusal that is only
+    logged leaves the session in `starting` and the user watching a spinner. The one
+    exception is a start the hub stopped midway: that session is already closed, so
+    the start is abandoned quietly. Its process (if any) and evidence entry were
+    already released by the stop handler, which runs before the start notices."""
+    _editor_starts.add(session_id)
+    try:
+        await _run_code_server_start(state, session_id, project_id, working_dir, relay_url, tier)
+    except _EditorStartStopped:
+        log.info("editor start for %s abandoned: the session was stopped", session_id[:8])
+    finally:
+        _editor_starts.discard(session_id)
+        _editor_starts_stopped.discard(session_id)
+
+
+async def _run_code_server_start(state: DaemonState, session_id: str, project_id: str,
+                                 working_dir: str, relay_url: str, tier: str):
+    from orchestratia_agent import code_server, code_server_install, relay_client, privilege
+
+    async def status(st: str, reason: str = "") -> None:
+        await ws_send(state, {"type": "editor_status", "session_id": session_id,
+                              "state": st, "reason": reason})
+
     tc = _tier_config(state)
     try:
-        port = code_server.start(project_id, working_dir, tc)
-    except privilege.PrivilegeError as e:
-        log.error("code_server_start refused for %s: %s", session_id[:8], e)
+        if tier == "standard" and not code_server_install.installed():
+            await status("preparing", "Preparing the editor (first time on this server)")
+            await asyncio.get_running_loop().run_in_executor(None, code_server_install.ensure)
+        _raise_if_stopped(session_id)
+        port = code_server.start(session_id, project_id, working_dir, tier, tc,
+                                 hub_url=getattr(state, "hub_url", "") or "")
+        await _wait_until_serving(session_id, status)
+    except _EditorStartStopped:
+        raise
+    except code_server_install.InstallError as e:
+        _raise_if_stopped(session_id)
+        log.error("editor install failed for %s: %s", session_id[:8], e.reason)
+        await status("error", e.reason)
         return
-    _editor_sessions.setdefault(project_id, set()).add(session_id)
+    except (code_server.EditorStartError, privilege.PrivilegeError) as e:
+        # A stop mid-wait kills the process, which surfaces here as "exited".
+        _raise_if_stopped(session_id)
+        log.error("code_server_start refused for %s: %s", session_id[:8], e)
+        code_server.stop(session_id)
+        await status("error", str(e))
+        return
+    except Exception as e:  # noqa: BLE001 — any failure must reach the user
+        log.exception("code_server_start failed for %s", session_id[:8])
+        code_server.stop(session_id)
+        await status("error", f"could not start the editor: {e}")
+        return
     # An editor has no PTY recording, so its audit evidence is the git diff it
     # leaves behind. Capture the BEFORE state now; the hub stores it write-once.
     # Run as the project user: git in a workspace we do not own can execute
@@ -1934,10 +2015,13 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
     # again here rather than assume a name: git must run AS that user, not as the
     # daemon — a workspace we do not own can execute repo-controlled code, which
     # is the entire reason the tier exists.
-    try:
-        editor_user = privilege.resolve_user("restricted", project_id, tc)
-    except Exception:  # noqa: BLE001
-        editor_user = None
+    editor_user = None
+    if tier != "standard":
+        try:
+            editor_user = privilege.resolve_user("restricted", project_id, tc)
+        except Exception:  # noqa: BLE001
+            editor_user = None
+    working_dir = os.path.expanduser(working_dir)
     _editor_workspaces[session_id] = (working_dir, editor_user)
     try:
         from orchestratia_agent import git_changes
@@ -1950,15 +2034,41 @@ async def _handle_code_server_start(state: DaemonState, session_id: str,
                  session_id[:8], base.get("is_repo"), sent_ok)
     except Exception as e:  # noqa: BLE001
         log.warning("editor baseline failed for session %s: %s", session_id[:8], e)
+    _raise_if_stopped(session_id)          # the baseline above can take a while
     _ensure_editor_reaper(state)
     from orchestratia_agent.tls import build_ssl_context
     ssl_ctx = build_ssl_context(state=state)
     relay_client.connect(
         session_id, relay_url, state.api_key, port,
-        on_activity=lambda: code_server.note_activity(project_id),
+        on_activity=lambda: code_server.note_activity(session_id),
         ssl_ctx=ssl_ctx,
     )
-    log.info("editor started: session %s project %s -> relay", session_id[:8], project_id[:12])
+    log.info("editor started: session %s project %s (%s) -> relay", session_id[:8], project_id[:12], tier)
+    await status("ready")
+
+
+# The dashboard gives up on a start it hears nothing about for 20s, so a slow start
+# says so well before that.
+SLOW_START_NOTICE_S = 5.0
+
+
+async def _wait_until_serving(session_id: str, status) -> None:
+    """Block until code-server accepts connections; raise EditorStartError if it
+    exits first or never does. See code_server.check_serving."""
+    from orchestratia_agent import code_server
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    told = False
+    while not code_server.check_serving(session_id):
+        _raise_if_stopped(session_id)
+        waited = loop.time() - started
+        if waited >= code_server.STARTUP_TIMEOUT:
+            raise code_server.EditorStartError(
+                f"the editor did not start within {int(code_server.STARTUP_TIMEOUT)}s")
+        if not told and waited >= SLOW_START_NOTICE_S:
+            await status("preparing", "Starting the editor…")
+            told = True
+        await asyncio.sleep(0.1)
 
 
 async def _handle_code_server_stop(session_id: str, project_id: str | None,
@@ -1966,6 +2076,9 @@ async def _handle_code_server_stop(session_id: str, project_id: str | None,
     """Tear down one editor session's relay bridge; stop code-server when the
     project has no more live editor sessions."""
     from orchestratia_agent import code_server, relay_client
+
+    if session_id in _editor_starts:
+        _editor_starts_stopped.add(session_id)   # the start abandons itself; see above
 
     # Snapshot the diff BEFORE tearing anything down — this is the session's only
     # audit evidence, and a close frequently happens with nobody watching
@@ -1987,13 +2100,7 @@ async def _handle_code_server_stop(session_id: str, project_id: str | None,
             log.warning("editor diff failed for session %s: %s", session_id[:8], e)
 
     await relay_client.disconnect(session_id)
-    if project_id:
-        sids = _editor_sessions.get(project_id)
-        if sids:
-            sids.discard(session_id)
-            if not sids:
-                _editor_sessions.pop(project_id, None)
-                code_server.stop(project_id)
+    code_server.stop(session_id)   # the process stops once no other session uses it
 
 
 async def _handle_git_changes(state: DaemonState, sender, msg: dict):

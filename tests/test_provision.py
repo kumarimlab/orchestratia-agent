@@ -254,6 +254,288 @@ def test_provision_creates_exactly_the_dir_code_server_will_use():
     assert cfg.startswith(root.rstrip("/") + "/"), f"{cfg} not under {root}"
 
 
+# ── locked-down workspaces must not hand out the daemon user's credentials ────
+# A recursive rwX ACL on /home/<user> gave the restricted user ~/.ssh — a path to
+# the daemon user and from there root. Found 2026-09-14.
+
+def test_workspace_refuses_home_dirs_and_credential_stores():
+    import shutil
+    import tempfile
+    base = tempfile.mkdtemp()
+    home = os.path.join(base, "home-ubuntu")
+    os.makedirs(os.path.join(home, "app"))
+    creds = os.path.join(base, "with-ssh")
+    os.makedirs(os.path.join(creds, ".ssh"))
+    gcloud = os.path.join(base, "with-gcloud")
+    os.makedirs(os.path.join(gcloud, ".config", "gcloud"))
+    claude = os.path.join(base, "with-claude-creds")
+    os.makedirs(os.path.join(claude, ".claude"))
+    open(os.path.join(claude, ".claude", ".credentials.json"), "w").close()
+    repo = os.path.join(base, "repo")
+    os.makedirs(os.path.join(repo, ".claude"))
+    os.makedirs(os.path.join(repo, ".orchestratia", "memory"))
+    saved = pv._home_dirs
+    try:
+        pv._home_dirs = lambda: {home}
+        _rejects(pv.validate_workspace, home, "a user's home directory must be refused")
+        _rejects(pv.validate_workspace, creds, "a folder containing .ssh must be refused")
+        _rejects(pv.validate_workspace, gcloud, "a folder containing .config/gcloud must be refused")
+        _rejects(pv.validate_workspace, claude, "a folder holding Claude credentials must be refused")
+        assert pv.validate_workspace(os.path.join(home, "app")) == os.path.join(home, "app"), \
+            "a project folder inside a home is fine"
+        assert pv.validate_workspace(repo) == repo, \
+            "a repo with project .claude/ and .orchestratia/ folders is fine"
+        os.makedirs(os.path.join(repo, ".orchestratia", "ssh_keys"))
+        _rejects(pv.validate_workspace, repo, "a folder holding Orchestratia ssh keys must be refused")
+    finally:
+        pv._home_dirs = saved
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_workspace_refuses_paths_inside_credential_stores():
+    """Refusing a folder that CONTAINS .ssh is not enough: `--workspace /home/dev/.ssh`
+    passed and ACL'd the daemon user's private key to the locked-down user. Found on
+    staging, 2026-09-14."""
+    import shutil
+    import tempfile
+    base = tempfile.mkdtemp()
+    ssh = os.path.join(base, "srv", ".ssh")
+    os.makedirs(os.path.join(ssh, "sub"))
+    gcloud_sub = os.path.join(base, "srv", ".config", "gcloud", "configs")
+    os.makedirs(gcloud_sub)
+    keys = os.path.join(base, "srv", ".orchestratia", "ssh_keys")
+    os.makedirs(keys)
+    upper = os.path.join(base, "srv", ".AWS")
+    os.makedirs(upper)
+    saved = pv._home_dirs
+    try:
+        pv._home_dirs = lambda: set()
+        _rejects(pv.validate_workspace, ssh, "a .ssh folder itself must be refused")
+        _rejects(pv.validate_workspace, os.path.join(ssh, "sub"), "a folder inside .ssh must be refused")
+        _rejects(pv.validate_workspace, gcloud_sub, "a folder inside .config/gcloud must be refused")
+        _rejects(pv.validate_workspace, keys, "Orchestratia's ssh_keys folder must be refused")
+        _rejects(pv.validate_workspace, upper, "credential stores match case-insensitively (macOS)")
+        hidden = os.path.join(base, "srv", ".cache-free", "proj")
+        os.makedirs(hidden)
+        assert pv.validate_workspace(hidden) == hidden, "a hidden folder outside any home is fine"
+    finally:
+        pv._home_dirs = saved
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_workspace_refuses_a_homes_dotfolders_bin_and_ancestors():
+    """Inside a home, the top-level dot-folders hold credentials and executables the
+    daemon user runs (~/.config/gh tokens, ~/.local/share/orchestratia/code-server), and
+    ~/bin is on its PATH: write access to any of them is a route back to that user.
+    A folder ABOVE a home hands over the whole home, exactly like the home itself."""
+    import shutil
+    import tempfile
+    base = tempfile.mkdtemp()
+    home = os.path.join(base, "data", "home-dev")
+    for d in (".config/gh", ".local/share/orchestratia/code-server", "bin", "app/.config", "binaries"):
+        os.makedirs(os.path.join(home, d))
+    saved = pv._home_dirs
+    try:
+        pv._home_dirs = lambda: {home}
+        _rejects(pv.validate_workspace, os.path.join(home, ".config"), "~/.config must be refused")
+        _rejects(pv.validate_workspace, os.path.join(home, ".local", "share", "orchestratia", "code-server"),
+                 "the daemon user's editor install must be refused")
+        _rejects(pv.validate_workspace, os.path.join(home, "bin"), "~/bin (on PATH) must be refused")
+        _rejects(pv.validate_workspace, os.path.join(base, "data"), "a folder above a home must be refused")
+        for ok_path in (os.path.join(home, "app"), os.path.join(home, "app", ".config"),
+                        os.path.join(home, "binaries")):
+            assert pv.validate_workspace(ok_path) == ok_path, f"{ok_path} is a project folder"
+    finally:
+        pv._home_dirs = saved
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_home_dirs_include_login_users_outside_home():
+    """A person's home at /data/alice is still a home; service accounts are not."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        alice, svc = os.path.join(td, "alice"), os.path.join(td, "svc")
+        os.makedirs(alice)
+        os.makedirs(svc)
+
+        class E:
+            def __init__(self, uid, d):
+                self.pw_uid, self.pw_dir = uid, d
+        homes = pv._home_dirs([E(1001, alice), E(998, svc), E(65534, "/nonexistent"), E(1002, "/")])
+        assert alice in homes, homes
+        assert svc not in homes, "a service account's home is not a person's home"
+        assert "/" not in homes and "/nonexistent" not in homes, homes
+
+
+def test_merge_is_additive_so_no_grant_goes_unrecorded():
+    """Re-provisioning with a different --workspace replaced the recorded list while
+    the old ACL stayed on disk — access that no config showed and nothing could revoke."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        a, b = os.path.join(td, "a"), os.path.join(td, "b")
+        os.makedirs(a)
+        os.makedirs(b)
+        saved = pv._home_dirs
+        try:
+            pv._home_dirs = lambda: set()
+            existing = {"P": {"user": "orcp-aaaaaaaaaaaa", "workspaces": [a]},
+                        "Q": {"user": "orcp-bbbbbbbbbbbb", "workspaces": [b]}}
+            merged = pv.merge_project_workspaces(existing, "P", "orcp-aaaaaaaaaaaa", [b, a])
+            assert merged["P"]["workspaces"] == [a, b], merged
+            assert merged["Q"] == existing["Q"], "other projects untouched"
+            assert existing["P"]["workspaces"] == [a], "input not mutated"
+            fresh = pv.merge_project_workspaces({}, "R", "orcp-cccccccccccc", [a])
+            assert fresh["R"] == {"user": "orcp-cccccccccccc", "workspaces": [a]}, fresh
+        finally:
+            pv._home_dirs = saved
+
+
+def test_merge_refuses_while_a_recorded_grant_is_no_longer_allowed():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ok_dir, bad = os.path.join(td, "ok"), os.path.join(td, ".ssh")
+        os.makedirs(ok_dir)
+        os.makedirs(bad)
+        saved = pv._home_dirs
+        try:
+            pv._home_dirs = lambda: set()
+            existing = {"P": {"user": "orcp-aaaaaaaaaaaa", "workspaces": [bad]}}
+            try:
+                pv.merge_project_workspaces(existing, "P", "orcp-aaaaaaaaaaaa", [ok_dir])
+            except pv.ProvisionError as e:
+                assert "--revoke-workspace" in str(e) and bad in str(e), str(e)
+            else:
+                raise AssertionError("a recorded grant that is now refused must block re-provisioning")
+        finally:
+            pv._home_dirs = saved
+
+
+def test_revoke_removes_the_grant_and_its_traverse_then_restores_what_remains():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        gone, keep_inside, keep_apart = (os.path.join(td, "srv", "gone"),
+                                         os.path.join(td, "srv", "gone", "kept"),
+                                         os.path.join(td, "other", "kept"))
+        for d in (keep_inside, keep_apart):
+            os.makedirs(d)
+        saved = pv._home_dirs
+        try:
+            pv._home_dirs = lambda: set()
+            user = "orcp-aaaaaaaaaaaa"
+            cmds = pv.revoke_commands(user, gone, [keep_inside, keep_apart])
+            assert cmds[0] == ["setfacl", "-P", "-R", "-x", f"u:{user}", gone], cmds[0]
+            parents = [c[-1] for c in cmds if c[:3] == ["setfacl", "-x", f"u:{user}"]]
+            assert os.path.join(td, "srv") in parents and td in parents and "/" not in parents, parents
+            # a remaining workspace inside the revoked tree lost its rwX: fully re-granted
+            assert ["setfacl", "-P", "-R", "-m", f"u:{user}:rwX", keep_inside] in cmds, cmds
+            # an unrelated one only needs its traverse chain back, not a recursive re-grant
+            assert ["setfacl", "-P", "-R", "-m", f"u:{user}:rwX", keep_apart] not in cmds, cmds
+            assert ["setfacl", "-m", f"u:{user}:--x", os.path.join(td, "other")] in cmds, cmds
+            # removals come before every re-grant
+            first_grant = next(i for i, c in enumerate(cmds) if "-m" in c)
+            assert all("-x" in c for c in cmds[:first_grant]), cmds
+        finally:
+            pv._home_dirs = saved
+
+
+def test_revoke_refuses_symlinks_and_bad_paths():
+    """setfacl -P silently SKIPS a symlink argument (exit 0), leaving the target's
+    grant in place — so a symlink must be refused, never passed through."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        target = os.path.join(td, "t")
+        os.makedirs(target)
+        link = os.path.join(td, "l")
+        os.symlink(target, link)
+        os.makedirs(os.path.join(target, "deep"))
+        via_parent = os.path.join(link, "deep")      # not itself a link, but resolves elsewhere
+        for bad, why in ((link, "symlink"), (via_parent, "symlinked-parent"),
+                         ("relative/path", "relative"), ("/srv/x\nroot", "newline")):
+            try:
+                pv.revoke_commands("orcp-aaaaaaaaaaaa", bad, [])
+            except pv.ProvisionError as e:
+                assert why != "symlink" or "symlink" in str(e), f"say it is a symlink: {e}"
+                continue
+            raise AssertionError(f"revoke must refuse a {why} path")
+        # a forbidden path CAN be revoked — removing access is always allowed
+        assert pv.revoke_commands("orcp-aaaaaaaaaaaa", "/root/.ssh", [])[0][-1] == "/root/.ssh"
+        # revoking a folder a remaining grant still covers would silently change nothing
+        inner = os.path.join(target, "sub")
+        os.makedirs(inner)
+        try:
+            pv.revoke_commands("orcp-aaaaaaaaaaaa", inner, [target])
+        except pv.ProvisionError as e:
+            assert target in str(e), str(e)
+        else:
+            raise AssertionError("revoking inside a still-granted workspace must be refused")
+
+
+def test_acl_perms_reads_the_named_user_entry():
+    out = ("user::rwx\nuser:orcp-aaaaaaaaaaaa:rwx\t#effective:r-x\n"
+           "user:orcp-aaaaaaaaaaaab:--x\ngroup::r-x\nmask::r-x\nother::---\n")
+    assert pv._acl_perms(out, "orcp-aaaaaaaaaaaa") == "rwx"
+    assert pv._acl_perms(out, "orcp-bbbbbbbbbbbb") is None
+    assert pv._acl_perms("user:orcp-aaaaaaaaaaaab:--x\n", "orcp-aaaaaaaaaaaa") is None, "prefix is not a match"
+
+
+def test_locked_down_editor_settings_are_written_as_the_project_user():
+    """The locked-down editor never got its settings: the daemon cannot write into the
+    project user's home, so its VS Code terminal was a plain unrecorded shell. Provisioning
+    (root) writes them — as that user, because the directory is theirs and a root write
+    could be redirected through a symlink they planted."""
+    import json
+    import subprocess
+    import tempfile
+    from orchestratia_agent import code_server as cs
+    calls = []
+    saved = pv.subprocess.run
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    pv.subprocess.run = fake_run
+    try:
+        pv._write_editor_settings("orcp-aaaaaaaaaaaa", "01690d2f-47c6-4d37-b787-27904723922b")
+    finally:
+        pv.subprocess.run = saved
+    assert len(calls) == 1, calls
+    argv, kw = calls[0]
+    assert kw.get("user") == "orcp-aaaaaaaaaaaa" and kw.get("group") == "orcp-aaaaaaaaaaaa", kw
+    assert kw.get("extra_groups") == [], "root's supplementary groups must be dropped"
+    want = os.path.join(cs.cfg_dir_for("orcp-aaaaaaaaaaaa", "01690d2f-47c6-4d37-b787-27904723922b"),
+                        "User", "settings.json")
+    assert want in argv, argv
+    forced = json.loads(argv[-1])
+    assert forced.get("terminal.integrated.defaultProfile.linux") == "orchestratia", forced
+
+    # the script itself: forced keys win, the user's own settings survive
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "cfg", "User", "settings.json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            json.dump({"editor.fontSize": 15, "terminal.integrated.defaultProfile.linux": "bash"}, f)
+        subprocess.run([argv[0], "-c", argv[2], path, argv[-1]], check=True)
+        data = json.load(open(path))
+        assert data["editor.fontSize"] == 15, data
+        assert data["terminal.integrated.defaultProfile.linux"] == "orchestratia", data
+        fresh = os.path.join(td, "new", "User", "settings.json")
+        subprocess.run([argv[0], "-c", argv[2], fresh, argv[-1]], check=True)
+        assert json.load(open(fresh))["terminal.integrated.defaultProfile.linux"] == "orchestratia"
+
+
+def test_workspace_refuses_orchestratia_install_paths():
+    _rejects(pv._validate_not_orchestratia, "/opt/orchestratia-agent", "the agent checkout must be refused")
+    _rejects(pv._validate_not_orchestratia, "/opt/orchestratia-venv/lib", "the agent venv must be refused")
+    pv._validate_not_orchestratia("/opt/orchestratia-agent-extra")   # a sibling name is not inside
+
+
+def test_home_dirs_come_from_the_password_database():
+    import pwd
+    homes = pv._home_dirs()
+    assert "/root" in homes, "/root is a home"
+    assert os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir) in homes, "this user's home is included"
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

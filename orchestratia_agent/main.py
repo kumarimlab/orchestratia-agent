@@ -250,6 +250,24 @@ async def main():
         else:
             signal.signal(signal.SIGTERM, handle_signal)
 
+        # Stop code-server processes a previous daemon left orphaned (an upgrade loses
+        # the in-memory editor map while the children keep running). Once, at startup,
+        # before any editor can be reopened — so every match is genuinely an orphan.
+        if sys.platform != "win32":
+            try:
+                from orchestratia_agent import code_server
+                swept = code_server.reap_orphans()
+                if swept["stopped"]:
+                    log.info(f"Stopped {len(swept['stopped'])} orphaned editor process(es) from a previous run")
+                for pid, uid in swept["unkillable"]:
+                    log.warning(
+                        f"Orphaned locked-down editor pid={pid} (uid={uid}) survived a restart and "
+                        f"cannot be stopped by this daemon; it will free its port when that user's "
+                        f"session ends or the box reboots."
+                    )
+            except Exception as e:  # noqa: BLE001 — a cleanup failure must not stop the daemon
+                log.warning(f"Editor orphan sweep failed: {e}")
+
         log.info("Agent daemon running. Heartbeats every 30s, WS auto-reconnect enabled.")
 
         # ws_send factory — returns a callable bound to whatever ws_connection

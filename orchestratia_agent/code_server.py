@@ -305,6 +305,88 @@ def _start_restricted(session_id: str, project_id: str, workspace: str, tc) -> i
     return port
 
 
+# The two roots a code-server --user-data-dir sits under, one per tier. Matching on
+# these (not just "code-server") means a stranger's own code-server install is left
+# alone. Standard lives in the daemon's home; restricted in each project user's home.
+_STANDARD_UDD_MARKER = os.sep + os.path.join("orchestratia", "editor") + os.sep
+_RESTRICTED_UDD_MARKER = os.sep + os.path.join(".orchestratia", "code-server") + os.sep
+
+
+def classify_editor_proc(argv: list[str]) -> dict | None:
+    """If `argv` is one of OUR code-server main processes, return {tier, port, udd}.
+
+    A main process has both --bind-addr and --user-data-dir; the workers (agentHost,
+    fileWatcher, ...) do not, so they are skipped — stopping the main one takes its
+    group down. Returns None for anything else, including a code-server that is not
+    ours (its user-data-dir is not under an Orchestratia editor root)."""
+    if not argv or "--user-data-dir" not in argv or "--bind-addr" not in argv:
+        return None
+    try:
+        udd = argv[argv.index("--user-data-dir") + 1]
+        addr = argv[argv.index("--bind-addr") + 1]
+        port = int(addr.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    if _STANDARD_UDD_MARKER in udd:
+        tier = "standard"
+    elif _RESTRICTED_UDD_MARKER in udd:
+        tier = "restricted"
+    else:
+        return None
+    return {"tier": tier, "port": port, "udd": udd}
+
+
+def _proc_iter():
+    """Yield (pid, uid, argv) for every process on the box. cmdline is world-readable,
+    so this sees other users' code-server too (which the daemon then cannot signal)."""
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+            uid = os.stat(f"/proc/{pid}").st_uid
+        except OSError:
+            continue
+        yield pid, uid, argv
+
+
+def reap_orphans(*, proc_iter=None, own_uid=None, pgid_of=None, kill=None) -> dict:
+    """Stop editor code-server processes left running by a PREVIOUS daemon.
+
+    The live-editor map is in-memory, so an agent restart (an upgrade, most often)
+    loses it while the code-server children — spawned with start_new_session — keep
+    running, orphaned: the tab is already dead (its relay bridge is gone) but the
+    process holds a port and the workspace open forever, and a later stop can't find
+    it. Called ONCE at startup, before any editor is (re)started, so every match is by
+    definition an orphan.
+
+    Only the daemon's OWN processes (the standard, zero-touch tier) can be signalled;
+    a project user's restricted process belongs to another uid and is reported so the
+    hub reaper / an operator can see it. A process this daemon is already tracking is
+    never touched (defensive — nothing should be tracked yet at startup)."""
+    proc_iter = proc_iter or _proc_iter
+    own_uid = os.geteuid() if own_uid is None else own_uid
+    pgid_of = pgid_of or os.getpgid
+    kill = kill or os.killpg
+    tracked = {m.get("udd") for m in _key_meta.values() if m.get("udd")}
+    stopped, unkillable = [], []
+    for pid, uid, argv in proc_iter():
+        info = classify_editor_proc(argv)
+        if info is None or info["udd"] in tracked:
+            continue
+        if uid != own_uid:
+            unkillable.append((pid, uid))
+            continue
+        try:
+            kill(pgid_of(pid), signal.SIGTERM)
+            stopped.append(pid)
+        except (OSError, ProcessLookupError):
+            pass
+    return {"stopped": stopped, "unkillable": unkillable}
+
+
 def stop(session_id: str) -> None:
     """End an editor session. Stops its process once no other session uses it.
 

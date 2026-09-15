@@ -433,6 +433,62 @@ def test_reap_idle_is_per_session():
         shutil.rmtree(ws, ignore_errors=True)
 
 
+def test_classify_editor_proc_matches_only_our_code_server():
+    cs._reset_for_test()
+    std = ["/usr/lib/node", "/x/code-server", "--auth", "none", "--bind-addr", "127.0.0.1:41000",
+           "--user-data-dir", "/home/dev/.local/share/orchestratia/editor/proj12345678/sessions/abc123def456",
+           "--extensions-dir", "/x/ext", "/srv/a"]
+    r = cs.classify_editor_proc(std)
+    ok("standard editor recognised by its user-data-dir", r == {"tier": "standard", "port": 41000,
+       "udd": "/home/dev/.local/share/orchestratia/editor/proj12345678/sessions/abc123def456"}, r)
+    res = ["node", "/usr/lib/code-server", "--auth", "none", "--bind-addr", "127.0.0.1:60000",
+           "--user-data-dir", "/home/orcp-abc/.orchestratia/code-server/proj12345678", "/srv/a"]
+    ok("restricted editor recognised", cs.classify_editor_proc(res) ==
+       {"tier": "restricted", "port": 60000, "udd": "/home/orcp-abc/.orchestratia/code-server/proj12345678"}, cs.classify_editor_proc(res))
+    ok("a stranger's code-server is ignored",
+       cs.classify_editor_proc(["node", "/x/code-server", "--user-data-dir", "/home/dev/.local/share/code-server", "--bind-addr", "127.0.0.1:9"]) is None)
+    ok("a non-code-server process is ignored", cs.classify_editor_proc(["python3", "-m", "http.server"]) is None)
+    ok("empty argv is ignored", cs.classify_editor_proc([]) is None)
+    ok("our marker but no bind-addr is ignored (not a main process)", cs.classify_editor_proc(
+       ["node", "--user-data-dir", "/home/dev/.local/share/orchestratia/editor/x/sessions/y"]) is None)
+
+
+def test_reap_orphans_stops_own_editors_and_reports_foreign_ones():
+    cs._reset_for_test()
+    OUR = os.geteuid()
+    procs = [
+        (111, OUR, ["node", "/x/code-server", "--auth", "none", "--bind-addr", "127.0.0.1:41000",
+                    "--user-data-dir", "/home/dev/.local/share/orchestratia/editor/p/sessions/s1"]),   # own standard orphan
+        (222, OUR + 1, ["node", "/usr/lib/code-server", "--auth", "none", "--bind-addr", "127.0.0.1:60000",
+                        "--user-data-dir", "/home/orcp-abc/.orchestratia/code-server/p"]),              # foreign restricted orphan
+        (333, OUR, ["node", "/x/code-server", "--auth", "none", "--bind-addr", "127.0.0.1:5",
+                    "--user-data-dir", "/home/dev/.local/share/code-server"]),                          # a stranger's editor
+        (444, OUR, ["python3", "-m", "http.server", "5173"]),                                           # unrelated
+    ]
+    killed = []
+    res = cs.reap_orphans(proc_iter=lambda: iter(procs), own_uid=OUR,
+                          pgid_of=lambda pid: pid, kill=lambda pgid, sig: killed.append((pgid, sig)))
+    ok("the daemon's own orphaned editor is stopped", 111 in res["stopped"] and (111, cs.signal.SIGTERM) in killed, (res, killed))
+    ok("a stranger's code-server is left alone", 333 not in res["stopped"] and all(k[0] != 333 for k in killed))
+    ok("unrelated processes are ignored", 444 not in res["stopped"])
+    ok("a project user's editor can't be signalled by the daemon, so it is reported",
+       res["unkillable"] == [(222, OUR + 1)] and all(k[0] != 222 for k in killed), res)
+    ok("nothing was killed twice", len(killed) == 1)
+
+
+def test_reap_orphans_never_touches_a_tracked_process():
+    cs._reset_for_test()
+    OUR = os.geteuid()
+    udd = "/home/dev/.local/share/orchestratia/editor/p/sessions/live1"
+    cs._key_meta["live1"] = {"tier": "standard", "project_id": "p", "udd": udd}
+    procs = [(555, OUR, ["node", "/x/code-server", "--auth", "none", "--bind-addr", "127.0.0.1:1", "--user-data-dir", udd])]
+    killed = []
+    res = cs.reap_orphans(proc_iter=lambda: iter(procs), own_uid=OUR,
+                          pgid_of=lambda pid: pid, kill=lambda pgid, sig: killed.append((pgid, sig)))
+    ok("a process we are actively managing is never reaped", res["stopped"] == [] and killed == [], (res, killed))
+    cs._reset_for_test()
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

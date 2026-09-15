@@ -371,20 +371,26 @@ def reap_orphans(*, proc_iter=None, own_uid=None, pgid_of=None, kill=None) -> di
     pgid_of = pgid_of or os.getpgid
     kill = kill or os.killpg
     tracked = {m.get("udd") for m in _key_meta.values() if m.get("udd")}
-    stopped, unkillable = [], []
+    stopped = []
+    # A locked-down editor appears twice — the root `sudo` monitor and the code-server
+    # it dropped to — both carrying our --user-data-dir. Report each workspace once, as
+    # the real (non-root) process, so the operator sees one line per orphaned editor.
+    foreign: dict[str, tuple[int, int]] = {}
     for pid, uid, argv in proc_iter():
         info = classify_editor_proc(argv)
         if info is None or info["udd"] in tracked:
             continue
         if uid != own_uid:
-            unkillable.append((pid, uid))
+            prev = foreign.get(info["udd"])
+            if prev is None or (prev[1] == 0 and uid != 0):
+                foreign[info["udd"]] = (pid, uid)
             continue
         try:
             kill(pgid_of(pid), signal.SIGTERM)
             stopped.append(pid)
         except (OSError, ProcessLookupError):
             pass
-    return {"stopped": stopped, "unkillable": unkillable}
+    return {"stopped": stopped, "unkillable": list(foreign.values())}
 
 
 def stop(session_id: str) -> None:

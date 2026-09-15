@@ -476,6 +476,22 @@ def test_reap_orphans_stops_own_editors_and_reports_foreign_ones():
     ok("nothing was killed twice", len(killed) == 1)
 
 
+def test_reap_orphans_reports_a_restricted_editor_once_not_its_sudo_wrapper():
+    """A locked-down editor shows up twice in /proc — the root `sudo` monitor and the
+    code-server it dropped to — both carrying our --user-data-dir. Report the editor
+    once, as the real (non-root) process."""
+    cs._reset_for_test()
+    OUR = os.geteuid()
+    udd = "/home/orcp-abc/.orchestratia/code-server/p"
+    argv = ["x", "--auth", "none", "--bind-addr", "127.0.0.1:60000", "--user-data-dir", udd]
+    procs = [(900, 0, ["sudo", "-n", "-u", "orcp-abc", "-H", *argv]),   # root sudo wrapper
+             (901, 1003, argv)]                                          # the dropped code-server
+    res = cs.reap_orphans(proc_iter=lambda: iter(procs), own_uid=OUR,
+                          pgid_of=lambda pid: pid, kill=lambda pgid, sig: None)
+    ok("one report per orphaned editor, and it names the real process not the root wrapper",
+       res["unkillable"] == [(901, 1003)], res)
+
+
 def test_reap_orphans_never_touches_a_tracked_process():
     cs._reset_for_test()
     OUR = os.geteuid()

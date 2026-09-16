@@ -87,8 +87,7 @@ def test_standard_already_installed_reports_ready_and_bridges():
         h.run("standard")
         ok("started as standard with hub url",
            h.started == [("sess-1", "pid-A", "/srv/a", "standard", "https://hub.example")], h.started)
-        ok("ensure still runs when installed (it strips the chat panel), but shows no first-time notice",
-           h.ensured == [1] and not any("first time" in (m.get("reason") or "") for m in h.sent))
+        ok("no download when installed", h.ensured == [])
         ok("reports ready (and not preparing)", h.states() == ["ready"], h.states())
         ok("relay bridged with the pinned port", h.connected == [("sess-1", 41000)])
     finally:

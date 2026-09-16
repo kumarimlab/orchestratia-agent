@@ -521,7 +521,7 @@ def _write_editor_settings(user: str, project_id: str) -> None:
     path = os.path.join(cs.cfg_dir_for(user, project_id), "User", "settings.json")
     result = subprocess.run(
         [sys.executable, "-c", _WRITE_SETTINGS, path,
-         json.dumps(cs.terminal_theme_defaults()), json.dumps(cs.settings_json("restricted"))],
+         json.dumps(cs.editor_defaults()), json.dumps(cs.settings_json("restricted"))],
         user=user, group=user, extra_groups=[], cwd="/", capture_output=True, text=True,
     )
     if result.returncode != 0:

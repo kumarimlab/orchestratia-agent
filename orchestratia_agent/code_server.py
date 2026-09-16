@@ -168,12 +168,14 @@ TERMINAL_COLORS = {
 }
 
 
-def terminal_theme_defaults() -> dict:
-    """The dashboard terminal's look as OVERRIDABLE defaults: the VS Code terminal
-    matches the Orchestratia dashboard out of the box, but a user who sets any of
-    these in their own settings wins. The web font is best-effort — code-server can
-    only use fonts the viewer's browser already has — so the chain falls back
-    gracefully; the colours match exactly."""
+def editor_defaults() -> dict:
+    """OVERRIDABLE editor defaults, applied unless the user's own settings set the same
+    key. Two things: (1) the dashboard terminal's look so the VS Code terminal matches
+    out of the box — the web font is best-effort (code-server can only use fonts the
+    viewer's browser has) but the colours match exactly; (2) the secondary side bar is
+    hidden by default, which is where VS Code's core "Build with Agent" chat panel
+    lives — it needs a subscription and only distracts users who work through
+    Orchestratia sessions. A user can reopen the side bar any time."""
     return {
         "terminal.integrated.fontFamily": "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace",
         "terminal.integrated.fontSize": 13,
@@ -182,6 +184,7 @@ def terminal_theme_defaults() -> dict:
         "terminal.integrated.cursorStyle": "line",   # VS Code's name for xterm's "bar"
         "terminal.integrated.cursorBlinking": True,
         "workbench.colorCustomizations": dict(TERMINAL_COLORS),
+        "workbench.secondarySideBar.defaultVisibility": "hidden",
     }
 
 
@@ -189,7 +192,7 @@ def settings_json(tier: str) -> dict:
     """VS Code settings FORCED on every editor (they always win over the user's own):
     the default terminal is the Orchestratia session picker (`orchestratia-agent
     orc-attach`), so terminal work flows through recorded sessions instead of a raw
-    shell. Extension auto-update is off. The look (terminal_theme_defaults) is separate
+    shell. Extension auto-update is off. The look (editor_defaults) is separate
     because it is overridable."""
     return {
         "terminal.integrated.defaultProfile.linux": "orchestratia",
@@ -211,7 +214,7 @@ def compose_settings(tier: str, saved_data: dict | None) -> dict:
     always win. `workbench.colorCustomizations` is merged per key, so a user who
     recolours one thing keeps the rest of the Orchestratia terminal palette."""
     saved_data = saved_data if isinstance(saved_data, dict) else {}
-    data = terminal_theme_defaults()
+    data = editor_defaults()
     user_cc = saved_data.get("workbench.colorCustomizations")
     data.update({k: v for k, v in saved_data.items() if k != "workbench.colorCustomizations"})
     if isinstance(user_cc, dict):

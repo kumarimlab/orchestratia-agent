@@ -111,8 +111,10 @@ def test_settings_json_points_terminal_at_orc_attach():
 
 
 def test_terminal_theme_matches_the_dashboard_and_is_overridable():
-    d = cs.terminal_theme_defaults()
+    d = cs.editor_defaults()
     cc = d["workbench.colorCustomizations"]
+    ok("the secondary side bar (VS Code's core 'Build with Agent' chat) is hidden by default",
+       d["workbench.secondarySideBar.defaultVisibility"] == "hidden")
     ok("terminal background matches the dashboard", cc["terminal.background"] == "#1a1816", cc.get("terminal.background"))
     ok("cursor is the brand cyan", cc["terminalCursor.foreground"] == "#00B8D9")
     ok("ANSI palette matches (red)", cc["terminal.ansiRed"] == "#e06c75")

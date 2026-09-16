@@ -505,8 +505,11 @@ def test_locked_down_editor_settings_are_written_as_the_project_user():
     want = os.path.join(cs.cfg_dir_for("orcp-aaaaaaaaaaaa", "01690d2f-47c6-4d37-b787-27904723922b"),
                         "User", "settings.json")
     assert want in argv, argv
+    # argv: python -c SCRIPT <path> <defaults-json> <forced-json>
+    defaults = json.loads(argv[-2])
     forced = json.loads(argv[-1])
     assert forced.get("terminal.integrated.defaultProfile.linux") == "orchestratia", forced
+    assert defaults["workbench.colorCustomizations"]["terminal.background"] == "#1a1816", defaults
 
     # the script itself: forced keys win, the user's own settings survive
     with tempfile.TemporaryDirectory() as td:
@@ -514,12 +517,23 @@ def test_locked_down_editor_settings_are_written_as_the_project_user():
         os.makedirs(os.path.dirname(path))
         with open(path, "w") as f:
             json.dump({"editor.fontSize": 15, "terminal.integrated.defaultProfile.linux": "bash"}, f)
-        subprocess.run([argv[0], "-c", argv[2], path, argv[-1]], check=True)
+        subprocess.run([argv[0], "-c", argv[2], path, argv[-2], argv[-1]], check=True)
         data = json.load(open(path))
         assert data["editor.fontSize"] == 15, data
         assert data["terminal.integrated.defaultProfile.linux"] == "orchestratia", data
+        # the overridable theme reached the locked-down editor too
+        assert data["workbench.colorCustomizations"]["terminal.background"] == "#1a1816", data
+        # a user who recolours one thing keeps the rest of the palette
+        with open(path) as f:
+            cur = json.load(f)
+        cur["workbench.colorCustomizations"] = {"terminal.background": "#222222"}
+        json.dump(cur, open(path, "w"))
+        subprocess.run([argv[0], "-c", argv[2], path, argv[-2], argv[-1]], check=True)
+        d2 = json.load(open(path))
+        assert d2["workbench.colorCustomizations"]["terminal.background"] == "#222222", d2
+        assert d2["workbench.colorCustomizations"]["terminal.ansiRed"] == "#e06c75", d2
         fresh = os.path.join(td, "new", "User", "settings.json")
-        subprocess.run([argv[0], "-c", argv[2], fresh, argv[-1]], check=True)
+        subprocess.run([argv[0], "-c", argv[2], fresh, argv[-2], argv[-1]], check=True)
         assert json.load(open(fresh))["terminal.integrated.defaultProfile.linux"] == "orchestratia"
 
 

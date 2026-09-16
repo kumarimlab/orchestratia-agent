@@ -151,11 +151,56 @@ def spawn_argv_standard(binary: str, port: int, workspace: str, user_data_dir: s
     ]
 
 
+# The dashboard terminal's palette (frontend InteractiveTerminal.tsx). Applied to the
+# VS Code terminal as an OVERRIDABLE default so it matches out of the box; keep in step.
+TERMINAL_COLORS = {
+    "terminal.background": "#1a1816",
+    "terminal.foreground": "#e8e3da",
+    "terminalCursor.foreground": "#00B8D9",
+    "terminalCursor.background": "#1a1816",
+    "terminal.selectionBackground": "#00B8D940",
+    "terminal.ansiBlack": "#1a1816",
+    "terminal.ansiRed": "#e06c75",
+    "terminal.ansiGreen": "#98c379",
+    "terminal.ansiYellow": "#e5c07b",
+    "terminal.ansiBlue": "#61afef",
+    "terminal.ansiMagenta": "#c678dd",
+    "terminal.ansiCyan": "#56b6c2",
+    "terminal.ansiWhite": "#e8e3da",
+    "terminal.ansiBrightBlack": "#706961",
+    "terminal.ansiBrightRed": "#e06c75",
+    "terminal.ansiBrightGreen": "#98c379",
+    "terminal.ansiBrightYellow": "#e5c07b",
+    "terminal.ansiBrightBlue": "#61afef",
+    "terminal.ansiBrightMagenta": "#c678dd",
+    "terminal.ansiBrightCyan": "#56b6c2",
+    "terminal.ansiBrightWhite": "#fdfcfa",
+}
+
+
+def terminal_theme_defaults() -> dict:
+    """The dashboard terminal's look as OVERRIDABLE defaults: the VS Code terminal
+    matches the Orchestratia dashboard out of the box, but a user who sets any of
+    these in their own settings wins. The web font is best-effort — code-server can
+    only use fonts the viewer's browser already has — so the chain falls back
+    gracefully; the colours match exactly."""
+    return {
+        "terminal.integrated.fontFamily": "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace",
+        "terminal.integrated.fontSize": 13,
+        "terminal.integrated.lineHeight": 1.2,
+        "terminal.integrated.letterSpacing": 0.3,
+        "terminal.integrated.cursorStyle": "line",   # VS Code's name for xterm's "bar"
+        "terminal.integrated.cursorBlinking": True,
+        "workbench.colorCustomizations": dict(TERMINAL_COLORS),
+    }
+
+
 def settings_json(tier: str) -> dict:
-    """VS Code settings forced on every editor: the default terminal is the
-    Orchestratia session picker (`orchestratia-agent orc-attach`), so terminal work
-    flows through recorded sessions instead of a raw shell. Extension auto-update
-    is off."""
+    """VS Code settings FORCED on every editor (they always win over the user's own):
+    the default terminal is the Orchestratia session picker (`orchestratia-agent
+    orc-attach`), so terminal work flows through recorded sessions instead of a raw
+    shell. Extension auto-update is off. The look (terminal_theme_defaults) is separate
+    because it is overridable."""
     return {
         "terminal.integrated.defaultProfile.linux": "orchestratia",
         "terminal.integrated.profiles.linux": {
@@ -170,18 +215,34 @@ def settings_json(tier: str) -> dict:
     }
 
 
+def compose_settings(tier: str, saved_data: dict | None) -> dict:
+    """The full settings.json content: overridable theme defaults at the bottom, the
+    user's own saved settings on top of them, and our forced settings last so they
+    always win. `workbench.colorCustomizations` is merged per key, so a user who
+    recolours one thing keeps the rest of the Orchestratia terminal palette."""
+    saved_data = saved_data if isinstance(saved_data, dict) else {}
+    data = terminal_theme_defaults()
+    user_cc = saved_data.get("workbench.colorCustomizations")
+    data.update({k: v for k, v in saved_data.items() if k != "workbench.colorCustomizations"})
+    if isinstance(user_cc, dict):
+        data["workbench.colorCustomizations"] = {**TERMINAL_COLORS, **user_cc}
+    data.update(settings_json(tier))
+    return data
+
+
 def write_settings(user_data_dir: str, tier: str, saved: str | None = None) -> str:
-    """Write <udd>/User/settings.json: the project's saved settings, ours forced on top."""
-    data: dict = {}
+    """Write <udd>/User/settings.json: theme defaults, the project's saved settings on
+    top, ours forced last. See compose_settings."""
+    saved_data: dict = {}
     if saved and os.path.exists(saved):
         try:
             with open(saved) as f:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
-                data.update(loaded)
+                saved_data = loaded
         except (OSError, ValueError):
             log.warning("ignoring unreadable saved editor settings at %s", saved)
-    data.update(settings_json(tier))
+    data = compose_settings(tier, saved_data)
     path = os.path.join(user_data_dir, "User", "settings.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:

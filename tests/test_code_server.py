@@ -112,6 +112,36 @@ def test_settings_json_points_terminal_at_orc_attach():
     ok("extension auto-update is off", s.get("extensions.autoUpdate") is False)
 
 
+def test_terminal_theme_matches_the_dashboard_and_is_overridable():
+    d = cs.terminal_theme_defaults()
+    cc = d["workbench.colorCustomizations"]
+    ok("terminal background matches the dashboard", cc["terminal.background"] == "#1a1816", cc.get("terminal.background"))
+    ok("cursor is the brand cyan", cc["terminalCursor.foreground"] == "#00B8D9")
+    ok("ANSI palette matches (red)", cc["terminal.ansiRed"] == "#e06c75")
+    ok("all 16 ANSI colours present",
+       sum(1 for k in cc if k.startswith("terminal.ansi")) == 16, [k for k in cc if k.startswith("terminal.ansi")])
+    ok("font chain leads with JetBrains Mono", "JetBrains Mono" in d["terminal.integrated.fontFamily"])
+    ok("bar cursor", d["terminal.integrated.cursorStyle"] == "line")
+
+    # forced settings still win; theme is a DEFAULT the user overrides
+    user = {"editor.fontSize": 22, "terminal.integrated.fontSize": 20,
+            "terminal.integrated.defaultProfile.linux": "bash",
+            "workbench.colorCustomizations": {"terminal.background": "#000000", "editor.background": "#101010"}}
+    merged = cs.compose_settings("standard", user)
+    ok("user's own unrelated key kept", merged["editor.fontSize"] == 22)
+    ok("user overrides a theme scalar (font size)", merged["terminal.integrated.fontSize"] == 20)
+    ok("forced terminal profile still wins over the user", merged["terminal.integrated.defaultProfile.linux"] == "orchestratia")
+    mcc = merged["workbench.colorCustomizations"]
+    ok("user's colour override wins per key", mcc["terminal.background"] == "#000000")
+    ok("user's own extra colour kept", mcc["editor.background"] == "#101010")
+    ok("our other terminal colours survive a partial override", mcc["terminal.ansiRed"] == "#e06c75")
+
+    # with no user settings, the theme is applied as-is
+    d2 = cs.compose_settings("standard", None)
+    ok("theme applied when the user has no settings", d2["workbench.colorCustomizations"]["terminal.background"] == "#1a1816")
+    ok("forced settings present with no user settings", d2["workbench.startupEditor"] == "none")
+
+
 def test_orc_attach_choice():
     from orchestratia_agent import orc_attach as oa
     ok("no sessions -> nothing to attach", oa.choose_action([]) == ("none", None))

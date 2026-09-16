@@ -479,15 +479,24 @@ def _ensure_editor_state_dir(user: str) -> None:
 
 # Run as the project user by _write_editor_settings: merge the forced keys into the
 # locked-down editor's settings, keeping the user's own.
+# Composes settings.json as the project user (see _write_editor_settings): overridable
+# theme defaults at the bottom, the user's own saved settings on top of them, our forced
+# settings last. colorCustomizations is merged per key. Mirrors code_server.compose_settings
+# — kept inline so this runs as the project user without importing our package.
 _WRITE_SETTINGS = """\
 import json, os, sys
-path, forced = sys.argv[1], json.loads(sys.argv[2])
+path, defaults, forced = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
 try:
     with open(path) as f:
-        data = json.load(f)
-    data = data if isinstance(data, dict) else {}
+        existing = json.load(f)
+    existing = existing if isinstance(existing, dict) else {}
 except (OSError, ValueError):
-    data = {}
+    existing = {}
+data = dict(defaults)
+user_cc = existing.get("workbench.colorCustomizations")
+data.update({k: v for k, v in existing.items() if k != "workbench.colorCustomizations"})
+if isinstance(user_cc, dict):
+    data["workbench.colorCustomizations"] = {**defaults.get("workbench.colorCustomizations", {}), **user_cc}
 data.update(forced)
 os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
 tmp = path + ".tmp"
@@ -511,7 +520,8 @@ def _write_editor_settings(user: str, project_id: str) -> None:
     from orchestratia_agent import code_server as cs
     path = os.path.join(cs.cfg_dir_for(user, project_id), "User", "settings.json")
     result = subprocess.run(
-        [sys.executable, "-c", _WRITE_SETTINGS, path, json.dumps(cs.settings_json("restricted"))],
+        [sys.executable, "-c", _WRITE_SETTINGS, path,
+         json.dumps(cs.editor_defaults()), json.dumps(cs.settings_json("restricted"))],
         user=user, group=user, extra_groups=[], cwd="/", capture_output=True, text=True,
     )
     if result.returncode != 0:

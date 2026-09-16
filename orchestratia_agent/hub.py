@@ -1981,8 +1981,11 @@ async def _run_code_server_start(state: DaemonState, session_id: str, project_id
 
     tc = _tier_config(state)
     try:
-        if tier == "standard" and not code_server_install.installed():
-            await status("preparing", "Preparing the editor (first time on this server)")
+        if tier == "standard":
+            # ensure() is idempotent and also strips the bundled Copilot chat panel, so
+            # call it even when already installed; the notice is only for a first download.
+            if not code_server_install.installed():
+                await status("preparing", "Preparing the editor (first time on this server)")
             await asyncio.get_running_loop().run_in_executor(None, code_server_install.ensure)
         _raise_if_stopped(session_id)
         port = code_server.start(session_id, project_id, working_dir, tier, tc,

@@ -233,6 +233,55 @@ def test_pinned_checksums_are_real():
     ok("arm64 pin is a sha256", len(ci.SHA256.get("arm64", "")) == 64 and set(ci.SHA256["arm64"]) <= set("0123456789abcdef"))
 
 
+def _fake_install_tree():
+    """A minimal extracted code-server tree with the bundled copilot chat + product.json."""
+    import json
+    root = tempfile.mkdtemp()
+    vscode = os.path.join(root, "lib", "vscode")
+    os.makedirs(os.path.join(vscode, "extensions", "copilot"))
+    open(os.path.join(vscode, "extensions", "copilot", "package.json"), "w").write('{"name":"copilot-chat"}')
+    os.makedirs(os.path.join(vscode, "extensions", "json-language-features"))   # a keeper
+    with open(os.path.join(vscode, "product.json"), "w") as f:
+        json.dump({"nameShort": "code-server", "defaultChatAgent": {"chatExtensionId": "GitHub.copilot-chat"}}, f)
+    return root
+
+
+def test_neutralize_removes_the_copilot_chat_panel():
+    import json
+    root = _fake_install_tree()
+    try:
+        ci._neutralize_bundled_chat(root)
+        ext = os.path.join(root, "lib", "vscode", "extensions")
+        ok("the Copilot chat extension is removed", not os.path.exists(os.path.join(ext, "copilot")))
+        ok("other built-in extensions are kept", os.path.exists(os.path.join(ext, "json-language-features")))
+        prod = json.load(open(os.path.join(root, "lib", "vscode", "product.json")))
+        ok("the default chat agent is cleared", "defaultChatAgent" not in prod)
+        ok("the rest of product.json is intact", prod.get("nameShort") == "code-server")
+        ok("a marker is written", os.path.exists(os.path.join(root, ci._CHAT_MARKER)))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_neutralize_is_idempotent_and_a_noop_when_already_clean():
+    root = _fake_install_tree()
+    try:
+        ci._neutralize_bundled_chat(root)
+        # a re-run must not error and must not touch anything (marker short-circuits)
+        marker = os.path.join(root, ci._CHAT_MARKER)
+        before = os.path.getmtime(marker)
+        ci._neutralize_bundled_chat(root)
+        ok("second run is a no-op (marker unchanged)", os.path.getmtime(marker) == before)
+        # a tree with no copilot ext / no chat agent is handled cleanly
+        clean = tempfile.mkdtemp()
+        os.makedirs(os.path.join(clean, "lib", "vscode", "extensions"))
+        open(os.path.join(clean, "lib", "vscode", "product.json"), "w").write('{"nameShort":"x"}')
+        ci._neutralize_bundled_chat(clean)
+        ok("no-copilot tree still gets a marker", os.path.exists(os.path.join(clean, ci._CHAT_MARKER)))
+        shutil.rmtree(clean, ignore_errors=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

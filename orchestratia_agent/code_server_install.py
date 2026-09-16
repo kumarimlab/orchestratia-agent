@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
+import logging
 import os
 import platform
 import shutil
@@ -17,6 +19,8 @@ import tarfile
 import tempfile
 import threading
 import urllib.request
+
+log = logging.getLogger("orchestratia-agent.code_server_install")
 
 VERSION = "4.137.0"
 # Verified 2026-09-14 against GitHub's published asset digests for v4.137.0.
@@ -93,9 +97,50 @@ def _download(url: str, dest: str, want_sha: str) -> None:
         raise InstallError("verification failed: the downloaded editor does not match its pinned checksum")
 
 
+# code-server exposes no flag to disable a built-in extension, so the bundled GitHub
+# Copilot chat extension — which draws the "Build with Agent" panel and auto-opens it —
+# is removed from the install we pin and control. A marker makes this idempotent and
+# cheap to re-check on every ensure().
+_CHAT_MARKER = ".orc-chat-removed"
+
+
+def _neutralize_bundled_chat(version_root: str) -> None:
+    """Remove the bundled Copilot chat extension and clear product.json's default chat
+    agent so the 'Build with Agent' panel does not appear. Idempotent; safe to call on a
+    fresh extract or an already-installed tree."""
+    marker = os.path.join(version_root, _CHAT_MARKER)
+    if os.path.exists(marker):
+        return
+    vscode = os.path.join(version_root, "lib", "vscode")
+    try:
+        shutil.rmtree(os.path.join(vscode, "extensions", "copilot"))
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("could not remove the bundled Copilot chat extension: %s", e)
+        return                                  # leave no marker; try again next time
+    product = os.path.join(vscode, "product.json")
+    try:
+        with open(product) as f:
+            data = json.load(f)
+        if data.pop("defaultChatAgent", None) is not None:
+            tmp = product + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, product)
+    except (OSError, ValueError) as e:
+        log.warning("could not clear the default chat agent in product.json: %s", e)
+    try:
+        open(marker, "w").close()
+    except OSError:
+        pass
+
+
 def ensure() -> str:
     """Return the pinned code-server binary, downloading it once if needed."""
+    vroot = os.path.join(install_root(), VERSION)
     if installed():
+        _neutralize_bundled_chat(vroot)
         return binary_path()
     root = install_root()
     try:
@@ -106,6 +151,7 @@ def ensure() -> str:
     with _thread_lock, lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)          # also serialises the installer CLI vs the daemon
         if installed():
+            _neutralize_bundled_chat(vroot)
             return binary_path()
         a = arch()
         want = SHA256.get(a)
@@ -129,6 +175,7 @@ def ensure() -> str:
             src = os.path.join(tmp, top)
             if not os.access(os.path.join(src, "bin", "code-server"), os.X_OK):
                 raise InstallError("verification failed: archive has no bin/code-server")
+            _neutralize_bundled_chat(src)       # patch the fresh tree before it goes live
             os.rename(src, os.path.join(root, VERSION))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

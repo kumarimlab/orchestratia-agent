@@ -99,15 +99,19 @@ def _ssl():
     return build_ssl_context()
 
 
-def fetch_sessions(hub_url: str, api_key: str, project_id: str, *, opener=None) -> list[dict]:
-    """This project's terminal sessions on this server (the key identifies the server)."""
+def fetch_sessions(hub_url: str, api_key: str, project_id: str, *,
+                   this_server: bool = True, opener=None) -> dict:
+    """This project's terminal sessions (on this server by default) plus the project's
+    name, so the picker can label itself. Returns the raw response dict. Pass
+    this_server=False to see the project's terminals on every server (for the hint)."""
     real = opener is None
     opener = opener or urllib.request.urlopen
-    url = (f"{hub_url}/api/v1/server/sessions?project_id={project_id}"
-           f"&this_server=true&kind=terminal")
-    req = urllib.request.Request(url, headers={"X-API-Key": api_key})
+    qs = f"project_id={project_id}&kind=terminal"
+    if this_server:
+        qs += "&this_server=true"
+    req = urllib.request.Request(f"{hub_url}/api/v1/server/sessions?{qs}", headers={"X-API-Key": api_key})
     with opener(req, context=_ssl() if real else None, timeout=10) as r:
-        return json.loads(r.read())["sessions"]
+        return json.loads(r.read())
 
 
 def create_session(hub_url: str, api_key: str, editor_session_id: str, cwd: str, *, opener=None) -> str:
@@ -139,13 +143,14 @@ def _age(started_at: str | None, now: datetime) -> str:
     return f"{secs // 86400}d"
 
 
-def menu_entries(sessions: list[dict], now: datetime) -> list[tuple[str, str | None]]:
+def menu_entries(sessions: list[dict], now: datetime,
+                 project: str | None = None) -> list[tuple[str, str | None]]:
     out = []
     for s in sessions:
         who = (s.get("created_by_email") or "?").split("@")[0]
         out.append((f"{s.get('name') or 'unnamed'} — {who} · {_age(s.get('started_at'), now)}",
                     tmux_name_for(s["id"])))
-    out.append(("New session", None))
+    out.append((f"New session in {project}" if project else "New session", None))
     return out
 
 
@@ -187,13 +192,29 @@ def main() -> int:
         return _legacy_main()
     hub_url, api_key = _hub_credentials()
     try:
-        sessions = fetch_sessions(hub_url, api_key, project_id)
+        resp = fetch_sessions(hub_url, api_key, project_id, this_server=True)
     except Exception as e:  # noqa: BLE001
         return _shell(f"Could not reach Orchestratia ({e}). Opening a plain shell — it is not recorded.")
-    entries = menu_entries(sessions, datetime.now(timezone.utc))
-    print("Orchestratia sessions for this project:")
+    sessions = resp.get("sessions", [])
+    project = resp.get("project_name") or "this project"
+    # Terminals in the same project on OTHER servers cannot be attached from here (tmux
+    # is per-box). List them as a hint so an empty picker is not a mystery — a common
+    # surprise when the editor and the sessions are on different machines.
+    try:
+        elsewhere = [s for s in fetch_sessions(hub_url, api_key, project_id, this_server=False).get("sessions", [])
+                     if s.get("id") not in {x.get("id") for x in sessions}]
+    except Exception:  # noqa: BLE001
+        elsewhere = []
+    entries = menu_entries(sessions, datetime.now(timezone.utc), project)
+    print(f"{project} — terminal sessions on this server:" if sessions
+          else f"{project} — no terminal sessions on this server yet:")
     for i, (label, _) in enumerate(entries, 1):
         print(f"  {i}. {label}")
+    if elsewhere:
+        names = ", ".join(sorted({s.get("name") or "unnamed" for s in elsewhere}))
+        srvs = ", ".join(sorted({s.get("server_name") or "another server" for s in elsewhere}))
+        print(f"  ({len(elsewhere)} more in {project} run on other servers — {names} on {srvs}.")
+        print("   Open the editor on that server to join them.)")
     idx = None
     while idx is None:
         try:

@@ -50,6 +50,8 @@ def test_menu_lists_sessions_then_new_session_last():
     ok("label shows name, who and age", entries[0][0] == "orc-2 — abhi · 2h", entries[0][0])
     ok("unnamed session labelled", entries[1][0].startswith("unnamed — ?"), entries[1][0])
     ok("New session is last with no target", entries[-1] == ("New session", None))
+    named = oa.menu_entries(SESS, NOW, "Signforge")
+    ok("New session names the project when known", named[-1] == ("New session in Signforge", None), named[-1])
 
 
 def test_parse_choice():
@@ -62,13 +64,19 @@ def test_parse_choice():
 def test_fetch_sessions_is_scoped_to_this_project_on_this_server():
     cap = []
     got = oa.fetch_sessions("https://hub.example", "orc_k", "proj-1",
-                            opener=_opener(cap, {"sessions": SESS, "count": 2}))
+                            opener=_opener(cap, {"sessions": SESS, "count": 2, "project_name": "Signforge"}))
     url = cap[0].full_url
-    ok("returns sessions", got == SESS)
+    ok("returns the full response (sessions + project name)",
+       got["sessions"] == SESS and got["project_name"] == "Signforge", got)
     ok("project scoped", "project_id=proj-1" in url, url)
-    ok("this server only", "this_server=true" in url, url)
+    ok("this server only by default", "this_server=true" in url, url)
     ok("terminals only (no editors)", "kind=terminal" in url, url)
     ok("server api key header", cap[0].get_header("X-api-key") == "orc_k")
+    cap2 = []
+    oa.fetch_sessions("https://hub.example", "orc_k", "proj-1", this_server=False,
+                      opener=_opener(cap2, {"sessions": SESS}))
+    ok("this_server=False drops the server filter (for the other-server hint)",
+       "this_server=true" not in cap2[0].full_url, cap2[0].full_url)
 
 
 def test_create_session_posts_to_the_editor_endpoint():
@@ -103,7 +111,7 @@ def _run_main(env, *, fetch=None, create=None, choice="", tmux_ok=True):
         for k in ("ORCHESTRATIA_EDITOR_SESSION_ID", "ORCHESTRATIA_PROJECT_ID"):
             os.environ.pop(k, None)
         os.environ.update(env)
-        oa.fetch_sessions = fetch or (lambda *a, **k: SESS)
+        oa.fetch_sessions = fetch or (lambda *a, **k: {"sessions": SESS, "project_name": "Signforge"})
         oa.create_session = create or (lambda *a, **k: "44444444-aaaa-bbbb-cccc-000000000004")
         oa.wait_for_tmux = lambda name, **k: tmux_ok
         oa.os.execvp = lambda prog, argv: execs.append(argv)
@@ -145,6 +153,23 @@ def test_main_hub_unreachable_falls_back_to_a_shell():
 def test_main_new_session_never_appears_falls_back_to_a_shell():
     execs, _ = _run_main(EDITOR_ENV, choice="", tmux_ok=False)
     ok("execs a login shell", len(execs) == 1 and execs[0][-1] == "-l", execs)
+
+
+def test_picker_names_the_project_and_hints_other_server_sessions(cap: object = None):
+    import io, contextlib
+    here = {"sessions": [], "project_name": "Signforge"}
+    everywhere = {"sessions": [
+        {"id": "99", "name": "sf-2", "server_name": "ubuntu-8gb-hel1-1", "status": "active",
+         "created_by_email": "a@b", "started_at": NOW.isoformat(), "kind": "terminal"}]}
+    def fetch(hub, key, pid, *, this_server=True, opener=None):
+        return here if this_server else everywhere
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _run_main(EDITOR_ENV, fetch=fetch, choice="")   # Enter = New session
+    out = buf.getvalue()
+    ok("names the project", "Signforge" in out, out)
+    ok("says none on this server", "no terminal sessions on this server" in out, out)
+    ok("hints the other server's session by name", "sf-2" in out and "ubuntu-8gb-hel1-1" in out, out)
 
 
 def test_main_without_editor_env_uses_local_behaviour():

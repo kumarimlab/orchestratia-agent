@@ -1201,6 +1201,14 @@ def cmd_agent_update(args):
             print(f"  {DIM}Restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.orchestratia.agent{RESET}")
         else:
             print(f"  {DIM}Restart the daemon to apply: sudo systemctl restart orchestratia-agent{RESET}")
+            for _cfg in ("/etc/orchestratia/config.yaml", os.path.expanduser("~/.config/orchestratia/config.yaml")):
+                try:
+                    if "orcp-" in open(_cfg).read():
+                        print(f"  {DIM}Restricted tier on this server — also run: "
+                              f"sudo orchestratia-agent provision-tier --refresh-existing{RESET}")
+                        break
+                except OSError:
+                    continue
 
 
 def _agent_update_pip():

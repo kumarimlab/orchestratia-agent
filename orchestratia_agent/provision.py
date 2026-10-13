@@ -198,11 +198,12 @@ def _validate_not_orchestratia(resolved: str) -> None:
 
 
 def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: str,
-                  code_server_path: str | None = None) -> list[str]:
+                  code_server_path: str | None = None,
+                  dl_helper_path: str | None = None) -> list[str]:
     """One pinned, downward-only rule per project user.
 
-    Each line permits exactly tmux, git, and (when provided) code-server as that
-    project's user — nothing else, no wildcards, no shell, no ALL target. git is
+    Each line permits exactly tmux, git, and (when provided) code-server and the
+    download helper as that project's user — nothing else, no wildcards, no shell, no ALL target. git is
     included so `git_changes` can inspect a repo AS the session's own
     unprivileged user; code-server so the editor runs as that user too.
 
@@ -223,11 +224,95 @@ def sudoers_lines(daemon_user: str, projects: dict, tmux_path: str, git_path: st
         if not BIN_PATH_RE.match(code_server_path):
             raise ProvisionError(f"invalid code-server path {code_server_path!r}")
         cmds += f", {code_server_path}"
+    if dl_helper_path:
+        if not BIN_PATH_RE.match(dl_helper_path):
+            raise ProvisionError(f"invalid dl-helper path {dl_helper_path!r}")
+        cmds += f", {dl_helper_path}"
     lines = []
     for spec in projects.values():
         user = validate_username((spec or {}).get("user"))
         lines.append(f"{daemon_user} ALL=({user}) NOPASSWD: {cmds}")
     return lines
+
+
+def install_dl_helper(target: str | None = None, python: str | None = None, verify: bool = True) -> str:
+    """Install the stdlib download helper where the tier sudoers rule points.
+
+    Root-owned and writable by nobody else: sudo runs this file AS a project user, so
+    a writable copy would let its writer run code as every project user. The shebang
+    pins this box's python3 in isolated mode (-I). Verified by running it — a helper
+    that can't start would turn every restricted download into a cryptic failure."""
+    import json as _json
+    import subprocess
+    import tempfile
+    from orchestratia_agent.dl_helper import PROTOCOL
+    from orchestratia_agent.downloads import HELPER_INSTALL_PATH
+    target = target or HELPER_INSTALL_PATH
+    py = python or shutil.which("python3") or "/usr/bin/python3"
+    if not BIN_PATH_RE.match(py):
+        raise ProvisionError(f"invalid python3 path {py!r}")
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dl_helper.py")
+    with open(src, "rb") as fh:
+        _, _, rest = fh.read().partition(b"\n")
+    os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".dl-helper.")
+    with os.fdopen(fd, "wb") as out:
+        out.write(f"#!{py} -I\n".encode() + rest)
+    os.chmod(tmp, 0o755)
+    if os.geteuid() == 0:
+        os.chown(tmp, 0, 0)
+    os.replace(tmp, target)
+    if verify:
+        res = subprocess.run([target, "stat", "--cwd", "/", "--", "/"], capture_output=True, timeout=20, cwd="/")
+        try:
+            head = _json.loads(res.stdout.split(b"\n", 1)[0] or b"{}")
+        except ValueError:
+            head = {}
+        if head.get("protocol") != PROTOCOL:
+            raise ProvisionError(f"installed download helper does not run: {res.stderr.decode()[:200]}")
+    return target
+
+
+def _install_sudoers(lines: list[str]) -> None:
+    """Write the tier drop-in atomically, validated by visudo before it goes live."""
+    tmp = "/etc/sudoers.d/.orchestratia-agent-tiers.tmp"
+    final = "/etc/sudoers.d/orchestratia-agent-tiers"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o440)
+    check = _run(["visudo", "-cf", tmp], check=False)
+    if check.returncode != 0:
+        os.unlink(tmp)
+        raise ProvisionError(f"refusing to install invalid sudoers: {check.stderr.strip()}")
+    os.replace(tmp, final)
+
+
+def refresh_existing(daemon_user: str, config_path: str) -> int:
+    """Re-install the download helper and re-render sudoers for EVERY provisioned
+    project. Idempotent; run by the installer on upgrade so the helper always matches
+    the agent that calls it."""
+    if os.geteuid() != 0:
+        raise ProvisionError("provision-tier must be run as root (use sudo)")
+    if daemon_user == "root":
+        raise ProvisionError("--daemon-user is required when running from a root shell")
+    daemon_user = validate_username(daemon_user)
+    from orchestratia_agent.config import load_config
+    try:
+        cfg = load_config(config_path) or {}
+    except FileNotFoundError:
+        cfg = {}
+    priv = cfg.get("privilege") or {}
+    projects = priv.get("projects") or {}
+    if not projects:
+        print("  no restricted projects on this server — nothing to refresh")
+        return 0
+    tmux_path = priv.get("tmux_path") or shutil.which("tmux")
+    git_path = priv.get("git_path") or shutil.which("git")
+    helper = install_dl_helper()
+    _install_sudoers(sudoers_lines(daemon_user, projects, tmux_path, git_path,
+                                   code_server_path=priv.get("code_server_path"), dl_helper_path=helper))
+    print(f"  refreshed the download helper and sudoers for {len(projects)} project(s)")
+    return 0
 
 
 def assert_no_collision(user: str, project_id: str, existing_projects: dict) -> None:
@@ -598,8 +683,9 @@ def provision(project_id: str, workspaces: list[str],
     # Merge this project in, then build ALL sudoers lines. Validating the whole
     # set now means bad input fails before any user/ACL/file change.
     merged_projects = merge_project_workspaces(existing_projects, project_id, user, spaces)
+    helper_path = install_dl_helper()
     lines = sudoers_lines(daemon_user, merged_projects, tmux_path, git_path,
-                          code_server_path=cs_path)
+                          code_server_path=cs_path, dl_helper_path=helper_path)
 
     # 1. The user: no login password, and explicitly none of the escalation groups.
     if _run(["id", user], check=False).returncode != 0:
@@ -634,18 +720,7 @@ def provision(project_id: str, workspaces: list[str],
             )
 
     # 3. Sudoers drop-in (all projects), validated before it goes live.
-    tmp = "/etc/sudoers.d/.orchestratia-agent-tiers.tmp"
-    final = "/etc/sudoers.d/orchestratia-agent-tiers"
-    with open(tmp, "w") as fh:
-        fh.write("\n".join(lines) + "\n")
-    os.chmod(tmp, 0o440)
-    check = _run(["visudo", "-cf", tmp], check=False)
-    if check.returncode != 0:
-        os.unlink(tmp)
-        raise ProvisionError(
-            f"refusing to install invalid sudoers: {check.stderr.strip()}"
-        )
-    os.replace(tmp, final)
+    _install_sudoers(lines)
 
     # 4. Config: merge this project into the projects map, pin both binaries.
     cfg = existing_cfg

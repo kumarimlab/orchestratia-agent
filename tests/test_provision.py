@@ -550,6 +550,32 @@ def test_home_dirs_come_from_the_password_database():
     assert os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir) in homes, "this user's home is included"
 
 
+def test_sudoers_lines_include_the_download_helper_when_given():
+    line = pv.sudoers_lines("ubuntu", {"p": {"user": "orcp-aaaaaaaaaaaa"}}, "/usr/bin/tmux", "/usr/bin/git",
+                            dl_helper_path="/usr/local/libexec/orchestratia/dl-helper")[0]
+    assert line == ("ubuntu ALL=(orcp-aaaaaaaaaaaa) NOPASSWD: /usr/bin/tmux, /usr/bin/git, "
+                    "/usr/local/libexec/orchestratia/dl-helper"), line
+
+
+def test_sudoers_lines_refuse_a_bad_helper_path():
+    try:
+        pv.sudoers_lines("ubuntu", {"p": {"user": "orcp-aaaaaaaaaaaa"}}, "/usr/bin/tmux", "/usr/bin/git",
+                         dl_helper_path="/tmp/x, ALL")
+    except pv.ProvisionError:
+        return
+    raise AssertionError("a helper path with sudoers metacharacters was accepted")
+
+
+def test_install_dl_helper_writes_an_isolated_executable_copy():
+    import tempfile
+    import sys as _sys
+    target = os.path.join(tempfile.mkdtemp(), "libexec", "dl-helper")
+    path = pv.install_dl_helper(target, python=_sys.executable)
+    assert os.stat(path).st_mode & 0o777 == 0o755, oct(os.stat(path).st_mode)
+    first = open(path).readline().strip()
+    assert first == f"#!{_sys.executable} -I", first
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

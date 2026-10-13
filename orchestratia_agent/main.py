@@ -103,6 +103,11 @@ async def main():
         default=default_config_path(),
         help=f"Config file path (default: {default_config_path()})",
     )
+    parser.add_argument(
+        "--refresh-existing", action="store_true",
+        help="provision-tier: re-install the download helper and re-render sudoers for "
+             "every provisioned project (run on upgrade)",
+    )
     parser.add_argument("--register", metavar="TOKEN", help="One-time registration token")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -134,6 +139,14 @@ async def main():
 
     if args.provision_tier == "provision-tier":
         from orchestratia_agent.provision import provision, revoke, ProvisionError
+        if args.refresh_existing:
+            from orchestratia_agent.provision import refresh_existing, ProvisionError as _PE
+            try:
+                sys.exit(refresh_existing(args.daemon_user or os.environ.get("SUDO_USER") or getpass.getuser(),
+                                          args.config))
+            except _PE as e:
+                log.error(f"provision-tier: {e}")
+                sys.exit(1)
         if not args.project:
             log.error("provision-tier: --project <id> is required (a restricted "
                       "user belongs to a project)")

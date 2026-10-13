@@ -741,6 +741,16 @@ ok "Service file created"
 
 sudo systemctl daemon-reload 2>/dev/null && ok "systemd reloaded" || fail "daemon-reload failed"
 sudo systemctl enable "$SERVICE_NAME" 2>/dev/null && ok "Service enabled (starts on boot)" || fail "Could not enable service"
+# Keep the restricted-tier download helper + sudoers rule in step with this release.
+if [ -f /etc/orchestratia/config.yaml ] && grep -q "orcp-" /etc/orchestratia/config.yaml 2>/dev/null; then
+    if sudo "$VENV_DIR/bin/orchestratia-agent" provision-tier --refresh-existing \
+            --daemon-user "$RUN_USER" --config /etc/orchestratia/config.yaml; then
+        ok "Restricted tier refreshed"
+    else
+        warn "Could not refresh the restricted tier — run: sudo orchestratia-agent provision-tier --refresh-existing"
+    fi
+fi
+
 sudo systemctl start "$SERVICE_NAME" 2>/dev/null && ok "Service started" || {
     fail "Could not start service"
     info "Check logs: sudo journalctl -u ${SERVICE_NAME} -n 20"

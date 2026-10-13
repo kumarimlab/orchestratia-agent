@@ -81,18 +81,25 @@ def should_retry(close_code) -> bool:
     return close_code not in PERMANENT_CLOSE_CODES
 
 
-async def handle_relay_message(msg: dict, *, pinned_port: int, ws_send, on_activity) -> None:
+async def handle_relay_message(msg: dict, *, pinned_port: int, ws_send, on_activity,
+                               fc: dict | None = None) -> None:
     """Route one relay message to the local code-server tunnel.
 
     `pinned_port` is authoritative — the message's target_host/target_port are
-    ignored on purpose (finding #3)."""
+    ignored on purpose (finding #3). `fc["on"]` turns True only when THIS relay
+    connection announced flow control, so an older relay can never stall us."""
     mt = msg.get("type")
+    if mt == "relay_hello":
+        if fc is not None and msg.get("flow_control") == 1:
+            fc["on"] = True
+        return
     tid = msg.get("tunnel_id")
     if not tid:
         return
     if mt == "tunnel_open":
         on_activity()
-        await open_tunnel(tid, "127.0.0.1", pinned_port, ws_send)
+        await open_tunnel(tid, "127.0.0.1", pinned_port, ws_send,
+                          flow_control=bool(fc and fc.get("on")))
     elif mt == "tunnel_data":
         on_activity()
         data = msg.get("data", "")
@@ -100,6 +107,9 @@ async def handle_relay_message(msg: dict, *, pinned_port: int, ws_send, on_activ
             await write_tunnel_data(tid, data)
     elif mt == "tunnel_close":
         close_tunnel(tid)
+    elif mt == "tunnel_ack":
+        from orchestratia_agent.tunnel import ack
+        ack(tid, msg.get("bytes") or 0)
 
 
 async def _attempt(session_id: str, relay_url: str, api_key: str, pinned_port: int,
@@ -129,14 +139,15 @@ async def _attempt(session_id: str, relay_url: str, api_key: str, pinned_port: i
         # Auth: the relay verifies the API key AND that this server owns the
         # editor session (T7). Nothing routes before auth_ok.
         await ws.send(json.dumps({"type": "auth", "api_key": api_key,
-                                  "session_id": session_id}))
+                                  "session_id": session_id, "flow_control": 1}))
+        fc = {"on": False}      # per connection: a reconnect to an older relay starts off again
         async for raw in ws:
             try:
                 msg = json.loads(raw)
             except (ValueError, TypeError):
                 continue
             await handle_relay_message(msg, pinned_port=pinned_port,
-                                       ws_send=ws_send, on_activity=on_activity)
+                                       ws_send=ws_send, on_activity=on_activity, fc=fc)
         return True, None
     except websockets.exceptions.ConnectionClosed as e:
         code = getattr(e, "code", None) or getattr(getattr(e, "rcvd", None), "code", None)

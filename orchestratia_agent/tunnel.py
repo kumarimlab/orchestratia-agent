@@ -19,12 +19,30 @@ active_tunnels: dict[str, tuple[asyncio.Task, asyncio.StreamWriter]] = {}
 # Type for the WS send function
 WsSender = Callable[[dict], Coroutine[Any, Any, bool]]
 
+# Credit-based flow control (relay editor tunnels, only once the relay announces it):
+# stop reading the local socket at WINDOW unacknowledged bytes; the relay acks as the
+# browser drains.
+WINDOW = 1024 * 1024
+
+# tunnel_id -> {"unacked": int, "event": asyncio.Event}
+_credit: dict[str, dict] = {}
+
+
+def ack(tunnel_id: str, n: int) -> None:
+    c = _credit.get(tunnel_id)
+    if not c:
+        return
+    c["unacked"] = max(0, c["unacked"] - int(n or 0))
+    if c["unacked"] < WINDOW:
+        c["event"].set()
+
 
 async def open_tunnel(
     tunnel_id: str,
     target_host: str,
     target_port: int,
     ws_send: WsSender,
+    flow_control: bool = False,
 ):
     """Open TCP connection to target and start reader task for TCP→WS relay."""
     try:
@@ -51,6 +69,11 @@ async def open_tunnel(
 
     log.info(f"Tunnel {tunnel_id[:8]}: TCP connected to {target_host}:{target_port}")
 
+    if flow_control:
+        ev = asyncio.Event()
+        ev.set()
+        _credit[tunnel_id] = {"unacked": 0, "event": ev}
+
     # Start reader task
     task = asyncio.create_task(_tcp_to_ws(tunnel_id, reader, ws_send))
     active_tunnels[tunnel_id] = (task, writer)
@@ -70,6 +93,11 @@ async def _tcp_to_ws(
     """Read from TCP socket and forward to WebSocket as base64."""
     try:
         while True:
+            c = _credit.get(tunnel_id)
+            if c is not None:
+                while c["unacked"] >= WINDOW:
+                    c["event"].clear()
+                    await c["event"].wait()
             data = await reader.read(16384)  # 16KB chunks
             if not data:
                 # TCP EOF
@@ -87,6 +115,8 @@ async def _tcp_to_ws(
                 "tunnel_id": tunnel_id,
                 "data": b64,
             })
+            if c is not None:
+                c["unacked"] += len(data)
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -121,6 +151,7 @@ async def write_tunnel_data(tunnel_id: str, b64_data: str):
 
 def close_tunnel(tunnel_id: str):
     """Cancel reader task and close TCP socket."""
+    _credit.pop(tunnel_id, None)
     entry = active_tunnels.pop(tunnel_id, None)
     if not entry:
         return
@@ -136,6 +167,7 @@ def close_tunnel(tunnel_id: str):
 
 def _cleanup_tunnel(tunnel_id: str):
     """Clean up tunnel state after reader task exits."""
+    _credit.pop(tunnel_id, None)
     entry = active_tunnels.pop(tunnel_id, None)
     if entry:
         _, writer = entry

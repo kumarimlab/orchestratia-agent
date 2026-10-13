@@ -161,7 +161,7 @@ def test_relay_bridge_pins_the_target_port():
 
     opened = {}
 
-    async def fake_open(tunnel_id, host, port, ws_send):
+    async def fake_open(tunnel_id, host, port, ws_send, flow_control=False):
         opened["host"] = host
         opened["port"] = port
 

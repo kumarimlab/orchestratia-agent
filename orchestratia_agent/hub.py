@@ -1228,6 +1228,17 @@ async def ws_receive_loop(ws, state: DaemonState):
                 if request_id:
                     asyncio.create_task(_handle_git_changes(state, sender, msg))
 
+            elif msg_type == "download_stat":
+                if msg.get("request_id"):
+                    asyncio.create_task(_handle_download_stat(state, sender, msg))
+
+            elif msg_type == "download_open":
+                if msg.get("request_id") and msg.get("relay_url"):
+                    from orchestratia_agent import downloads as _dl
+                    from orchestratia_agent.tls import build_ssl_context
+                    asyncio.create_task(_dl.open_download(
+                        msg, _tier_config(state), state.api_key, build_ssl_context(state=state)))
+
             elif msg_type == "remote_exec":
                 request_id = msg.get("request_id")
                 command = msg.get("command", "")
@@ -2101,6 +2112,17 @@ async def _handle_code_server_stop(session_id: str, project_id: str | None,
 
     await relay_client.disconnect(session_id)
     code_server.stop(session_id)   # the process stops once no other session uses it
+
+
+async def _handle_download_stat(state: DaemonState, sender, msg: dict):
+    """Preflight for a download: stat the path AS the session user."""
+    from orchestratia_agent import downloads as _dl
+    try:
+        result = await _dl.stat_request(msg, _tier_config(state))
+    except Exception as e:  # noqa: BLE001
+        log.exception("download_stat failed")
+        result = {"ok": False, "error": "invalid", "detail": type(e).__name__}
+    await sender({"type": "download_stat_result", "request_id": msg.get("request_id"), **result})
 
 
 async def _handle_git_changes(state: DaemonState, sender, msg: dict):

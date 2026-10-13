@@ -40,6 +40,12 @@ PRIVILEGE_CLASSIFICATION = {
     # its own privileges rather than the daemon's.
     "git_changes": TIER_BOUNDED,
 
+    # Downloads (relay-streamed). Every file access runs dl_helper AS THE
+    # SESSION'S USER (sudo -u orcp-<project> for restricted), never in the daemon
+    # process — the tier is resolved from this host's config, not the message.
+    "download_stat": TIER_BOUNDED,
+    "download_open": TIER_BOUNDED,
+
     # Filesystem side-panel — scoped to the session's working_dir.
     # NOTE: these still run IN THE DAEMON PROCESS as the daemon user. They are
     # path-scoped, not privilege-scoped. Tracked as a known gap; see the

@@ -248,14 +248,31 @@ async def main():
         # Signal handling (cross-platform)
         loop = asyncio.get_event_loop()
 
+        shutdown_tasks: list[asyncio.Future] = []  # keep a ref so it isn't GC'd
+
         def handle_signal(sig, frame):
             sig_name = signal.Signals(sig).name if hasattr(signal, "Signals") else str(sig)
             log.info(f"Received {sig_name}, shutting down...")
             state.running = False
+            shutdown_tasks.append(asyncio.ensure_future(_stop_tunnels_then_ws()))
+
+        async def _stop_tunnels_then_ws():
+            # Stop grant listeners NOW (the full cleanup only runs once every
+            # background loop has noticed — up to a minute of accepting SSH
+            # connections that can't work), and tell the hub about open
+            # tunnels while the WebSocket is still up to carry it.
+            from orchestratia_agent import s2s_tunnel
+            try:
+                await asyncio.wait_for(s2s_tunnel.close_all(), timeout=5)
+            except Exception as e:  # noqa: BLE001 — shutdown must proceed regardless
+                log.warning(f"Closing tunnels on shutdown: {e}")
             # Close the WebSocket to unblock ws.recv()
             ws = state.ws_connection
             if ws:
-                asyncio.ensure_future(ws.close())
+                try:
+                    await ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
         signal.signal(signal.SIGINT, handle_signal)
         if sys.platform == "win32":

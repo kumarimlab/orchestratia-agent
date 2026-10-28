@@ -742,17 +742,42 @@ def clean_known_hosts(port: int) -> None:
     When grants are recreated, the remote host key changes but the local port
     stays the same. SSH blocks the connection with REMOTE HOST IDENTIFICATION
     HAS CHANGED. This cleans the stale entry so the next connection succeeds.
+
+    Uses `ssh-keygen -R`, which also matches HASHED entries (`|1|...`,
+    Ubuntu's default HashKnownHosts) — a plain text match never did.
     """
     known_hosts = Path.home() / ".ssh" / "known_hosts"
     if not known_hosts.exists():
         return
+    host = f"[localhost]:{port}"
+    backup = Path(f"{known_hosts}.old")
+    # ssh-keygen -R writes its backup to known_hosts.old — keep the user's own.
+    users_backup = backup.read_bytes() if backup.exists() else None
     try:
-        marker = f"[localhost]:{port}"
-        lines = known_hosts.read_text().splitlines()
-        filtered = [l for l in lines if marker not in l]
-        if len(filtered) < len(lines):
-            known_hosts.write_text("\n".join(filtered) + "\n")
-            log.info(f"Cleaned {len(lines) - len(filtered)} stale known_hosts entry(s) for port {port}")
+        result = subprocess.run(
+            ["ssh-keygen", "-R", host, "-f", str(known_hosts)],
+            capture_output=True, text=True, timeout=10,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if _IS_WINDOWS else {}),
+        )
+        if result.returncode != 0:
+            log.warning(f"Could not clean known_hosts for port {port}: {result.stderr.strip()}")
+        elif "updated" in result.stdout or "updated" in result.stderr:
+            log.info(f"Cleaned stale known_hosts entry for port {port}")
+        if users_backup is None:
+            backup.unlink(missing_ok=True)
+        else:
+            backup.write_bytes(users_backup)
+    except FileNotFoundError:
+        # No ssh-keygen (optional on Windows). Plain-text match: enough for
+        # unhashed entries, which is what Windows OpenSSH writes by default.
+        try:
+            lines = known_hosts.read_text().splitlines()
+            filtered = [l for l in lines if host not in l]
+            if len(filtered) < len(lines):
+                known_hosts.write_text("\n".join(filtered) + "\n")
+                log.info(f"Cleaned {len(lines) - len(filtered)} stale known_hosts entry(s) for port {port}")
+        except Exception as e:
+            log.warning(f"Could not clean known_hosts for port {port}: {e}")
     except Exception as e:
         log.warning(f"Could not clean known_hosts for port {port}: {e}")
 

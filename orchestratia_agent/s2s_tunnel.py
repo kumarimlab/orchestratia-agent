@@ -38,6 +38,25 @@ _writers: dict[str, asyncio.StreamWriter] = {}
 # Tunnel ready events — source waits for target to confirm TCP connection
 _ready_events: dict[str, asyncio.Event] = {}
 
+# tunnel_id -> grant_id for every tunnel we hold a socket for, including ones
+# still waiting for the target (those aren't in _active_tunnels yet).
+_tunnel_grant: dict[str, str] = {}
+
+# tunnel_id -> reason, for a tunnel the hub or target refused before it was ready
+_refused: dict[str, str] = {}
+
+# How long a new connection waits for the target agent to confirm its end.
+READY_TIMEOUT = 10.0
+
+# tunnel_id -> reason for closes we couldn't send (WS down mid-reconnect).
+# Flushed on the next reconcile, which also runs right after a reconnect —
+# otherwise the target keeps that session open for days.
+_unsent_closes: dict[str, str] = {}
+_UNSENT_CLOSES_MAX = 500
+
+# Set by close_all(): no listener may be (re)started once shutdown has begun.
+_shutting_down = False
+
 # Module-level ws_send reference (set during setup)
 _ws_send: WsSender | None = None
 
@@ -69,34 +88,36 @@ async def setup_grant(
 ) -> bool:
     """Start a local TCP listener for an access grant.
 
-    Idempotent + conflict-tolerant: any existing listener for the same
-    grant_id OR the same bind_port is torn down first. Without this, a
-    missed `revoke_grant_access` WS push from the hub leaves the stale
-    listener running with its old grant_id captured in the connection
-    handler's closure — every inbound connection routes to a grant the
-    target no longer recognises, causing 'target not ready after 10s'
-    on every SSH attempt. (Reported 2026-05-24 on staging.kritis.io;
-    workaround was a full daemon restart.)
+    Idempotent + conflict-tolerant: an unchanged re-broadcast (the 60s
+    reconcile calls this every cycle) keeps the running listener and its
+    open tunnels; a listener for the same grant on a different port/target,
+    or for a different grant on the same port, is torn down first. The
+    latter covers a missed `revoke_grant_access` push leaving a stale
+    listener whose closure routes to a grant the target no longer knows
+    ('target not ready after 10s' on every SSH attempt — staging.kritis.io,
+    2026-05-24).
+
+    Recreating on every reconcile was itself a bug: on Python >= 3.12.1
+    `Server.wait_closed()` waits for every open connection, so one long SSH
+    session left the port refusing all new connections, and the reconcile
+    loop stalled, until that session ended (kritis-ipp, 2026-10).
     """
     global _ws_send
     _ws_send = ws_send
+    if _shutting_down:
+        return False
 
-    # Conflict 1: same grant_id already active. Could be a re-broadcast of
-    # `grant_ssh_access` (idempotent path) or a port-changed re-create.
-    # Always tear down + recreate so the in-memory state matches the new
-    # arguments — never trust that "we already have it" is still correct.
-    if grant_id in _active_grants:
-        existing_port = _active_grants[grant_id][1]["bind_port"]
-        if existing_port == bind_port:
-            log.info(
-                f"Grant {grant_id[:8]}: re-broadcast on same port {bind_port}, "
-                f"recreating listener (idempotent)"
-            )
-        else:
-            log.info(
-                f"Grant {grant_id[:8]}: bind port changed {existing_port} → {bind_port}, "
-                f"tearing down old listener"
-            )
+    existing = _active_grants.get(grant_id)
+    if existing:
+        server, info = existing
+        if (info["bind_port"] == bind_port and info["target_port"] == target_port
+                and server.is_serving()):
+            return True
+        log.info(
+            f"Grant {grant_id[:8]}: listener changed "
+            f"({info['bind_port']}→{bind_port}, target port {info['target_port']}→{target_port}"
+            f"{'' if server.is_serving() else ', not serving'}), recreating"
+        )
         await teardown_grant(grant_id)
 
     # Conflict 2: a *different* grant holds this port. Standard cause is a
@@ -114,7 +135,7 @@ async def setup_grant(
 
     try:
         server = await asyncio.start_server(
-            lambda r, w: _handle_connection(r, w, grant_id, target_port, ws_send),
+            lambda r, w: _handle_connection(r, w, grant_id),
             "127.0.0.1",
             bind_port,
         )
@@ -131,10 +152,11 @@ async def setup_grant(
 
 
 async def teardown_grant(grant_id: str):
-    """Stop listener and close all tunnels for a grant. Idempotent — calling
-    for a grant we don't have is a no-op, not an error (this is the
-    `revoke_grant_access` push arriving after the grant was already cleaned
-    up by reconciliation, for example)."""
+    """Stop listener and close all tunnels for a grant, telling the hub about
+    each so the target closes its end too. Idempotent — calling for a grant
+    we don't have is a no-op, not an error (this is the `revoke_grant_access`
+    push arriving after the grant was already cleaned up by reconciliation,
+    for example)."""
     entry = _active_grants.pop(grant_id, None)
     if entry:
         server, info = entry
@@ -145,13 +167,24 @@ async def teardown_grant(grant_id: str):
         if port is not None and _port_to_grant.get(port) == grant_id:
             _port_to_grant.pop(port, None)
         server.close()
-        await server.wait_closed()
+
+    # Close the tunnels BEFORE waiting on the server: wait_closed() waits for
+    # every connection to drop, so waiting first deadlocks on a live session.
+    for tid in [t for t, gid in _tunnel_grant.items() if gid == grant_id]:
+        await _notify_closed(tid, "grant listener stopped")
+        close_tunnel(tid)
+
+    if entry:
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=5)
+        except asyncio.TimeoutError:
+            log.warning(f"Grant {grant_id[:8]}: connections still draining after 5s")
         log.info(f"Grant {grant_id[:8]}: listener stopped")
 
-    # Close any active tunnels for this grant
-    to_close = [tid for tid, (_, _, gid) in _active_tunnels.items() if gid == grant_id]
-    for tid in to_close:
-        close_tunnel(tid)
+
+def owns(tunnel_id: str) -> bool:
+    """True if this module holds a socket for the tunnel (pending or live)."""
+    return tunnel_id in _writers
 
 
 def mark_ready(tunnel_id: str):
@@ -162,16 +195,56 @@ def mark_ready(tunnel_id: str):
         log.info(f"S2S tunnel {tunnel_id[:8]}: target ready")
 
 
+def handle_remote_close(tunnel_id: str, reason: str):
+    """The hub or target closed/refused the tunnel (tunnel_close, tunnel_closed,
+    tunnel_error). A tunnel still waiting for the target fails right away with
+    the reason instead of timing out; a live one is closed. Never echoed back."""
+    ev = _ready_events.get(tunnel_id)
+    if ev:
+        _refused[tunnel_id] = reason
+        ev.set()
+        return
+    close_tunnel(tunnel_id)
+
+
+async def _send(msg: dict, timeout: float | None = 2) -> bool:
+    """Send on the hub WS. Control messages get a timeout so a stuck hub can't
+    hold up teardown; data frames pass timeout=None to keep backpressure."""
+    if _ws_send is None:
+        return False
+    try:
+        if timeout is None:
+            return await _ws_send(msg)
+        return await asyncio.wait_for(_ws_send(msg), timeout=timeout)
+    except Exception:
+        return False
+
+
+async def _notify_closed(tunnel_id: str, reason: str):
+    """Tell the hub (and through it the target) that our end is gone. If the WS
+    is down, keep it for flush_unsent_closes()."""
+    sent = await _send({"type": "tunnel_closed", "tunnel_id": tunnel_id, "reason": reason})
+    if not sent and len(_unsent_closes) < _UNSENT_CLOSES_MAX:
+        _unsent_closes[tunnel_id] = reason
+
+
+async def flush_unsent_closes():
+    """Resend closes that failed while the WS was down (called on reconcile)."""
+    for tid, reason in list(_unsent_closes.items()):
+        if not await _send({"type": "tunnel_closed", "tunnel_id": tid, "reason": reason}):
+            return  # still down — try again next cycle
+        _unsent_closes.pop(tid, None)
+
+
 async def _handle_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     grant_id: str,
-    target_port: int,
-    ws_send: WsSender,
 ):
     """Handle incoming TCP connection: generate tunnel_id, start relay."""
     tunnel_id = str(uuid.uuid4())
     _writers[tunnel_id] = writer
+    _tunnel_grant[tunnel_id] = grant_id
 
     log.info(f"S2S tunnel {tunnel_id[:8]}: new TCP connection (grant {grant_id[:8]})")
 
@@ -179,33 +252,45 @@ async def _handle_connection(
     ready = asyncio.Event()
     _ready_events[tunnel_id] = ready
 
-    await ws_send({
+    await _send({
         "type": "s2s_tunnel_open",
         "tunnel_id": tunnel_id,
         "grant_id": grant_id,
     })
 
-    # Wait for target to confirm TCP connection (up to 10s)
+    # Wait for target to confirm TCP connection
     try:
-        await asyncio.wait_for(ready.wait(), timeout=10.0)
+        await asyncio.wait_for(ready.wait(), timeout=READY_TIMEOUT)
     except asyncio.TimeoutError:
-        log.warning(f"S2S tunnel {tunnel_id[:8]}: target not ready after 10s, aborting")
+        log.warning(
+            f"S2S tunnel {tunnel_id[:8]}: target not ready after {READY_TIMEOUT:g}s "
+            f"(no reply from the hub or the target agent), aborting"
+        )
         _ready_events.pop(tunnel_id, None)
-        _writers.pop(tunnel_id, None)
-        writer.close()
+        # The target may still connect late — make sure its end is closed too.
+        await _notify_closed(tunnel_id, "source timed out waiting for target")
+        close_tunnel(tunnel_id)
         return
     finally:
         _ready_events.pop(tunnel_id, None)
+        refused = _refused.pop(tunnel_id, None)
+
+    if refused is not None:
+        if tunnel_id in _writers:
+            log.warning(f"S2S tunnel {tunnel_id[:8]}: refused before ready: {refused}")
+            close_tunnel(tunnel_id)
+        return
+    if tunnel_id not in _writers:
+        return  # closed (grant torn down) while waiting
 
     # Start TCP→WS reader only after target is connected
-    task = asyncio.create_task(_tcp_to_ws(tunnel_id, reader, ws_send))
+    task = asyncio.create_task(_tcp_to_ws(tunnel_id, reader))
     _active_tunnels[tunnel_id] = (task, writer, grant_id)
 
 
 async def _tcp_to_ws(
     tunnel_id: str,
     reader: asyncio.StreamReader,
-    ws_send: WsSender,
 ):
     """Read from local TCP socket and forward to hub as base64."""
     try:
@@ -213,31 +298,20 @@ async def _tcp_to_ws(
             data = await reader.read(16384)
             if not data:
                 log.info(f"S2S tunnel {tunnel_id[:8]}: TCP EOF")
-                await ws_send({
-                    "type": "tunnel_closed",
-                    "tunnel_id": tunnel_id,
-                    "reason": "eof",
-                })
+                await _notify_closed(tunnel_id, "eof")
                 break
 
             b64 = base64.b64encode(data).decode("ascii")
-            await ws_send({
+            await _send({
                 "type": "tunnel_data",
                 "tunnel_id": tunnel_id,
                 "data": b64,
-            })
+            }, timeout=None)
     except asyncio.CancelledError:
         pass
     except Exception as e:
         log.warning(f"S2S tunnel {tunnel_id[:8]}: TCP read error: {e}")
-        try:
-            await ws_send({
-                "type": "tunnel_closed",
-                "tunnel_id": tunnel_id,
-                "reason": str(e),
-            })
-        except Exception:
-            pass
+        await _notify_closed(tunnel_id, str(e))
     finally:
         _cleanup_tunnel(tunnel_id)
 
@@ -246,7 +320,8 @@ async def write_data(tunnel_id: str, b64_data: str):
     """WS→TCP: decode base64 and write to local TCP socket."""
     writer = _writers.get(tunnel_id)
     if not writer:
-        log.warning(f"S2S tunnel {tunnel_id[:8]}: write to unknown tunnel")
+        # hub.py only routes here when owns() — an orphan id goes to
+        # tunnel.write_tunnel_data, which answers it with tunnel_closed.
         return
 
     try:
@@ -258,7 +333,14 @@ async def write_data(tunnel_id: str, b64_data: str):
 
 
 def close_tunnel(tunnel_id: str):
-    """Close a specific S2S tunnel."""
+    """Close a specific S2S tunnel (no message to the hub — callers that end it
+    on our side send tunnel_closed first)."""
+    if tunnel_id not in _writers and tunnel_id not in _active_tunnels:
+        return
+    ev = _ready_events.get(tunnel_id)
+    if ev:  # still waiting for the target: wake the handler so it stops now
+        _refused.setdefault(tunnel_id, "closed locally")
+        ev.set()
     entry = _active_tunnels.pop(tunnel_id, None)
     if entry:
         task, writer, _ = entry
@@ -268,7 +350,13 @@ def close_tunnel(tunnel_id: str):
         except Exception:
             pass
 
-    _writers.pop(tunnel_id, None)
+    writer = _writers.pop(tunnel_id, None)
+    if writer and not entry:
+        try:
+            writer.close()  # still waiting for the target — no reader task yet
+        except Exception:
+            pass
+    _tunnel_grant.pop(tunnel_id, None)
     log.info(f"S2S tunnel {tunnel_id[:8]}: closed")
 
 
@@ -282,14 +370,18 @@ def _cleanup_tunnel(tunnel_id: str):
         except Exception:
             pass
     _writers.pop(tunnel_id, None)
+    _tunnel_grant.pop(tunnel_id, None)
 
 
 async def close_all():
-    """Shutdown all listeners and tunnels."""
+    """Shutdown all listeners and tunnels, telling the hub about each tunnel."""
+    global _shutting_down
+    _shutting_down = True
     for grant_id in list(_active_grants):
         await teardown_grant(grant_id)
 
-    for tunnel_id in list(_active_tunnels):
+    for tunnel_id in list(_tunnel_grant):
+        await _notify_closed(tunnel_id, "source agent shutting down")
         close_tunnel(tunnel_id)
 
     log.info("All S2S tunnels and listeners closed")

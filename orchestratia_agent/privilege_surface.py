@@ -86,6 +86,7 @@ PRIVILEGE_CLASSIFICATION = {
     "tunnel_ready": NO_EXECUTION,
     "tunnel_close": NO_EXECUTION,
     "tunnel_closed": NO_EXECUTION,
+    "tunnel_error": NO_EXECUTION,
     "setup_ssh_access": UNCONFINED,
     "revoke_ssh_access": UNCONFINED,
     "grant_ssh_access": UNCONFINED,

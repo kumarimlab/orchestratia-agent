@@ -1104,13 +1104,15 @@ async def ws_receive_loop(ws, state: DaemonState):
                 b64_data = msg.get("data", "")
                 if tunnel_id and b64_data:
                     from orchestratia_agent import s2s_tunnel
-                    if tunnel_id in s2s_tunnel._writers:
+                    if s2s_tunnel.owns(tunnel_id):
                         # S2S: data from hub → local TCP socket (source role)
                         await s2s_tunnel.write_data(tunnel_id, b64_data)
                     else:
-                        # Regular tunnel (target role)
+                        # Regular tunnel (target role). An id we don't have at
+                        # all is answered with tunnel_closed so the far end —
+                        # source or target — drops its orphan.
                         from orchestratia_agent.tunnel import write_tunnel_data
-                        await write_tunnel_data(tunnel_id, b64_data)
+                        await write_tunnel_data(tunnel_id, b64_data, sender)
 
             elif msg_type == "tunnel_ready":
                 # Target confirmed TCP connection — unblock source relay
@@ -1119,24 +1121,16 @@ async def ws_receive_loop(ws, state: DaemonState):
                     from orchestratia_agent import s2s_tunnel
                     s2s_tunnel.mark_ready(tunnel_id)
 
-            elif msg_type == "tunnel_close":
+            elif msg_type in ("tunnel_close", "tunnel_closed", "tunnel_error"):
+                # Hub relays a close/refusal from the peer (tunnel_error: the hub
+                # refused an s2s_tunnel_open, e.g. grant not active).
                 tunnel_id = msg.get("tunnel_id")
                 if tunnel_id:
                     from orchestratia_agent import s2s_tunnel
-                    if tunnel_id in s2s_tunnel._writers:
-                        s2s_tunnel.close_tunnel(tunnel_id)
-                    else:
-                        from orchestratia_agent.tunnel import close_tunnel
-                        close_tunnel(tunnel_id)
-
-            elif msg_type == "tunnel_closed":
-                # Hub relays close from peer
-                tunnel_id = msg.get("tunnel_id")
-                if tunnel_id:
-                    from orchestratia_agent import s2s_tunnel
-                    if tunnel_id in s2s_tunnel._writers:
-                        s2s_tunnel.close_tunnel(tunnel_id)
-                    else:
+                    reason = msg.get("reason") or msg.get("error") or msg_type
+                    if s2s_tunnel.owns(tunnel_id):
+                        s2s_tunnel.handle_remote_close(tunnel_id, reason)
+                    elif msg_type != "tunnel_error":
                         from orchestratia_agent.tunnel import close_tunnel
                         close_tunnel(tunnel_id)
 
@@ -1553,6 +1547,9 @@ async def _reconcile_grants(state: DaemonState, sender):
                 store_private_key, remove_private_key,
             )
             from orchestratia_agent import s2s_tunnel
+
+            # Closes that couldn't be sent while the WS was down.
+            await s2s_tunnel.flush_unsent_closes()
 
             # Run blocking ssh_setup calls in the default executor — see
             # the matching comment in ws_receive_loop. Calling them

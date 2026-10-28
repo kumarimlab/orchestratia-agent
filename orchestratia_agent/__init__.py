@@ -1,3 +1,3 @@
 """Orchestratia Agent - cross-platform daemon for AI agent orchestration."""
 
-__version__ = "0.32.0"
+__version__ = "0.32.1"

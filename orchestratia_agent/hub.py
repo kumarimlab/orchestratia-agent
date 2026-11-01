@@ -259,6 +259,24 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
         return False
 
 
+# How long to wait for the hub's auth_ok. Generous: right after a hub restart or a network
+# blip every agent reconnects at once and the hub answers slowly, and an attempt given up
+# on too early only adds a retry to that load.
+AUTH_REPLY_TIMEOUT = 15.0
+
+
+async def _discard(ws) -> None:
+    """Close an attempt we won't use, so the hub drops it too — it may already have
+    authenticated it. Bounded: a hub that doesn't answer the close mustn't hold up the retry,
+    and then the socket is dropped outright (a cancelled close leaves it open)."""
+    try:
+        await asyncio.wait_for(ws.close(), timeout=2)
+    except Exception:
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            transport.abort()
+
+
 async def connect_ws(state: DaemonState):
     """Connect to the hub's agent WebSocket."""
     from orchestratia_agent.tls import build_ssl_context
@@ -268,6 +286,7 @@ async def connect_ws(state: DaemonState):
     target = f"{ws_url}/ws/server"
     log.debug(f"WebSocket connecting to {target}")
 
+    ws = None
     try:
         ws = await websockets.connect(
             target,
@@ -277,15 +296,17 @@ async def connect_ws(state: DaemonState):
             max_size=2**20,
         )
         await ws.send(json.dumps({"type": "auth", "api_key": state.api_key}))
-        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=AUTH_REPLY_TIMEOUT))
         if resp.get("type") == "auth_ok":
             log.info("WebSocket connected and authenticated")
             return ws
         else:
             log.error(f"WebSocket auth failed: {resp}")
-            await ws.close()
+            await _discard(ws)
             return None
     except Exception as e:
+        if ws is not None:
+            await _discard(ws)
         log.warning(f"WebSocket connect failed to {target}")
         log.warning(f"  Error: {e.__class__.__name__}: {e}")
         log.debug(f"  SSL verify: disabled, event loop: {type(asyncio.get_event_loop()).__name__}")

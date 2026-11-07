@@ -741,6 +741,16 @@ ok "Service file created"
 
 sudo systemctl daemon-reload 2>/dev/null && ok "systemd reloaded" || fail "daemon-reload failed"
 sudo systemctl enable "$SERVICE_NAME" 2>/dev/null && ok "Service enabled (starts on boot)" || fail "Could not enable service"
+# Reserve the upload folders for root at every boot (/etc/tmpfiles.d/orchestratia.conf,
+# applied now with systemd-tmpfiles --create) and give the service user its private
+# 0700 folder — uploads never land in a folder another local user could own.
+if sudo "$VENV_DIR/bin/orchestratia-agent" provision-tier --upload-dirs \
+        --daemon-user "$RUN_USER" --config /etc/orchestratia/config.yaml; then
+    ok "Upload folders reserved"
+else
+    warn "Could not reserve the upload folders — run: sudo orchestratia-agent provision-tier --upload-dirs --daemon-user ${RUN_USER}"
+fi
+
 # Keep the restricted-tier download helper + sudoers rule in step with this release.
 if [ -f /etc/orchestratia/config.yaml ] && grep -q "orcp-" /etc/orchestratia/config.yaml 2>/dev/null; then
     if sudo "$VENV_DIR/bin/orchestratia-agent" provision-tier --refresh-existing \

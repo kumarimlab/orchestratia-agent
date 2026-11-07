@@ -576,6 +576,90 @@ def test_install_dl_helper_writes_an_isolated_executable_copy():
     assert first == f"#!{_sys.executable} -I", first
 
 
+def test_install_dl_helper_refuses_a_helper_without_upload_ops():
+    """A helper that answers but predates the upload ops would turn every restricted
+    upload into helper_outdated; the install verifies the ops, not just the protocol."""
+    import tempfile
+    import sys as _sys
+    target = os.path.join(tempfile.mkdtemp(), "libexec", "dl-helper")
+    path = pv.install_dl_helper(target, python=_sys.executable)
+    import json
+    import subprocess
+    out = subprocess.run([path, "stat", "--cwd", "/", "--", "/"], capture_output=True, cwd="/").stdout
+    head = json.loads(out.split(b"\n", 1)[0])
+    assert "ul-write" in head["ops"] and head["protocol"] == 2, head
+
+
+def test_upload_dirs_need_root():
+    if os.geteuid() == 0:
+        print("SKIP  test_upload_dirs_need_root (running as root)")
+        return
+    try:
+        pv.install_upload_dirs("ubuntu", "/nonexistent/config.yaml")
+    except pv.ProvisionError as e:
+        assert "root" in str(e), e
+        return
+    raise AssertionError("install_upload_dirs ran without root")
+
+
+def test_upload_dirs_refuse_a_bad_daemon_user():
+    if os.geteuid() != 0:
+        print("SKIP  test_upload_dirs_refuse_a_bad_daemon_user (needs root)")
+        return
+    try:
+        pv.install_upload_dirs("bad\nuser", "/nonexistent/config.yaml")
+    except pv.ProvisionError:
+        return
+    raise AssertionError("a daemon user with a newline reached tmpfiles.d")
+
+
+def test_upload_dirs_create_every_users_folder_and_the_tmpfiles_conf():
+    """Root (provisioning) is the only party that can make a project user's folder:
+    the daemon runs as an ordinary user. Sandboxed via root= so nothing touches /tmp."""
+    if os.geteuid() != 0:
+        print("SKIP  test_upload_dirs_create_every_users_folder_and_the_tmpfiles_conf (needs root)")
+        return
+    import pwd
+    import tempfile
+    from orchestratia_agent.config import save_config
+    sandbox = tempfile.mkdtemp()
+    cfg = os.path.join(sandbox, "config.yaml")
+    save_config(cfg, {"privilege": {"projects": {"p1": {"user": "nobody", "workspaces": []}}}})
+    conf = os.path.join(sandbox, "tmpfiles.d", "orchestratia.conf")
+    daemon = pwd.getpwuid(0).pw_name
+    assert pv.install_upload_dirs(daemon, cfg, conf_path=conf, root=sandbox) == 0
+    base = os.path.join(sandbox, "orchestratia-uploads")
+    s = os.lstat(base)
+    assert s.st_uid == 0 and s.st_mode & 0o777 == 0o755, oct(s.st_mode)
+    theirs = os.lstat(os.path.join(base, "nobody"))
+    assert theirs.st_uid == pwd.getpwnam("nobody").pw_uid and theirs.st_mode & 0o777 == 0o700, oct(theirs.st_mode)
+    text = open(conf).read()
+    assert f"d {base}/nobody 0700 nobody " in text, text
+    assert "d /tmp/orchestratia-uploads 0755 root root -" in text, text
+    assert os.stat(conf).st_mode & 0o777 == 0o644
+    # idempotent
+    assert pv.install_upload_dirs(daemon, cfg, conf_path=conf, root=sandbox) == 0
+
+
+def test_upload_dirs_refuse_a_squatted_base():
+    if os.geteuid() != 0:
+        print("SKIP  test_upload_dirs_refuse_a_squatted_base (needs root)")
+        return
+    import pwd
+    import tempfile
+    sandbox = tempfile.mkdtemp()
+    base = os.path.join(sandbox, "orchestratia-uploads")
+    os.mkdir(base, 0o755)
+    os.chown(base, pwd.getpwnam("nobody").pw_uid, -1)
+    try:
+        pv.install_upload_dirs(pwd.getpwuid(0).pw_name, os.path.join(sandbox, "none.yaml"),
+                               conf_path=os.path.join(sandbox, "t.conf"), root=sandbox)
+    except pv.ProvisionError as e:
+        assert "orchestratia-uploads" in str(e), e
+        return
+    raise AssertionError("provisioning used a parent folder another user owns")
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

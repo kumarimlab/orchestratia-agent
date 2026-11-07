@@ -56,6 +56,9 @@ RESERVED_USERS = {"root", "daemon", "bin", "sys", "adm", "sudo", "docker"}
 ALLOWED_SUPPLEMENTARY_GROUPS: tuple[str, ...] = ()
 
 
+TMPFILES_PATH = "/etc/tmpfiles.d/orchestratia.conf"
+
+
 class ProvisionError(Exception):
     """Refuse to provision. Never partially apply."""
 
@@ -268,7 +271,7 @@ def install_dl_helper(target: str | None = None, python: str | None = None, veri
             head = _json.loads(res.stdout.split(b"\n", 1)[0] or b"{}")
         except ValueError:
             head = {}
-        if head.get("protocol") != PROTOCOL:
+        if head.get("protocol") != PROTOCOL or "ul-write" not in (head.get("ops") or []):
             raise ProvisionError(f"installed download helper does not run: {res.stderr.decode()[:200]}")
     return target
 
@@ -287,10 +290,80 @@ def _install_sudoers(lines: list[str]) -> None:
     os.replace(tmp, final)
 
 
+def install_upload_dirs(daemon_user: str, config_path: str, conf_path: str = TMPFILES_PATH,
+                        root: str | None = None) -> int:
+    """Reserve the shared upload parent for root and give every user that can receive
+    an upload — the daemon user and each project user — its own 0700 folder, now and at
+    every boot (tmpfiles.d). Root only, idempotent.
+
+    This is where a project user's folder is made: the daemon is not root (the
+    restricted tier requires that), so it can only verify those folders. `root`
+    redirects everything into a sandbox for tests (and then skips systemd-tmpfiles)."""
+    import grp
+    import pwd
+    import sys as _sys
+    from orchestratia_agent import upload_dirs
+    if os.geteuid() != 0:
+        raise ProvisionError("provision-tier must be run as root (use sudo)")
+    if not _sys.platform.startswith("linux"):
+        print("  upload folders: this platform's private temp dir is used — nothing to set up")
+        return 0
+    if not isinstance(daemon_user, str) or not USERNAME_RE.match(daemon_user):
+        raise ProvisionError(f"invalid daemon user {daemon_user!r}")
+    from orchestratia_agent.config import load_config
+    try:
+        cfg = load_config(config_path) or {}
+    except FileNotFoundError:
+        cfg = {}
+    projects = (cfg.get("privilege") or {}).get("projects") or {}
+    names = [daemon_user] + [validate_username((spec or {}).get("user")) for spec in projects.values()]
+    entries = []
+    for name in dict.fromkeys(names):
+        try:
+            pw = pwd.getpwnam(name)
+        except KeyError:
+            print(f"  upload folders: no user {name} on this box — skipped")
+            continue
+        try:
+            group = grp.getgrgid(pw.pw_gid).gr_name
+        except KeyError:
+            group = str(pw.pw_gid)
+        entries.append((name, group))
+    try:
+        text = upload_dirs.tmpfiles_conf(entries, root=root)
+    except ValueError as e:
+        raise ProvisionError(str(e)) from e
+    os.makedirs(os.path.dirname(conf_path), mode=0o755, exist_ok=True)
+    tmp = conf_path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, conf_path)
+    if root is None and shutil.which("systemd-tmpfiles"):
+        res = _run(["systemd-tmpfiles", "--create", conf_path], check=False)
+        if res.returncode != 0:
+            print(f"  WARNING: systemd-tmpfiles --create {conf_path} failed: {res.stderr.strip()[:200]}")
+    try:
+        trusted = (pwd.getpwnam(daemon_user).pw_uid,)
+    except KeyError:
+        trusted = ()
+    try:
+        # A base the daemon user made (an older agent, or no systemd) is trusted; any
+        # other owner is refused here rather than worked around: provisioning must not
+        # create a project user's folder somewhere the daemon will never look.
+        base = upload_dirs.ensure_base(root=root, fallback=False, trusted_uids=trusted)
+        for name, _ in entries:
+            upload_dirs.ensure_user_dir(base, name)
+    except upload_dirs.UploadDirError as e:
+        raise ProvisionError(str(e)) from e
+    print(f"  upload folders: {base}/<user> for {', '.join(n for n, _ in entries)}")
+    return 0
+
+
 def refresh_existing(daemon_user: str, config_path: str) -> int:
-    """Re-install the download helper and re-render sudoers for EVERY provisioned
-    project. Idempotent; run by the installer on upgrade so the helper always matches
-    the agent that calls it."""
+    """Re-install the download helper, re-render sudoers and re-create the upload
+    folders for EVERY provisioned project. Idempotent; run by the installer and by
+    `orchestratia update` (as root) so the helper always matches the agent that calls it."""
     if os.geteuid() != 0:
         raise ProvisionError("provision-tier must be run as root (use sudo)")
     if daemon_user == "root":
@@ -303,6 +376,7 @@ def refresh_existing(daemon_user: str, config_path: str) -> int:
         cfg = {}
     priv = cfg.get("privilege") or {}
     projects = priv.get("projects") or {}
+    install_upload_dirs(daemon_user, config_path)
     if not projects:
         print("  no restricted projects on this server — nothing to refresh")
         return 0
@@ -733,6 +807,9 @@ def provision(project_id: str, workspaces: list[str],
     priv.pop("workspaces", None)
     cfg["privilege"] = priv
     save_config(config_path, cfg)
+
+    # 5. Upload folders: the new user's private folder, reserved at boot too.
+    install_upload_dirs(daemon_user, config_path)
 
     print(f"\n  Project:            {project_id}")
     print(f"  Restricted user:    {user}")

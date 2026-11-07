@@ -34,6 +34,27 @@ def test_argv():
        r[:6] == ["sudo", "-n", "-u", "orcp-abc", "-H", dl.HELPER_INSTALL_PATH], r[:6])
 
 
+def test_check_header():
+    ok("protocol-1 header still serves downloads", dl._check_header({"protocol": 1, "ok": True}) is None)
+    ok("protocol-2 header serves downloads", dl._check_header({"protocol": 2, "ops": ["stat"], "ok": True}) is None)
+    ok("protocol-1 header refused for an upload op",
+       dl._check_header({"protocol": 1, "ok": True}, need_op="ul-write") == {"ok": False, "error": "helper_outdated"})
+    ok("protocol 2 without the op refused",
+       dl._check_header({"protocol": 2, "ops": ["stat", "read", "zip"]}, need_op="ul-write")["error"]
+       == "helper_outdated")
+    ok("protocol 2 with the op accepted",
+       dl._check_header({"protocol": 2, "ops": ["ul-write"]}, need_op="ul-write") is None)
+    ok("an old helper's argparse refusal -> helper_outdated",
+       dl._check_header({}, "dl-helper: error: argument op: invalid choice: 'ul-write'", need_op="ul-write")
+       == {"ok": False, "error": "helper_outdated"})
+    ok("sudo refusal -> privilege",
+       dl._check_header({}, "sudo: a password is required", need_op="ul-write")["error"] == "privilege")
+    ok("no header, no clue -> invalid", dl._check_header({})["error"] == "invalid")
+    ok("missing / bogus protocol -> helper_outdated",
+       dl._check_header({"ok": True})["error"] == "helper_outdated"
+       and dl._check_header({"protocol": True})["error"] == "helper_outdated")
+
+
 async def fake_relay(handler, port):
     return await websockets.serve(handler, "127.0.0.1", port, max_size=None, compression=None)
 
@@ -111,6 +132,7 @@ async def test_teardown_does_not_hang():
 
 
 test_argv()
+test_check_header()
 asyncio.run(test_stream())
 asyncio.run(test_teardown_does_not_hang())
 print(f"\n{sum(results)}/{len(results)} passed")

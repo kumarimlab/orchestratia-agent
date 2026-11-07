@@ -19,7 +19,6 @@ import sys
 import websockets
 
 from orchestratia_agent import privilege
-from orchestratia_agent.dl_helper import PROTOCOL
 
 log = logging.getLogger("orchestratia-agent.downloads")
 
@@ -85,11 +84,21 @@ async def _read_header(proc) -> dict:
         return {}
 
 
-def _check_header(header: dict, stderr_text: str = "") -> dict | None:
-    """None if usable, else an error dict."""
+def _check_header(header: dict, stderr_text: str = "", need_op: str | None = None) -> dict | None:
+    """None if usable, else an error dict.
+
+    Downloads work with any helper protocol >= 1, so a restricted host whose installed
+    helper is older than the agent keeps downloading. An upload op (`need_op`) needs
+    protocol >= 2 AND the op listed in the header's `ops`. A pre-upload helper never
+    gets as far as a header for an upload op: argparse refuses the op on stderr."""
     if not header:
+        if need_op and ("invalid choice" in stderr_text or "unrecognized arguments" in stderr_text):
+            return {"ok": False, "error": "helper_outdated"}
         return {"ok": False, "error": "privilege" if "sudo" in stderr_text else "invalid"}
-    if header.get("protocol") != PROTOCOL:
+    proto = header.get("protocol")
+    if not isinstance(proto, int) or isinstance(proto, bool) or proto < 1:
+        return {"ok": False, "error": "helper_outdated"}
+    if need_op is not None and (proto < 2 or need_op not in (header.get("ops") or [])):
         return {"ok": False, "error": "helper_outdated"}
     return None
 

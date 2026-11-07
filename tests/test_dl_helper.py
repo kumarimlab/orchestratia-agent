@@ -61,6 +61,10 @@ with tempfile.TemporaryDirectory() as d:
     open(f, "wb").write(data)
     rc, head, _ = run("stat", "a.bin", d, env={"PYTHONPATH": d})
     ok("PYTHONPATH/cwd can't hijack the helper", rc == 0 and head.get("protocol") == h.PROTOCOL, head)
+    ok("every header lists the ops (protocol 2)", head.get("protocol") == 2
+       and head.get("ops") == ["stat", "read", "zip", "ul-prepare", "ul-write", "ul-cancel", "ul-sweep"], head)
+    p = subprocess.run([sys.executable, "-I", HELPER, "stat", "--cwd", d], capture_output=True, timeout=20, cwd="/")
+    ok("a download op still requires its path", p.returncode == 2 and not p.stdout)
     dash = os.path.join(d, "-rf")
     open(dash, "w").write("x")
     rc, head, _ = run("stat", "-rf", d)

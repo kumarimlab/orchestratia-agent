@@ -613,6 +613,54 @@ def test_upload_dirs_refuse_a_bad_daemon_user():
     raise AssertionError("a daemon user with a newline reached tmpfiles.d")
 
 
+def test_refresh_existing_never_gated_on_upload_folders():
+    """A squatted /tmp/orchestratia-uploads (any local user can `touch` it) must not stop
+    the helper + sudoers refresh: the folder step runs last and only warns."""
+    import tempfile
+    from orchestratia_agent.config import save_config
+    calls = []
+    saved = (pv.os.geteuid, pv.install_upload_dirs, pv.install_dl_helper, pv._install_sudoers)
+    cfg = os.path.join(tempfile.mkdtemp(), "config.yaml")
+    save_config(cfg, {"privilege": {"projects": {"p1": {"user": "orcp-0123456789ab", "workspaces": []}}}})
+
+    def squatted(*a, **k):
+        calls.append("dirs")
+        raise pv.ProvisionError("upload folder /tmp/orchestratia-uploads is not safe to use")
+    try:
+        pv.os.geteuid = lambda: 0
+        pv.install_upload_dirs = squatted
+        pv.install_dl_helper = lambda *a, **k: calls.append("helper") or "/x/dl-helper"
+        pv._install_sudoers = lambda lines: calls.append("sudoers")
+        rc = pv.refresh_existing("ubuntu", cfg)
+    finally:
+        pv.os.geteuid, pv.install_upload_dirs, pv.install_dl_helper, pv._install_sudoers = saved
+    assert rc == 0 and calls == ["helper", "sudoers", "dirs"], (rc, calls)
+
+
+def test_upload_dirs_tighten_old_world_readable_uploads():
+    """Pre-0.33 legacy uploads sit 0644 directly in the old parent: make them owner-only,
+    never following a symlink planted there."""
+    if os.geteuid() != 0:
+        print("SKIP  test_upload_dirs_tighten_old_world_readable_uploads (needs root)")
+        return
+    import pwd
+    import tempfile
+    sandbox = tempfile.mkdtemp()
+    base = os.path.join(sandbox, "orchestratia-uploads")
+    os.mkdir(base, 0o755)
+    old = os.path.join(base, "dev-key")
+    open(old, "w").write("secret")
+    os.chmod(old, 0o644)
+    target = os.path.join(sandbox, "victim")
+    open(target, "w").write("x")
+    os.chmod(target, 0o644)
+    os.symlink(target, os.path.join(base, "link"))
+    pv.install_upload_dirs(pwd.getpwuid(0).pw_name, os.path.join(sandbox, "none.yaml"),
+                           conf_path=os.path.join(sandbox, "t.conf"), root=sandbox)
+    assert os.stat(old).st_mode & 0o777 == 0o600, oct(os.stat(old).st_mode)
+    assert os.stat(target).st_mode & 0o777 == 0o644, "followed a symlink"
+
+
 def test_upload_dirs_create_every_users_folder_and_the_tmpfiles_conf():
     """Root (provisioning) is the only party that can make a project user's folder:
     the daemon runs as an ordinary user. Sandboxed via root= so nothing touches /tmp."""

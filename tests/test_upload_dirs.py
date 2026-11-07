@@ -136,8 +136,9 @@ conf = ud.tmpfiles_conf([("ubuntu", "ubuntu"), ("orcp-0123456789ab", "orcp-01234
 lines = [ln for ln in conf.splitlines() if ln and not ln.startswith("#")]
 ok("tmpfiles: both parents root 0755", "d /tmp/orchestratia-uploads 0755 root root -" in lines
    and "d /var/tmp/orchestratia-uploads 0755 root root -" in lines, lines)
-ok("tmpfiles: a private folder per user", "d /tmp/orchestratia-uploads/ubuntu 0700 ubuntu ubuntu -" in lines
-   and "d /tmp/orchestratia-uploads/orcp-0123456789ab 0700 orcp-0123456789ab orcp-0123456789ab -" in lines, lines)
+ok("tmpfiles: a private folder per user, age-cleaned after 10 days (its own line would otherwise exempt it)",
+   "d /tmp/orchestratia-uploads/ubuntu 0700 ubuntu ubuntu 10d" in lines
+   and "d /tmp/orchestratia-uploads/orcp-0123456789ab 0700 orcp-0123456789ab orcp-0123456789ab 10d" in lines, lines)
 ok("tmpfiles: bare call is the parents only", len([ln for ln in ud.tmpfiles_conf().splitlines()
                                                    if ln.startswith("d ")]) == 2)
 for bad in (("a\nd /etc 0777 root root -", "x"), ("ubuntu", "g p"), ("../x", "x")):

@@ -277,7 +277,29 @@ async def test_link(relay):
     ok("sweep_all leaves recent files and published uploads alone", "three.bin" in published())
 
 
+def test_frames():
+    F = "/tmp/orchestratia-uploads/u"
+    h = "ab" * 32
+    ok("ack rebuilt from its own keys only", ul._clean_frame(
+        {"type": "ack", "offset": 5, "index": 0, "sha256": h, "extra": "x" * 10}, F)
+        == {"type": "ack", "offset": 5, "index": 0, "sha256": h})
+    ok("done inside the folder passes", ul._clean_frame(
+        {"type": "done", "path": F + "/a b.bin", "sha256": h, "chunks_digest": h, "junk": 1}, F)
+        == {"type": "done", "path": F + "/a b.bin", "sha256": h, "chunks_digest": h})
+    for bad in ("/home/ubuntu/.ssh/id_ed25519", F + "/../x", F + "/sub/x", F + "/.orchestratia-x.part", F):
+        got = ul._clean_frame({"type": "done", "path": bad, "sha256": h, "chunks_digest": h}, F)
+        ok(f"done naming {bad!r} -> tampered", got.get("type") == "error" and got.get("code") == "tampered", got)
+    got = ul._clean_frame({"type": "error", "code": "weird", "message": "m" * 5000, "offset": 3}, F)
+    ok("error: unknown code -> internal, message capped", got["code"] == "internal" and len(got["message"]) <= 200
+       and got["offset"] == 3, got)
+    ok("relay URL: wss only (or ws to loopback for tests)",
+       ul._relay_url_ok("wss://staging.orchestratia.com") and ul._relay_url_ok("ws://127.0.0.1:9")
+       and not ul._relay_url_ok("ws://evil.example") and not ul._relay_url_ok("http://x")
+       and not ul._relay_url_ok(""))
+
+
 async def main():
+    test_frames()
     relay = Relay()
     srv = await websockets.serve(relay.handler, "127.0.0.1", PORT, max_size=None, compression=None)
     try:

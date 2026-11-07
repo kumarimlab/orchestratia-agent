@@ -818,7 +818,14 @@ class _Upload:
             try:
                 os.link(self.part, cand, src_dir_fd=self.dfd, dst_dir_fd=self.dfd, follow_symlinks=False)
             except FileExistsError:
-                continue
+                try:
+                    there = os.stat(cand, dir_fd=self.dfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    there = None
+                if there is None or (there.st_dev, there.st_ino) != (pst.st_dev, pst.st_ino):
+                    continue
+                # Our own earlier link (power lost before the done record reached the disk):
+                # it IS this upload — report it, never publish a second copy.
             got = os.stat(cand, dir_fd=self.dfd, follow_symlinks=False)
             if (got.st_dev, got.st_ino) != (pst.st_dev, pst.st_ino):
                 _unlink(self.dfd, cand)              # the part's name was swapped under us

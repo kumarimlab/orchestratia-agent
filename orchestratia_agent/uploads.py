@@ -18,11 +18,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import sys
+from urllib.parse import urlsplit
 
 import websockets
 
 from orchestratia_agent import privilege, upload_dirs
+from orchestratia_agent.dl_helper import valid_name
 from orchestratia_agent.downloads import HELPER_INSTALL_PATH, HELPER_SOURCE, _check_header, _run_as, _stop
 
 log = logging.getLogger("orchestratia-agent.uploads")
@@ -40,6 +44,45 @@ TERMINAL = ("tampered", "name_exhausted", "io")
 LINK_ERRORS = frozenset({"checksum_mismatch", "no_space", "helper_outdated", "tampered", "offset_mismatch",
                          "busy", "io", "internal", "unsafe_destination", "permission_denied", "privilege",
                          "invalid_name", "name_exhausted", "invalid", "protocol"})
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def _int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _clean_frame(f: dict, folder: str) -> dict:
+    """A helper line rebuilt from its own allow-listed keys before it reaches the relay.
+    The helper runs AS the session user, who could ptrace it: never forward a `done`
+    whose path isn't a plain file name directly in this upload's folder."""
+    kind = f.get("type")
+    if kind == "ack":
+        return {"type": "ack", "offset": f.get("offset"), "index": f.get("index"), "sha256": f.get("sha256")}
+    if kind == "done":
+        path, sha, cdig = f.get("path"), f.get("sha256"), f.get("chunks_digest")
+        name = os.path.basename(path) if isinstance(path, str) else ""
+        if (isinstance(path, str) and valid_name(name) and not name.startswith(".orchestratia-")
+                and path == os.path.join(folder, name)
+                and isinstance(sha, str) and _HEX64.match(sha) and isinstance(cdig, str) and _HEX64.match(cdig)):
+            return {"type": "done", "path": path, "sha256": sha, "chunks_digest": cdig}
+        return {"type": "error", "code": "tampered", "message": "the upload helper reported an unexpected file"}
+    code = f.get("code") if f.get("code") in LINK_ERRORS else "internal"
+    out = {"type": "error", "code": code, "message": str(f.get("message") or code)[:200]}
+    if _int(f.get("offset")):
+        out["offset"] = f["offset"]
+    return out
+
+
+def _relay_url_ok(url: str) -> bool:
+    """The API key goes in the first frame: only over TLS (plain ws only to loopback, for tests)."""
+    try:
+        u = urlsplit(url or "")
+    except ValueError:
+        return False
+    return bool(u.hostname) and (u.scheme == "wss" or (u.scheme == "ws" and u.hostname in _LOOPBACK))
+
 
 # upload_id -> the ul-write helper of its live link (one per upload).
 live_links: dict[str, asyncio.subprocess.Process] = {}
@@ -187,7 +230,7 @@ async def _relay_to_helper(ws, proc, send) -> None:
         return
 
 
-async def _helper_to_relay(proc, send) -> None:
+async def _helper_to_relay(proc, send, folder: str) -> None:
     """Helper lines (ack / error / done) -> relay. A helper that stops without a
     terminal line is reported as error{internal}."""
     terminal = False
@@ -205,11 +248,8 @@ async def _helper_to_relay(proc, send) -> None:
                 continue
             if not isinstance(f, dict) or f.get("type") not in ("ack", "error", "done"):
                 continue
+            f = _clean_frame(f, folder)
             terminal = f["type"] == "done" or (f["type"] == "error" and f.get("code") in TERMINAL)
-            if f["type"] == "error":
-                if f.get("code") not in LINK_ERRORS:
-                    f["code"] = "internal"
-                f.setdefault("message", f.get("code"))
             await send(f)
     except websockets.exceptions.ConnectionClosed:
         return                                           # the relay left; the helper is killed by the caller
@@ -228,6 +268,9 @@ async def open_upload(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
     """Dial the relay for ONE upload and bridge it to a ul-write helper until either
     side ends. Never raises."""
     uid = str(msg.get("upload_id") or "")
+    if not _relay_url_ok(msg.get("relay_url") or ""):
+        log.warning("upload %s: refusing relay URL %r (wss only)", uid[:8], str(msg.get("relay_url"))[:80])
+        return
     target = f"{(msg.get('relay_url') or '').rstrip('/')}/ws/relay-ul"
     proc = None
     tasks: list[asyncio.Task] = []
@@ -285,7 +328,7 @@ async def open_upload(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
                 ready["reset"] = True
             await send(ready)                    # the relay now holds WINDOW credit implicitly
             tasks = [asyncio.create_task(_relay_to_helper(ws, proc, send)),
-                     asyncio.create_task(_helper_to_relay(proc, send))]
+                     asyncio.create_task(_helper_to_relay(proc, send, folder))]
             # Either side ending ends the link. If the relay left first, the helper is
             # killed below: whatever it had not journalled is rolled back on the next open.
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

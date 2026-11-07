@@ -356,6 +356,20 @@ ok("final journal, no done record: ready says finalizing", w.first["finalizing"]
 ok("…then it finalizes and publishes", d["type"] == "done" and d["sha256"] == sha(data)
    and published(base) == ["f.bin"], d)
 
+# power loss after link() but before the done record reached the disk: the name already
+# IS our part — report it, never publish "f (1).bin"
+base = new_base()
+part, jrnl, done = (os.path.join(base, f".orchestratia-{U}.{x}") for x in ("part", "journal", "done"))
+open(part, "wb").write(data)
+json.dump({"upload_id": U, "size": len(data), "chunk_size": CS, "offset": len(data),
+           "digests": digests, "final": True}, open(jrnl, "w"))
+os.link(part, os.path.join(base, "f.bin"))
+w = Writer(base, req(U, "f.bin", len(data)))
+d = w.line()
+w.close()
+ok("a candidate that already is our part's inode counts as published (no duplicate after power loss)",
+   d["type"] == "done" and d["path"].endswith("/f.bin") and published(base) == ["f.bin"], (d, files(base)))
+
 # .done present, link not made yet
 base = new_base()
 part, jrnl, done = (os.path.join(base, f".orchestratia-{U}.{x}") for x in ("part", "journal", "done"))

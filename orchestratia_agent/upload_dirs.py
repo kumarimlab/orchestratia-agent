@@ -196,6 +196,9 @@ def folder_for(run_as: str | None) -> str:
     return ensure_user_dir(ensure_base(), run_as or own_user())
 
 
+UPLOAD_MAX_AGE = "10d"
+
+
 def tmpfiles_conf(users=(), root: str | None = None) -> str:
     """Content of /etc/tmpfiles.d/orchestratia.conf: the shared parents for root (both
     /tmp and /var/tmp, whichever the box uses), plus one private folder per (user,
@@ -211,5 +214,8 @@ def tmpfiles_conf(users=(), root: str | None = None) -> str:
     for user, group in users:
         if not _TMPFILES_NAME_RE.match(str(user)) or not _TMPFILES_NAME_RE.match(str(group)):
             raise ValueError(f"unsafe name for tmpfiles.d: {user!r}:{group!r}")
-        lines.append(f"d {base}/{user} 0700 {user} {group} -")
+        # 10d: a path with its own line is exempt from the temp dir's age cleanup, so the
+        # age must be stated here or uploads in /var/tmp would never be cleaned up.
+        # systemd-tmpfiles skips flock()ed files, so a live part is never aged out.
+        lines.append(f"d {base}/{user} 0700 {user} {group} {UPLOAD_MAX_AGE}")
     return "\n".join(lines) + "\n"

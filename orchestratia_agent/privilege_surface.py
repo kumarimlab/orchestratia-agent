@@ -47,9 +47,10 @@ PRIVILEGE_CLASSIFICATION = {
     "download_open": TIER_BOUNDED,
 
     # Uploads (relay-streamed). Every write runs dl_helper AS THE SESSION'S USER, in
-    # that user's own 0700 upload folder, never in the daemon process; the tier is
-    # resolved from this host's config, not the message, and the file name travels on
-    # the helper's stdin, never argv. Cancel removes only that upload's own files.
+    # that user's own 0700 upload folder, never in the daemon process; the OS user comes
+    # from this host's config (privilege.resolve_user maps the message's tier + project to
+    # it, so a hub can never name an arbitrary user), and the file name travels on the
+    # helper's stdin, never argv. Cancel removes only that upload's own files.
     "upload_prepare": TIER_BOUNDED,
     "upload_open": TIER_BOUNDED,
     "upload_cancel": TIER_BOUNDED,

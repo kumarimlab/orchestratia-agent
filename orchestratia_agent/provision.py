@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 
 # Deliberately strict: this feeds a sudoers file. Anything outside this charset
@@ -356,8 +357,44 @@ def install_upload_dirs(daemon_user: str, config_path: str, conf_path: str = TMP
             upload_dirs.ensure_user_dir(base, name)
     except upload_dirs.UploadDirError as e:
         raise ProvisionError(str(e)) from e
+    _tighten_loose_uploads(base)
     print(f"  upload folders: {base}/<user> for {', '.join(n for n, _ in entries)}")
     return 0
+
+
+def _tighten_loose_uploads(base: str) -> None:
+    """Agents before 0.33 wrote legacy uploads 0644 straight into the shared parent,
+    readable by every local user. Make each regular file there owner-only (opened with
+    O_NOFOLLOW through the folder fd: a planted symlink is never followed)."""
+    try:
+        dfd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        for name in os.listdir(dfd):
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except OSError:
+                continue                                 # a symlink, a socket, gone meanwhile
+            try:
+                s = os.fstat(fd)
+                if stat.S_ISREG(s.st_mode) and s.st_mode & 0o077:
+                    os.fchmod(fd, s.st_mode & 0o700)
+            finally:
+                os.close(fd)
+    finally:
+        os.close(dfd)
+
+
+def _upload_dirs_nonfatal(daemon_user: str, config_path: str) -> None:
+    """The upload-folder step must never block the helper / sudoers refresh: any local
+    user can squat /tmp/orchestratia-uploads (e.g. `touch` it) before tmpfiles runs."""
+    try:
+        install_upload_dirs(daemon_user, config_path)
+    except ProvisionError as e:
+        print(f"  WARNING: upload folders not set up: {e}\n"
+              f"  (uploads into this server will be refused until it is fixed; then run: "
+              f"sudo orchestratia-agent provision-tier --upload-dirs --daemon-user {daemon_user})")
 
 
 def refresh_existing(daemon_user: str, config_path: str) -> int:
@@ -376,9 +413,9 @@ def refresh_existing(daemon_user: str, config_path: str) -> int:
         cfg = {}
     priv = cfg.get("privilege") or {}
     projects = priv.get("projects") or {}
-    install_upload_dirs(daemon_user, config_path)
     if not projects:
         print("  no restricted projects on this server — nothing to refresh")
+        _upload_dirs_nonfatal(daemon_user, config_path)
         return 0
     tmux_path = priv.get("tmux_path") or shutil.which("tmux")
     git_path = priv.get("git_path") or shutil.which("git")
@@ -386,6 +423,7 @@ def refresh_existing(daemon_user: str, config_path: str) -> int:
     _install_sudoers(sudoers_lines(daemon_user, projects, tmux_path, git_path,
                                    code_server_path=priv.get("code_server_path"), dl_helper_path=helper))
     print(f"  refreshed the download helper and sudoers for {len(projects)} project(s)")
+    _upload_dirs_nonfatal(daemon_user, config_path)          # last, and never fatal
     return 0
 
 
@@ -808,8 +846,9 @@ def provision(project_id: str, workspaces: list[str],
     cfg["privilege"] = priv
     save_config(config_path, cfg)
 
-    # 5. Upload folders: the new user's private folder, reserved at boot too.
-    install_upload_dirs(daemon_user, config_path)
+    # 5. Upload folders: the new user's private folder, reserved at boot too. Never
+    # fatal: the provision above is already applied (no half-applied provision).
+    _upload_dirs_nonfatal(daemon_user, config_path)
 
     print(f"\n  Project:            {project_id}")
     print(f"  Restricted user:    {user}")

@@ -1048,6 +1048,101 @@ def cmd_grants(args):
 # ── Update Command ───────────────────────────────────────────────
 
 
+AGENT_UNIT = "/etc/systemd/system/orchestratia-agent.service"
+TIER_CONFIGS = ("/etc/orchestratia/config.yaml", "~/.config/orchestratia/config.yaml")
+UPLOAD_TMPFILES = "/etc/tmpfiles.d/orchestratia.conf"
+
+
+def _restricted_config(paths=TIER_CONFIGS) -> str | None:
+    """The config that provisions restricted projects (orcp-* users), if any."""
+    for p in paths:
+        p = os.path.expanduser(p)
+        try:
+            with open(p) as fh:
+                if "orcp-" in fh.read():
+                    return p
+        except OSError:
+            continue
+    return None
+
+
+def _service_user(unit_path: str = AGENT_UNIT) -> str | None:
+    """The user the daemon runs as: the unit's User= (the installer writes it), else
+    $SUDO_USER. Never guessed from whoever happens to run `orchestratia update`."""
+    try:
+        with open(unit_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("User=") and line[5:].strip():
+                    return line[5:].strip()
+    except OSError:
+        pass
+    return os.environ.get("SUDO_USER") or None
+
+
+def _agent_bin() -> str:
+    """The daemon entry point of the package just installed (this venv)."""
+    import shutil
+    here = os.path.join(os.path.dirname(sys.executable), "orchestratia-agent")
+    return here if os.path.exists(here) else (shutil.which("orchestratia-agent") or "orchestratia-agent")
+
+
+def tier_refresh_plan(euid: int, restricted_cfg: str | None, daemon_user: str | None, agent_bin: str,
+                      tmpfiles_present: bool) -> tuple[str, list[str]]:
+    """What `orchestratia update` does once the new package is in place.
+
+    ("run", argv)  as root: refresh with the NEW code — a subprocess, never this process,
+                   which still has the old modules loaded
+    ("hint", argv) not root (or the daemon user is unknown): print exactly this command
+    ("skip", [])   nothing to do
+    Restricted projects -> --refresh-existing (helper + sudoers + upload folders);
+    otherwise --upload-dirs, only while the tmpfiles.d reservation is missing."""
+    if restricted_cfg:
+        argv = [agent_bin, "provision-tier", "--refresh-existing", "--config", restricted_cfg]
+    elif not tmpfiles_present:
+        argv = [agent_bin, "provision-tier", "--upload-dirs", "--config", TIER_CONFIGS[0]]
+    else:
+        return "skip", []
+    if euid == 0 and daemon_user:
+        return "run", argv + ["--daemon-user", daemon_user]
+    return "hint", ["sudo"] + argv + ["--daemon-user", daemon_user or "<daemon-user>"]
+
+
+def _after_update_refresh(results: dict | None = None, euid: int | None = None,
+                          config_paths=TIER_CONFIGS, unit_path: str = AGENT_UNIT,
+                          tmpfiles_path: str = UPLOAD_TMPFILES) -> str:
+    """Keep the restricted helper, sudoers and upload folders in step with the agent
+    that was just installed. Returns the plan kind (for tests)."""
+    import shlex
+    import subprocess
+    if not sys.platform.startswith("linux"):
+        return "skip"
+    kind, argv = tier_refresh_plan(os.geteuid() if euid is None else euid, _restricted_config(config_paths),
+                                   _service_user(unit_path), _agent_bin(), os.path.exists(tmpfiles_path))
+    if kind == "skip":
+        return kind
+    cmd = " ".join(shlex.quote(a) for a in argv)
+    if kind == "hint":
+        if results is not None:
+            results["steps"].append({"restricted_tier": "manual", "command": cmd})
+        else:
+            print(f"  {YELLOW}Restricted tier / upload folders:{RESET} also run as root: {cmd}")
+        return kind
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+        good, detail = res.returncode == 0, (res.stderr or res.stdout or "").strip()[-300:]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        good, detail = False, str(e)
+    if results is not None:
+        results["steps"].append({"restricted_tier": "refreshed" if good else "failed", "command": cmd,
+                                 **({} if good else {"error": detail})})
+    elif good:
+        print(f"  {GREEN}tier:{RESET} download/upload helper, sudoers and upload folders refreshed")
+    else:
+        print(f"  {RED}tier:{RESET} refresh failed ({detail}) — run: {cmd}")
+    return kind
+
+
 def cmd_agent_update(args):
     """Update the agent: pull latest code, reinstall package.
 
@@ -1193,6 +1288,9 @@ def cmd_agent_update(args):
 
     # Skill file updates automatically via symlink — no action needed
 
+    if pip_ok:
+        _after_update_refresh(results if JSON_MODE else None)
+
     if JSON_MODE:
         _json_output(results)
     else:
@@ -1201,14 +1299,6 @@ def cmd_agent_update(args):
             print(f"  {DIM}Restart the daemon to apply: launchctl kickstart -k gui/$(id -u)/com.orchestratia.agent{RESET}")
         else:
             print(f"  {DIM}Restart the daemon to apply: sudo systemctl restart orchestratia-agent{RESET}")
-            for _cfg in ("/etc/orchestratia/config.yaml", os.path.expanduser("~/.config/orchestratia/config.yaml")):
-                try:
-                    if "orcp-" in open(_cfg).read():
-                        print(f"  {DIM}Restricted tier on this server — also run: "
-                              f"sudo orchestratia-agent provision-tier --refresh-existing{RESET}")
-                        break
-                except OSError:
-                    continue
 
 
 def _agent_update_pip():
@@ -1283,6 +1373,9 @@ def _agent_update_pip():
             results["steps"].append({"pip": "failed", "error": msg})
         else:
             print(f"  {RED}pip:{RESET} {msg}")
+
+    _after_update_refresh(results if JSON_MODE else None)
+
 
     if JSON_MODE:
         _json_output(results)

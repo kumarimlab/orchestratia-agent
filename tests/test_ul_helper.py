@@ -131,6 +131,13 @@ ok("plain extension", list(h.candidate_names("report.pdf", 1)) == ["report.pdf",
 ok("dotfile has no extension", list(h.candidate_names(".bashrc", 1)) == [".bashrc", ".bashrc (1)"])
 ok("no extension", list(h.candidate_names("Makefile", 1)) == ["Makefile", "Makefile (1)"])
 ok("inner dots stay in the stem", list(h.candidate_names("v1.2.zip", 1))[1] == "v1.2 (1).zip")
+long_name = "é" * 97 + "xy.pdf"                      # 200 bytes, multi-byte stem
+assert len(long_name.encode()) == 200
+cands = list(h.candidate_names(long_name, 12))
+ok("a 200-byte name's clash copies stay <= 200 bytes, valid, keep the extension, distinct",
+   all(h.valid_name(c) and c.endswith(".pdf") for c in cands) and len(set(cands)) == len(cands)
+   and cands[1].endswith(" (1).pdf") and cands[12].endswith(" (12).pdf"),
+   [len(c.encode()) for c in cands[:3]])
 for bad in ("", ".", "..", "a/b", "a\x00b", ".orchestratia-x", "a‮b.txt", "a​b", "x" * 201,
             "é" * 101, "\ud800", " lead.txt", "trail.txt ", "tab\t"):
     ok(f"name refused: {bad[:12]!r}", not h.valid_name(bad))

@@ -357,15 +357,17 @@ def install_upload_dirs(daemon_user: str, config_path: str, conf_path: str = TMP
             upload_dirs.ensure_user_dir(base, name)
     except upload_dirs.UploadDirError as e:
         raise ProvisionError(str(e)) from e
-    _tighten_loose_uploads(base)
+    _tighten_loose_uploads(base, trusted)
     print(f"  upload folders: {base}/<user> for {', '.join(n for n, _ in entries)}")
     return 0
 
 
-def _tighten_loose_uploads(base: str) -> None:
+def _tighten_loose_uploads(base: str, owners: tuple = ()) -> None:
     """Agents before 0.33 wrote legacy uploads 0644 straight into the shared parent,
     readable by every local user. Make each regular file there owner-only (opened with
-    O_NOFOLLOW through the folder fd: a planted symlink is never followed)."""
+    O_NOFOLLOW through the folder fd: a planted symlink is never followed). Only files the
+    daemon user owns with a single link: root must never chmod a hard link to somebody
+    else's file (boxes with fs.protected_hardlinks=0 let users make those)."""
     try:
         dfd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
@@ -378,7 +380,8 @@ def _tighten_loose_uploads(base: str) -> None:
                 continue                                 # a symlink, a socket, gone meanwhile
             try:
                 s = os.fstat(fd)
-                if stat.S_ISREG(s.st_mode) and s.st_mode & 0o077:
+                if (stat.S_ISREG(s.st_mode) and s.st_mode & 0o077 and s.st_nlink == 1
+                        and s.st_uid in owners):
                     os.fchmod(fd, s.st_mode & 0o700)
             finally:
                 os.close(fd)

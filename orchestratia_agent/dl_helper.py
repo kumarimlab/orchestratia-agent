@@ -338,7 +338,13 @@ def candidate_names(name, limit=MAX_COPIES):
     yield name
     stem, ext = split_ext(name)
     for i in range(1, limit + 1):
-        yield f"{stem} ({i}){ext}"
+        suffix = f" ({i}){ext}"
+        # Keep every copy within NAME_MAX_BYTES (the hub trims names to exactly that): trim
+        # the stem on a UTF-8 boundary, never the suffix or the extension.
+        budget = NAME_MAX_BYTES - len(suffix.encode("utf-8"))
+        short = stem.encode("utf-8")[:max(0, budget)].decode("utf-8", "ignore").rstrip()
+        if short:
+            yield short + suffix
 
 
 def chunks_digest(digests):

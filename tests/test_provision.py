@@ -659,6 +659,14 @@ def test_upload_dirs_tighten_old_world_readable_uploads():
                            conf_path=os.path.join(sandbox, "t.conf"), root=sandbox)
     assert os.stat(old).st_mode & 0o777 == 0o600, oct(os.stat(old).st_mode)
     assert os.stat(target).st_mode & 0o777 == 0o644, "followed a symlink"
+    # a hard link to someone else's file (fs.protected_hardlinks=0) is never chmodded by root
+    victim2 = os.path.join(sandbox, "victim2")
+    open(victim2, "w").write("x")
+    os.chmod(victim2, 0o644)
+    os.link(victim2, os.path.join(base, "hardlink"))
+    pv.install_upload_dirs(pwd.getpwuid(0).pw_name, os.path.join(sandbox, "none.yaml"),
+                           conf_path=os.path.join(sandbox, "t.conf"), root=sandbox)
+    assert os.stat(victim2).st_mode & 0o777 == 0o644, "chmodded through a hard link"
 
 
 def test_upload_dirs_create_every_users_folder_and_the_tmpfiles_conf():

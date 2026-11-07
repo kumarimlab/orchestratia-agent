@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
 import platform
+import re
 import ssl
 import subprocess
 import sys
@@ -20,7 +22,7 @@ import websockets
 from orchestratia_agent.config import persist_api_key
 from orchestratia_agent.session import ManagedSession, get_session_backend
 from orchestratia_agent.session_base import SessionBackend
-from orchestratia_agent import privilege, session_env
+from orchestratia_agent import privilege, session_env, upload_dirs
 from orchestratia_agent.system import get_repos_info, get_system_info
 
 if TYPE_CHECKING:
@@ -325,65 +327,150 @@ async def heartbeat_loop(client: httpx.AsyncClient, state: DaemonState):
 
 
 def _upload_dest_dir() -> "Path":
-    """Return the per-OS directory for browser-initiated uploads.
+    """Windows only: %USERPROFILE%\\Orchestratia\\uploads for legacy direct uploads.
 
-    - Linux:   /tmp/orchestratia-uploads
-    - macOS:   /var/folders/.../orchestratia-uploads (tempfile.gettempdir())
-    - Windows: %USERPROFILE%\\Orchestratia\\uploads
-
-    On Windows we deliberately avoid %TEMP% because it lives under
-    AppData\\Local\\Temp (hidden by default in File Explorer, 8.3
-    short-names like ABHISH~1) which looks unfamiliar even though it's
-    the standard temp dir. %USERPROFILE%\\Orchestratia\\uploads is
-    visible in Explorer, has no short-names, and matches the "product
-    files in user profile" pattern used by apps like Discord/Slack.
+    We deliberately avoid %TEMP% because it lives under AppData\\Local\\Temp (hidden
+    by default in File Explorer, 8.3 short-names like ABHISH~1). Linux and macOS use
+    the daemon user's private upload folder from upload_dirs instead.
     """
-    import sys
     import tempfile
     from pathlib import Path
 
-    if sys.platform == "win32":
-        user_profile = os.environ.get("USERPROFILE")
-        if user_profile:
-            return Path(user_profile) / "Orchestratia" / "uploads"
-        # Fallback if USERPROFILE isn't set (very unusual)
-        return Path(tempfile.gettempdir()) / "orchestratia-uploads"
-
+    user_profile = os.environ.get("USERPROFILE")
+    if user_profile:
+        return Path(user_profile) / "Orchestratia" / "uploads"
     return Path(tempfile.gettempdir()) / "orchestratia-uploads"
+
+
+def _legacy_part_name(upload_id: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_-]", "", upload_id)[:64] or uuid.uuid4().hex
+    return f".orchestratia-legacy-{safe}.part"
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def _unlink_at(dfd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dfd)          # removes a symlink itself, never its target
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        pass
 
 
 async def _process_pending_upload(
     client: httpx.AsyncClient, state: DaemonState, item: dict
 ) -> None:
-    """Download one queued upload to local disk and ack back to the hub."""
-    import hashlib
-    from pathlib import Path
+    """Fetch one queued legacy (<= 10 MB) upload into the daemon user's private upload
+    folder and ack back to the hub.
 
-    upload_id = item.get("upload_id")
-    filename = item.get("filename") or "file"
+    The folder comes from upload_dirs (owned by the daemon user, 0700, under a parent
+    only root or the daemon can write) and is re-checked on its opened fd. The part is
+    created O_EXCL|O_NOFOLLOW 0600 relative to that fd, and publish is a no-clobber
+    link(): a planted symlink is never followed and no existing file is replaced.
+    """
+    from orchestratia_agent.dl_helper import candidate_names, valid_name
+
+    upload_id = str(item.get("upload_id") or "")
     download_url = item.get("download_url") or ""
     expected_sha = item.get("sha256")
-
     if not upload_id or not download_url:
         return
+    # Never trust the hub's path hint; only the base name is ever used.
+    name = os.path.basename((item.get("filename") or "file").replace("\\", "/"))
+    if not valid_name(name):
+        await _ack_upload(client, state, upload_id, success=False, error="invalid file name")
+        return
+    url = f"{state.hub_url}{download_url}" if download_url.startswith("/") else download_url
+    if sys.platform == "win32":
+        await _process_pending_upload_windows(client, state, upload_id, name, url, expected_sha)
+        return
 
-    # Always compute dest locally — never trust hub's hint (hub sends a
-    # /tmp/... path that doesn't exist on Windows).
-    dest = _upload_dest_dir() / filename
     try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        folder = upload_dirs.folder_for(None)
+    except upload_dirs.UploadDirError as e:
+        await _ack_upload(client, state, upload_id, success=False, error=f"upload folder unavailable: {e}")
+        return
+    try:
+        dfd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    except OSError as e:
+        await _ack_upload(client, state, upload_id, success=False,
+                          error=f"upload folder {folder} is not safe: {e.strerror}")
+        return
+    part = _legacy_part_name(upload_id)
+    pfd = None
+    try:
+        s = os.fstat(dfd)
+        if s.st_uid != os.geteuid() or s.st_mode & 0o022:
+            await _ack_upload(client, state, upload_id, success=False,
+                              error=f"upload folder {folder} is not safe (owner uid {s.st_uid}, "
+                                    f"mode {oct(s.st_mode & 0o777)})")
+            return
+        _unlink_at(dfd, part)                # our own leftover from a crash, or a planted name
+        pfd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        sha = hashlib.sha256()
+        size = 0
+        async with client.stream("GET", url, headers={"X-API-Key": state.api_key}) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(64 * 1024):
+                _write_all(pfd, chunk)
+                sha.update(chunk)
+                size += len(chunk)
+        os.fsync(pfd)
+        if expected_sha and sha.hexdigest() != expected_sha:
+            await _ack_upload(client, state, upload_id, success=False, error="sha256 mismatch")
+            return
+        pst = os.fstat(pfd)
+        published = None
+        for cand in candidate_names(name):
+            try:
+                os.link(part, cand, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            got = os.stat(cand, dir_fd=dfd, follow_symlinks=False)
+            if (got.st_dev, got.st_ino) != (pst.st_dev, pst.st_ino):
+                _unlink_at(dfd, cand)
+                await _ack_upload(client, state, upload_id, success=False,
+                                  error="upload folder changed during delivery")
+                return
+            published = cand
+            break
+        if published is None:
+            await _ack_upload(client, state, upload_id, success=False, error="no free file name left")
+            return
+        dest = os.path.join(folder, published)
+        log.info(f"Direct upload delivered: {published} ({size} B) → {dest}")
+        await _ack_upload(client, state, upload_id, success=True, path=dest)
+    except httpx.HTTPError as e:
+        await _ack_upload(client, state, upload_id, success=False, error=f"download failed: {e}")
+    except OSError as e:
+        await _ack_upload(client, state, upload_id, success=False, error=f"write failed: {e}")
+    finally:
+        if pfd is not None:
+            os.close(pfd)
+        _unlink_at(dfd, part)                # after publish the file lives on under its name
+        os.close(dfd)
+
+
+async def _process_pending_upload_windows(client, state, upload_id: str, name: str, url: str,
+                                          expected_sha: str | None) -> None:
+    """Windows: the profile folder (not world-writable like /tmp); rename() there refuses
+    to replace an existing file, which makes the publish no-clobber."""
+    from orchestratia_agent.dl_helper import candidate_names
+
+    dest_dir = _upload_dest_dir()
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         await _ack_upload(client, state, upload_id, success=False, error=f"mkdir failed: {e}")
         return
-
-    url = download_url
-    if url.startswith("/"):
-        url = f"{state.hub_url}{url}"
-
+    tmp_path = dest_dir / _legacy_part_name(upload_id)
     try:
         sha = hashlib.sha256()
         size = 0
-        tmp_path = dest.with_suffix(dest.suffix + ".part")
         async with client.stream("GET", url, headers={"X-API-Key": state.api_key}) as resp:
             resp.raise_for_status()
             with open(tmp_path, "wb") as f:
@@ -391,20 +478,28 @@ async def _process_pending_upload(
                     f.write(chunk)
                     sha.update(chunk)
                     size += len(chunk)
-
         if expected_sha and sha.hexdigest() != expected_sha:
-            tmp_path.unlink(missing_ok=True)
             await _ack_upload(client, state, upload_id, success=False, error="sha256 mismatch")
             return
-
-        tmp_path.replace(dest)
-        log.info(f"Direct upload delivered: {filename} ({size} B) → {dest}")
-        await _ack_upload(client, state, upload_id, success=True, path=str(dest))
-
+        for cand in candidate_names(name):
+            try:
+                os.rename(tmp_path, dest_dir / cand)
+            except FileExistsError:
+                continue
+            dest = dest_dir / cand
+            log.info(f"Direct upload delivered: {cand} ({size} B) → {dest}")
+            await _ack_upload(client, state, upload_id, success=True, path=str(dest))
+            return
+        await _ack_upload(client, state, upload_id, success=False, error="no free file name left")
     except httpx.HTTPError as e:
         await _ack_upload(client, state, upload_id, success=False, error=f"download failed: {e}")
     except OSError as e:
         await _ack_upload(client, state, upload_id, success=False, error=f"write failed: {e}")
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
 
 async def _ack_upload(

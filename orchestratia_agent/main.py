@@ -32,6 +32,7 @@ from orchestratia_agent.hub import (
     ws_connection_loop,
 )
 from orchestratia_agent.logging_config import setup_logging
+from orchestratia_agent.uploads import sweep_loop as upload_sweep_loop
 from orchestratia_agent.session import ManagedSession, get_session_backend
 from orchestratia_agent.session_base import SessionBackend
 
@@ -330,6 +331,9 @@ async def main():
             permlog_flush_loop(state),
             pending_uploads_loop(client, state),
             pending_pulls_loop(client, state),
+            # Streamed uploads: remove abandoned parts/journals (> 24 h idle) at startup
+            # and hourly, in the daemon user's folder and each project user's.
+            upload_sweep_loop(state),
             # Reconcile grant state with hub every 60s. Defensive against
             # missed WS pushes (grant_ssh_access / revoke_grant_access).
             # See _reconcile_grants for the bug class this addresses.

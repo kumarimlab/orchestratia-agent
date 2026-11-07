@@ -46,6 +46,14 @@ PRIVILEGE_CLASSIFICATION = {
     "download_stat": TIER_BOUNDED,
     "download_open": TIER_BOUNDED,
 
+    # Uploads (relay-streamed). Every write runs dl_helper AS THE SESSION'S USER, in
+    # that user's own 0700 upload folder, never in the daemon process; the tier is
+    # resolved from this host's config, not the message, and the file name travels on
+    # the helper's stdin, never argv. Cancel removes only that upload's own files.
+    "upload_prepare": TIER_BOUNDED,
+    "upload_open": TIER_BOUNDED,
+    "upload_cancel": TIER_BOUNDED,
+
     # Filesystem side-panel — scoped to the session's working_dir.
     # NOTE: these still run IN THE DAEMON PROCESS as the daemon user. They are
     # path-scoped, not privilege-scoped. Tracked as a known gap; see the

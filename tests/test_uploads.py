@@ -228,8 +228,10 @@ async def test_link(relay):
        and not any(n.startswith("final (") for n in published()), published())
     task, peer = await relay.link(open_msg(uid, "final.bin", len(data)))
     ready = await peer.next()
-    ok("a third link (lost response) still reports done, no copy", ready["done"] and ready["done"]["sha256"] == sha(data)
-       and published().count("final.bin") == 1, ready)
+    tail = await peer.next()
+    ok("a third link (lost response) re-hashes and reports done, no copy", ready["finalizing"] is True
+       and tail["type"] == "done" and tail["sha256"] == sha(data) and published().count("final.bin") == 1,
+       (ready, tail))
     await asyncio.wait_for(task, 15)
 
     # duplicate open while one is live

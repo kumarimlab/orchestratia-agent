@@ -515,9 +515,10 @@ def cmd_ul_prepare(base):
         part, jname, dname = _names(req["upload_id"])
         free, margin = _free(dfd)
         info = {"dir": base, "free_bytes": free}
-        done = _load_done(dfd, dname, req["upload_id"])
-        if done:
-            _header(dict(info, ok=True, offset=req["size"], done=done))
+        if _load_done(dfd, dname, req["upload_id"]):
+            # Finished, but the record is the session user's file: never echo it. ul-write
+            # re-hashes the published file and reports that (the browser polls HEAD).
+            _header(dict(info, ok=True, offset=req["size"], done=None))
             return
         j = _load_journal(dfd, jname, req)
         offset = j["offset"] if j else 0
@@ -614,14 +615,9 @@ class _Upload:
     def _resume_done(self, done):
         """Finalize had verified the file and written the done record. Either the link
         happened (report it — never publish a second copy) or it did not (publish now)."""
-        public = {"path": done["path"], "sha256": done["sha256"]}
-        if "chunks_digest" in done:
-            public["chunks_digest"] = done["chunks_digest"]
         if self.pfd is None:                         # published, and the part already removed
             _unlink(self.dfd, self.jname)
-            self._ready(done=public)
-            _emit(dict(public, type="done"))
-            return
+            return self._report_published(done)
         pst = os.fstat(self.pfd)
         try:
             got = os.stat(os.path.basename(done["path"]), dir_fd=self.dfd, follow_symlinks=False)
@@ -629,9 +625,7 @@ class _Upload:
             got = None
         if got is not None and (got.st_dev, got.st_ino) == (pst.st_dev, pst.st_ino):
             self._after_publish()
-            self._ready(done=public)
-            _emit(dict(public, type="done"))
-            return
+            return self._report_published(done)
         # Not published yet: verify again from the journal (the part may have been
         # touched while nothing held it), then publish.
         j = _load_journal(self.dfd, self.jname, self.req)
@@ -735,6 +729,49 @@ class _Upload:
             _emit({"type": "ack", "offset": self.offset, "index": f["index"], "sha256": digest})
             if final:
                 return self._finalize()
+
+    def _report_published(self, done):
+        """The upload was published earlier. The done record lives in the session user's
+        own folder, so its hash and path are never echoed: re-hash the published file
+        through the folder fd (no symlinks, ours, regular, the right size) and report what
+        is actually there — the hub compares its chunk digests with the relay's. Answers
+        ready{finalizing} first: re-reading a large file can take a while."""
+        _header({"type": "ready", "offset": self.size, "finalizing": True, "done": None, "reset": False})
+        path = done["path"]
+        name = os.path.basename(path)
+        tampered = {"type": "error", "code": "tampered", "offset": self.size}
+        if not valid_name(name) or os.path.join(self.base, name) != path:
+            _emit(tampered)
+            return
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | _NONBLOCK, dir_fd=self.dfd)
+        except OSError:
+            _emit(tampered)
+            return
+        try:
+            s = os.fstat(fd)
+            if not st.S_ISREG(s.st_mode) or s.st_uid != os.geteuid() or s.st_size != self.size:
+                _emit(tampered)
+                return
+            whole, digests, pos = hashlib.sha256(), [], 0
+            for _ in range(_chunk_count(self.size, self.cs)):
+                h, left = hashlib.sha256(), min(self.cs, self.size - pos)
+                while left:
+                    b = os.pread(fd, min(1 << 20, left), pos)
+                    if not b:
+                        _emit(tampered)
+                        return
+                    h.update(b)
+                    whole.update(b)
+                    pos += len(b)
+                    left -= len(b)
+                digests.append(h.hexdigest())
+        except OSError:
+            _emit({"type": "error", "code": "io", "offset": self.size})
+            return
+        finally:
+            os.close(fd)
+        _emit({"type": "done", "path": path, "sha256": whole.hexdigest(), "chunks_digest": chunks_digest(digests)})
 
     # ── finalize ──────────────────────────────────────────────────────────
     def _verify(self):

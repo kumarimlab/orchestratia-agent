@@ -380,17 +380,34 @@ json.dump({"upload_id": U, "path": os.path.join(base, "f.bin"), "sha256": sha(da
 w = Writer(base, req(U, "f.bin", len(data)))
 d = w.line()
 w.close()
-ok(".done after link: ready carries done", w.first["done"] and w.first["done"]["path"].endswith("/f.bin"), w.first)
-ok(".done after link: reports done, never a second copy", d["type"] == "done" and published(base) == ["f.bin"]
-   and not os.path.exists(part) and not os.path.exists(jrnl), (d, files(base)))
+ok(".done after link: ready says finalizing (the record is never echoed)", w.first["finalizing"] is True
+   and w.first["done"] is None and w.first["offset"] == len(data), w.first)
+ok(".done after link: done re-hashed from the published file, never a second copy", d["type"] == "done"
+   and d["path"].endswith("/f.bin") and d["sha256"] == sha(data) and d["chunks_digest"] == h.chunks_digest(digests)
+   and published(base) == ["f.bin"] and not os.path.exists(part) and not os.path.exists(jrnl), (d, files(base)))
 w = Writer(base, req(U, "f.bin", len(data)))
 d = w.line()
 w.close()
-ok("a later ul-write (lost response) is idempotent", w.first["done"] and d["type"] == "done"
-   and published(base) == ["f.bin"], files(base))
+ok("a later ul-write (lost response) is idempotent", w.first["finalizing"] is True and d["type"] == "done"
+   and d["sha256"] == sha(data) and published(base) == ["f.bin"], files(base))
 rc, head = once("ul-prepare", base, req(U, "f.bin", len(data)))
-ok("ul-prepare reports the finished upload", head["ok"] and head["done"]["path"].endswith("/f.bin")
-   and head["offset"] == len(data), head)
+ok("ul-prepare never echoes a .done record: offset = size, done None (ul-write re-hashes)",
+   head["ok"] and head["done"] is None and head["offset"] == len(data), head)
+
+# a .done record the session user wrote: its sha256 / path are never believed
+json.dump({"upload_id": U, "path": os.path.join(base, "f.bin"), "sha256": "ab" * 32,
+           "chunks_digest": "cd" * 32}, open(done, "w"))
+w = Writer(base, req(U, "f.bin", len(data)))
+d = w.line()
+w.close()
+ok("forged .done: the reported hashes are the published file's, not the record's",
+   d["type"] == "done" and d["sha256"] == sha(data) and d["chunks_digest"] == h.chunks_digest(digests), d)
+json.dump({"upload_id": U, "path": "/etc/passwd", "sha256": "ab" * 32}, open(done, "w"))
+w = Writer(base, req(U, "f.bin", len(data)))
+d = w.line()
+w.close()
+ok("a .done naming a path outside the upload folder -> tampered", d["type"] == "error"
+   and d["code"] == "tampered", d)
 
 # .done names a path someone else took meanwhile (not our inode) -> next free name
 base = new_base()

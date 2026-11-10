@@ -46,6 +46,10 @@ orchestratia task view <task-id> --json
 
 Read the spec, acceptance criteria, structured requirements, and any resolved inputs from upstream tasks.
 
+Tasks have keys like `ORC-42` — use them anywhere a task id is expected (`orchestratia task view ORC-42`).
+Every task belongs to a person (its assignee). If the task is part of an **epic**, the view shows the
+epic's key, title and description: that is context for the bigger goal, never something to work on directly.
+
 ### Step 3: Start the task
 
 ```bash
@@ -122,6 +126,12 @@ orchestratia task create --title "Build auth API" --spec "Implement JWT authenti
   --priority high --type feature --repo cloud-gateway
 ```
 
+### Add a task to an epic
+
+```bash
+orchestratia task create --title "Retry on 409" --spec "..." --epic ORC-12
+```
+
 ### Create and assign in one step
 
 ```bash
@@ -130,6 +140,10 @@ orchestratia task create --title "Build auth API" --spec "..." \
 ```
 
 ### Assign existing tasks
+
+Assigning hands a task to the session and sends it there; the task's owner becomes the person who
+started that session. You can only hand over a pending or assigned task that is unassigned, yours, or
+already that session owner's. Linking sessions and assigning people otherwise happen on the dashboard.
 
 ```bash
 orchestratia task assign <task-id> --session claude-web-dashboard

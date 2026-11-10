@@ -44,6 +44,7 @@ Task IDs accept short prefixes (minimum 4 chars) that resolve to full UUIDs.
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
@@ -179,6 +180,10 @@ def _resolve_task_id(prefix: str) -> str:
     if len(prefix) == 36 and prefix.count("-") == 4:
         return prefix
 
+    # Task key (ORC-42): the hub resolves it within this agent's projects.
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{1,5}-[0-9]{1,9}", prefix):
+        return _api_request("GET", f"/{prefix.upper()}")["id"]
+
     # Short prefix: search task list
     if len(prefix) < 4:
         _error_exit(f"Task ID prefix too short (minimum 4 characters): {prefix}")
@@ -220,7 +225,7 @@ def _print_task(task: dict, verbose: bool = False):
         "done": GREEN, "failed": RED, "needs_human": RED, "cancelled": DIM,
     }.get(task["status"], "")
 
-    print(f"  {BRAND}#{task['id']}{RESET} {BOLD}{task['title']}{RESET}")
+    print(f"  {BRAND}{task.get('key') or '#' + task['id']}{RESET} {BOLD}{task['title']}{RESET}")
     print(f"    Status: {status_color}{task['status']}{RESET}  "
           f"Priority: {priority_color}{task['priority']}{RESET}", end="")
 
@@ -228,6 +233,13 @@ def _print_task(task: dict, verbose: bool = False):
         print(f"  Type: {task['type']}", end="")
     print()
 
+    if task.get("assigned_user_name"):
+        print(f"    Assignee: {task['assigned_user_name']}")
+    if task.get("epic"):
+        epic = task["epic"]
+        print(f"    Epic: {epic.get('key') or ''} {epic.get('title', '')}".rstrip())
+        if verbose and epic.get("description"):
+            print(f"      {epic['description'][:300]}")
     if task.get("assigned_server_name"):
         print(f"    Server: {CYAN}{task['assigned_server_name']}{RESET}")
 
@@ -321,6 +333,8 @@ def cmd_create(args):
         data["acceptance_criteria"] = args.acceptance_criteria
     if args.depends_on:
         data["dependency_ids"] = [_resolve_task_id(d) for d in args.depends_on]
+    if getattr(args, "epic", None):
+        data["parent"] = args.epic
 
     task = _api_request("POST", "", data)
 
@@ -1978,6 +1992,7 @@ def main():
     create_p.add_argument("--depends-on", nargs="+",
                          help="IDs of tasks this depends on")
     create_p.add_argument("--assign", help="Session name to auto-assign after creation")
+    create_p.add_argument("--epic", help="Epic key or id to add this task to (e.g. ORC-12)")
     create_p.add_argument("--require-plan", action="store_true",
                           help="Require plan approval before execution (used with --assign)")
 

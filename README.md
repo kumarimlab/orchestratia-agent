@@ -44,6 +44,17 @@ Start the daemon:
 orchestratia-agent
 ```
 
+## Updating
+
+**Linux:** `sudo orchestratia update`, then `sudo systemctl restart orchestratia-agent`. Coming from 0.34 or older,
+run the update twice before restarting (the first run is the old updater; the second installs the root-owned pieces):
+
+```bash
+sudo orchestratia update && sudo orchestratia update && sudo systemctl restart orchestratia-agent
+```
+
+**macOS:** `brew upgrade orchestratia-agent`. **Windows:** re-run the install command.
+
 ## Configuration
 
 ### Config file locations

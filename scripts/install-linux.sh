@@ -72,9 +72,9 @@ _log_to_file() {
 }
 # Isolated venv for the agent. Keeps us out of system Python — no PEP 668
 # collisions, no Debian-managed-dep RECORD-not-found errors, no
-# --user-vs-system entry-point guessing, and `orchestratia update` runs
-# without sudo because the venv is owned by $RUN_USER. v0.13.0+ uses
-# this; earlier versions installed via pip3 system-wide.
+# --user-vs-system entry-point guessing. The venv is root's: root runs this
+# code, so `sudo orchestratia update` upgrades it. v0.13.0+ uses this;
+# earlier versions installed via pip3 system-wide.
 VENV_DIR="/opt/orchestratia-venv"
 TOTAL_STEPS=6
 ERRORS=0
@@ -186,6 +186,16 @@ fi
 
 RUN_HOME=$(eval echo "~${RUN_USER}")
 
+# Files this installer creates as root are root's and readable by the daemon user (never group-writable).
+umask 022
+
+# Root never imports from the caller's directory: `python3 -c`/`-m` put the cwd first on sys.path, so a planted
+# ~/ensurepip.py or ~/venv/__main__.py would run as root. Resolve a relative install source first, then leave.
+if [ -n "$INSTALL_SOURCE" ] && [ -e "$INSTALL_SOURCE" ] && [ "${INSTALL_SOURCE#/}" = "$INSTALL_SOURCE" ]; then
+    INSTALL_SOURCE="$(cd "$(dirname "$INSTALL_SOURCE")" && pwd)/$(basename "$INSTALL_SOURCE")"
+fi
+cd / || exit 1
+
 # ── Main installer ──────────────────────────────────────────────────
 
 print_header
@@ -251,8 +261,8 @@ fi
 
 # /opt/orchestratia-agent is intentionally preserved here — it's the
 # live source tree that provides agent-skills/ (SKILL.md files and hook
-# shell scripts). Step 6 refreshes it via `git pull` or `git clone` as
-# appropriate. Deleting it here would break any symlinks the previous
+# shell scripts). Step 6 replaces it with a fresh root-owned clone, swapped
+# in whole. Deleting it here would break any symlinks the previous
 # install created under ~/.claude/skills/ and ~/.gemini/skills/ until
 # the new clone finishes, which is pointless churn.
 
@@ -274,7 +284,7 @@ uninstall_pip() {
     local user="$1"; shift
     local flags="$*"
     if [ "$user" = "root" ]; then
-        pip3 uninstall -y $flags orchestratia-agent >/dev/null 2>&1
+        python3 -I -m pip uninstall -y $flags orchestratia-agent >/dev/null 2>&1
     else
         sudo -u "$user" pip3 uninstall -y $flags orchestratia-agent >/dev/null 2>&1
     fi
@@ -283,7 +293,7 @@ uninstall_pip() {
 for ctx in "root" "$RUN_USER"; do
     # Does this context have the package installed?
     if [ "$ctx" = "root" ]; then
-        HAS=$(pip3 show orchestratia-agent >/dev/null 2>&1 && echo y || echo n)
+        HAS=$(python3 -I -m pip show orchestratia-agent >/dev/null 2>&1 && echo y || echo n)
     else
         HAS=$(sudo -u "$ctx" pip3 show orchestratia-agent >/dev/null 2>&1 && echo y || echo n)
     fi
@@ -314,6 +324,8 @@ if [ -d "$VENV_DIR" ]; then
     EXISTING=true
     sudo rm -rf "$VENV_DIR" 2>/dev/null && ok "Removed venv ($VENV_DIR)" || warn "Could not remove $VENV_DIR"
 fi
+# Copies an interrupted `sudo orchestratia update` left beside it.
+sudo rm -rf "${VENV_DIR}".old-* 2>/dev/null || true
 
 if [ "$EXISTING" = false ]; then
     ok "No existing installation found"
@@ -323,9 +335,9 @@ fi
 step 2 "Checking prerequisites"
 
 if check_command python3; then
-    PYTHON_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    PYTHON_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)')
-    PYTHON_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
+    PYTHON_VER=$(python3 -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    PYTHON_MAJOR=$(python3 -I -c 'import sys; print(sys.version_info.major)')
+    PYTHON_MINOR=$(python3 -I -c 'import sys; print(sys.version_info.minor)')
     if [ "$PYTHON_MAJOR" -ge 3 ] && [ "$PYTHON_MINOR" -ge 10 ]; then
         ok "Python ${PYTHON_VER}"
     else
@@ -430,7 +442,6 @@ step 3 "Installing orchestratia-agent"
 #     RECORD file not found")
 #   - Entry-point generation failures from stale system setuptools
 #   - --user vs system entry-point landing-spot guessing
-#   - "orchestratia update" needing sudo (venv is owned by RUN_USER)
 
 # Ensure python3-venv + ensurepip are present. Ubuntu/Debian splits venv
 # into multiple pieces:
@@ -444,8 +455,8 @@ step 3 "Installing orchestratia-agent"
 # We test the actual breaking condition (`import ensurepip`) instead of
 # `--help`, then install both the version-specific and generic venv
 # packages so any apt-shipped layout works.
-if ! python3 -c "import ensurepip" >/dev/null 2>&1 \
-   || ! python3 -m venv --help >/dev/null 2>&1; then
+if ! python3 -I -c "import ensurepip" >/dev/null 2>&1 \
+   || ! python3 -I -m venv --help >/dev/null 2>&1; then
     info "Python venv/ensurepip support missing — installing..."
 
     # Detect distro — universe-enable logic is Ubuntu-only. On Debian,
@@ -543,7 +554,7 @@ UNIV_EOF
     # Re-verify after install. If still broken, fail loudly here rather
     # than letting the venv create step report the same error one
     # screen later.
-    if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+    if ! python3 -I -c "import ensurepip" >/dev/null 2>&1; then
         fail "ensurepip still unavailable after installing $PYVENV_PKG"
         info "Try manually: sudo apt-get install -y python3-venv python3-pip-whl"
         fatal "Python venv support is broken on this system."
@@ -552,7 +563,7 @@ fi
 
 info "Creating venv at $VENV_DIR..."
 sudo mkdir -p "$(dirname "$VENV_DIR")"
-if ! VENV_OUT=$(sudo python3 -m venv "$VENV_DIR" 2>&1); then
+if ! VENV_OUT=$(sudo python3 -I -m venv "$VENV_DIR" 2>&1); then
     fail "Could not create venv:"
     echo -e "     ${DIM}${VENV_OUT}${NC}"
     fatal "Cannot proceed without the venv."
@@ -565,7 +576,7 @@ ok "Venv created"
 # on PEP 517 builds — the failure mode that prompted this whole refactor.
 # `--quiet` makes failures quieter; we capture stdout/stderr so the
 # fatal path still shows what went wrong.
-if ! BOOTSTRAP_OUT=$(sudo "$VENV_DIR/bin/pip" install --upgrade --quiet pip setuptools wheel 2>&1); then
+if ! BOOTSTRAP_OUT=$(sudo "$VENV_DIR/bin/python3" -I -m pip install --no-cache-dir --upgrade --quiet pip setuptools wheel 2>&1); then
     fail "Could not bootstrap pip/setuptools/wheel in venv:"
     echo -e "     ${DIM}${BOOTSTRAP_OUT}${NC}"
     fatal "Cannot proceed without a working venv pip."
@@ -573,17 +584,16 @@ fi
 ok "Venv pip bootstrapped"
 
 info "Installing agent into venv..."
-if ! VENV_INSTALL_OUT=$(sudo "$VENV_DIR/bin/pip" install --quiet "$INSTALL_SOURCE" 2>&1); then
+if ! VENV_INSTALL_OUT=$(sudo "$VENV_DIR/bin/python3" -I -m pip install --no-cache-dir --quiet "$INSTALL_SOURCE" 2>&1); then
     fail "venv pip install failed:"
     echo -e "     ${DIM}${VENV_INSTALL_OUT}${NC}"
-    info "Try manually: sudo $VENV_DIR/bin/pip install $INSTALL_SOURCE"
+    info "Try manually: cd / && sudo $VENV_DIR/bin/python3 -I -m pip install --no-cache-dir $INSTALL_SOURCE"
     fatal "Cannot proceed without the agent package."
 fi
 ok "Package installed in venv"
 
-# Hand the venv to RUN_USER so `orchestratia update` (which runs as the
-# daemon user) can write into venv/lib/python*/site-packages without sudo.
-sudo chown -R "${RUN_USER}:${RUN_USER}" "$VENV_DIR" 2>/dev/null || true
+# The venv stays root's: root runs this code (sudo orchestratia …, the scan-data timer), so no other account may
+# change it. `sudo orchestratia update` upgrades it.
 
 # PATH-discoverable wrappers at /usr/local/bin/ so users still type
 # `orchestratia status` etc from any shell. Each wrapper is a 2-line
@@ -604,7 +614,7 @@ done
 # this catches it loudly instead of silently shipping a broken install.
 if [ ! -x "$VENV_DIR/bin/orchestratia-agent" ]; then
     fail "venv install completed but $VENV_DIR/bin/orchestratia-agent is missing"
-    info "pip files: sudo $VENV_DIR/bin/pip show -f orchestratia-agent"
+    info "pip files: cd / && sudo $VENV_DIR/bin/python3 -I -m pip show -f orchestratia-agent"
     fatal "Entry-point script was not created."
 fi
 
@@ -652,54 +662,16 @@ if [ -f "${CONFIG_DIR}/config.yaml" ]; then
 fi
 sudo chmod 0750 "$CONFIG_DIR"
 
-# Step 5: Systemd service + agent sudoers
+# Step 5: Systemd service
 step 5 "Setting up systemd service"
 
-# Agent sudoers — required for access-grant target operations. The agent
-# runs as $RUN_USER (unprivileged) but needs to:
-#   - create the orchestratia system user on first grant (useradd)
-#   - manage /home/orchestratia/.ssh/authorized_keys (mkdir/chmod/chown/tee/cat)
-#   - manage /etc/sudoers.d/orchestratia for elevated grants
-# Without this file, every _sudo_run() in ssh_setup.py silently fails
-# under `sudo -n`, leaving grants in the broken-but-not-loudly-broken
-# state where the source can tunnel through but the target rejects the
-# pubkey (because no orchestratia user exists to authenticate as).
-#
-# Written with 0440 perms (sudoers requires) and visudo-validated before
-# moving into place — a malformed entry would break ALL sudo on the box.
-SUDOERS_AGENT="/etc/sudoers.d/${SERVICE_NAME}"
-SUDOERS_TMP="$(mktemp)"
-cat > "$SUDOERS_TMP" <<SUDOERSEOF
-# Auto-generated by Orchestratia installer ($(date -u +"%Y-%m-%dT%H:%M:%SZ"))
-# Allows the agent daemon (running as ${RUN_USER}) to set up SSH access
-# grants and the orchestratia system user. Remove this file to disable
-# grant-target functionality on this server.
-
-# Create the orchestratia system user on first grant.
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/sbin/useradd --system --create-home --shell /bin/bash orchestratia
-
-# Manage orchestratia user's .ssh directory.
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /home/orchestratia/.ssh
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/chmod * /home/orchestratia/.ssh*
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/chown * /home/orchestratia/.ssh*
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/cat /home/orchestratia/.ssh/authorized_keys
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/tee /home/orchestratia/.ssh/authorized_keys
-
-# Manage sudoers drop-in for elevated grants (which give the orchestratia
-# user NOPASSWD: ALL). The drop-in file is the *only* sudoers file the
-# agent can write — it cannot escalate further.
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/sudoers.d/orchestratia
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/sudoers.d/orchestratia
-SUDOERSEOF
-
-if sudo visudo -cf "$SUDOERS_TMP" >/dev/null 2>&1; then
-    sudo install -m 0440 -o root -g root "$SUDOERS_TMP" "$SUDOERS_AGENT"
-    rm -f "$SUDOERS_TMP"
-    ok "Agent sudoers installed: ${SUDOERS_AGENT}"
-else
-    rm -f "$SUDOERS_TMP"
-    warn "Generated sudoers failed visudo check — skipping install"
-    info "Grant target setup will not work until this is fixed."
+# Access grants go through ONE root-owned helper (installed by `secure-install` in step 6), never through broad sudo
+# rules. Remove the rules earlier installers wrote: each of them let this account become root.
+sudo rm -f "/etc/sudoers.d/${SERVICE_NAME}"
+# uninstall.sh expires the orchestratia account (day 1) so grant logins stop; a reinstall lifts only that marker (an
+# expiry an admin set stays). The agent re-adds the keys of the grants the hub still lists.
+if id orchestratia >/dev/null 2>&1 && [ "$(sudo getent shadow orchestratia | cut -d: -f8)" = "1" ]; then
+    sudo usermod -e "" orchestratia && ok "Access-grant logins re-enabled for the orchestratia account"
 fi
 
 # Use $AGENT_BIN as set by step 3 — the absolute venv path. Don't
@@ -790,61 +762,34 @@ fi
 # Architecture: git-clone the repo to /opt/orchestratia-agent and
 # symlink SKILL.md files from ~/.claude/skills/orchestratia/ (etc.)
 # into the cloned tree. Hooks in settings.json point directly at hook
-# scripts inside the cloned tree. This mirrors the design of the
-# top-level install.sh and lets `git pull` inside /opt refresh skill
-# content without a full re-install.
+# scripts inside the cloned tree. The tree is root's; `sudo orchestratia
+# update` swaps in a fresh clone to refresh skill content.
 step 6 "Setting up AI agent integrations"
 
 INSTALL_DIR="/opt/orchestratia-agent"
 REPO_URL="https://github.com/kumarimlab/orchestratia-agent.git"
 
-# Ensure the asset tree exists and is fresh at /opt/orchestratia-agent.
-# On a fresh box: clone. On an existing install: fetch + hard reset so
-# the tree matches origin/main regardless of local state.
-#
-# Git 2.35+ has a "dubious ownership" safety check that refuses to
-# operate on a repo whose dir is owned by a different user than the
-# caller. Our scripts run as root via sudo but the repo dir was
-# chown'd to $RUN_USER on a previous install — that combination trips
-# the check. Mark the dir safe globally before any git operation.
-if sudo git config --global --get-all safe.directory 2>/dev/null | grep -qx "$INSTALL_DIR" ; then
-    :
+# A fresh root-owned clone every time, swapped in whole: root never runs git inside a tree another account could
+# have changed (a planted .git/config runs code on fetch/reset).
+NEW_TREE="$(sudo mktemp -d /opt/.orchestratia-agent.new-XXXXXX)"
+sudo chmod 0755 "$NEW_TREE"
+if sudo git -c core.hooksPath=/dev/null clone --quiet --depth 1 --no-tags "$REPO_URL" "$NEW_TREE" >/dev/null 2>&1; then
+    sudo rm -rf "${INSTALL_DIR}.old"
+    if [ -e "$INSTALL_DIR" ] || [ -L "$INSTALL_DIR" ]; then sudo mv "$INSTALL_DIR" "${INSTALL_DIR}.old"; fi
+    sudo mv "$NEW_TREE" "$INSTALL_DIR"
+    sudo rm -rf "${INSTALL_DIR}.old"
+    ok "Asset tree cloned: $INSTALL_DIR"
 else
-    sudo git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
+    sudo rm -rf "$NEW_TREE"
+    fail "git clone failed for $REPO_URL"
 fi
 
-git_fetch_reset() {
-    sudo git -C "$INSTALL_DIR" fetch --depth 1 origin main 2>&1 && \
-    sudo git -C "$INSTALL_DIR" reset --hard FETCH_HEAD 2>&1
-}
-
-if [ -d "$INSTALL_DIR/.git" ]; then
-    GIT_OUT=$(git_fetch_reset)
-    if [ $? -eq 0 ]; then
-        ok "Asset tree refreshed: $INSTALL_DIR"
-    else
-        warn "Could not refresh $INSTALL_DIR — falling back to fresh clone"
-        info "Git error: $(echo "$GIT_OUT" | tail -1)"
-        # Re-clone the tree so Step 6 can create valid symlinks even
-        # if the existing checkout is corrupt / ownership-locked.
-        sudo rm -rf "$INSTALL_DIR" 2>/dev/null || true
-        if sudo git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1; then
-            ok "Asset tree re-cloned: $INSTALL_DIR"
-        else
-            fail "git clone fallback also failed for $REPO_URL"
-        fi
-    fi
+# Root-owned, read-only for everyone else; refuses (and says why) when anything isn't.
+if sudo "$VENV_DIR/bin/orchestratia-agent" secure-install --daemon-user "$RUN_USER"; then
+    ok "Agent code is root-owned"
 else
-    sudo rm -rf "$INSTALL_DIR" 2>/dev/null || true
-    if sudo git clone --depth 1 "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1; then
-        ok "Asset tree cloned: $INSTALL_DIR"
-    else
-        fail "git clone failed for $REPO_URL"
-    fi
+    warn "Could not secure the install — run: sudo orchestratia update"
 fi
-
-# Give the asset tree to RUN_USER so symlinks + reads work without sudo.
-sudo chown -R "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" 2>/dev/null || true
 
 HOOK_CONTEXT="$INSTALL_DIR/agent-skills/hooks/orchestratia-context.sh"
 HOOK_PRETOOLUSE="$INSTALL_DIR/agent-skills/hooks/orchestratia-pretooluse.sh"

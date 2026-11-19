@@ -73,11 +73,12 @@ async def main():
         ),
     )
     parser.add_argument(
-        "provision_tier", nargs="?", choices=["provision-tier", "orc-attach", "ensure-code-server"],
+        "provision_tier", nargs="?", choices=["provision-tier", "orc-attach", "ensure-code-server", "secure-install"],
         default=None,
         help="provision-tier: provision a project's restricted tier (root). "
              "orc-attach: attach the editor terminal to the project's tmux. "
-             "ensure-code-server: download the pinned editor for this user (no root).",
+             "ensure-code-server: download the pinned editor for this user (no root). "
+             "secure-install: make the installed code and its root-facing pieces root-owned (root).",
     )
     parser.add_argument(
         "--project", default=None, metavar="ID",
@@ -114,6 +115,16 @@ async def main():
         help="provision-tier: reserve the upload folders (tmpfiles.d) and create the daemon "
              "user's and every project user's private upload folder (root; run by the installer)",
     )
+    elevated = parser.add_mutually_exclusive_group()
+    elevated.add_argument("--allow-elevated-grants", dest="elevated_grants", action="store_const", const="allow",
+                          default=None,
+                          help="secure-install (root): let elevated access grants give the orchestratia user sudo. "
+                               "While elevated grants are allowed, any process running as the agent's user can "
+                               "become root (it can add its own key and log in as orchestratia). It stays allowed "
+                               "until --deny-elevated-grants.")
+    elevated.add_argument("--deny-elevated-grants", dest="elevated_grants", action="store_const", const="deny",
+                          help="secure-install (root): turn elevated access grants off (removes a live elevated "
+                               "rule). This is the default on every server.")
     parser.add_argument("--register", metavar="TOKEN", help="One-time registration token")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -125,6 +136,14 @@ async def main():
 
     state = DaemonState()
     state.config_path = args.config
+
+    if (args.provision_tier is None and not args.register and sys.platform.startswith("linux")
+            and os.geteuid() != 0):
+        from orchestratia_agent import codetrust
+        why = codetrust.install_problem()
+        if why:
+            log.warning(f"This agent's code isn't root's alone ({why}). Root runs it (sudo orchestratia …, the "
+                        f"scan-data timer), so another account could change what root runs. {codetrust.FIX_HINT}")
 
     if args.provision_tier == "orc-attach":
         # The editor terminal's default command — attaches to the project's
@@ -142,6 +161,19 @@ async def main():
         except _ci.InstallError as e:
             print(f"editor not installed: {e.reason}", file=sys.stderr)
             sys.exit(1)
+
+    if args.provision_tier == "secure-install":
+        # Root. `sudo orchestratia update` and the installer run this through the NEW entry point.
+        from orchestratia_agent import secure_install
+        from orchestratia_agent.scanning import pack as _pack
+        try:
+            # Each step's line is printed as it finishes, so a later failure never hides what already ran.
+            secure_install.run(args.daemon_user or _pack.service_user(), elevated=args.elevated_grants,
+                               report=lambda line: print(line, flush=True))
+        except Exception as e:  # noqa: BLE001 — report every failure; the caller decides
+            print(f"secure-install: {e}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     if args.provision_tier == "provision-tier":
         from orchestratia_agent.provision import provision, revoke, ProvisionError
@@ -324,7 +356,11 @@ async def main():
                 return await _ws_send_fn(state, msg)
             return _send
 
+        from orchestratia_agent.scanning.runner import sweep_at_start as scan_sweep_at_start
+
         background_tasks = [
+            # Stop scan sandboxes left by a previous run; refresh the runner files.
+            scan_sweep_at_start(),
             heartbeat_loop(client, state),
             ws_connection_loop(state),
             idle_note_flush_loop(state),

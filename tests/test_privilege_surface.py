@@ -52,7 +52,7 @@ def test_remote_exec_is_tier_bounded():
 
 def test_every_value_is_a_known_bucket():
     bad = {k: v for k, v in PRIVILEGE_CLASSIFICATION.items()
-           if v not in ("tier_bounded", "no_execution", "unconfined")}
+           if v not in ("tier_bounded", "no_execution", "unconfined", "sandboxed")}
     assert not bad, bad
 
 

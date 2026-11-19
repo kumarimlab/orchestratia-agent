@@ -5,15 +5,24 @@ Target role (Server B): manages authorized_keys for SSH access.
   - Windows: OpenSSH server + administrators_authorized_keys or user authorized_keys
 
 Source role (Server A): stores/removes private keys for SSH client use.
+
+Linux target role (hardening plan Task 4): every change goes through ONE root-owned helper
+(/usr/local/libexec/orchestratia/grant-helper) behind one sudoers rule, never through broad sudo rules, and only for
+what differs from what this process last saw (converge_target): no change, no sudo.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+
+from orchestratia_agent.grant_helper import GRANT_ID, POLICY as _GRANT_POLICY, parse_key
 
 log = logging.getLogger("orchestratia-agent.ssh_setup")
 
@@ -34,6 +43,13 @@ else:
     _AUTH_KEYS_PATH = _ORCHESTRATIA_HOME / ".ssh" / "authorized_keys"
     _SUDOERS_PATH = Path(f"/etc/sudoers.d/{_ORCHESTRATIA_USER}")
     _GRANT_TAG = "orchestratia-grant:"
+
+GRANT_HELPER = "/usr/local/libexec/orchestratia/grant-helper"
+_NO_HELPER = "the access-grant helper isn't installed; run: sudo orchestratia update"
+HELPER_PLATFORM = sys.platform.startswith("linux")   # macOS and Windows keep their existing paths
+POLICY_PATH = _GRANT_POLICY          # root-owned, world-readable: a change is noticed without sudo
+STATUS_TTL = 3600.0                  # re-read the helper's status hourly where there is something to verify
+_clock = time.monotonic
 
 
 # ── Windows helpers ───────────────────────────────────────────────────────────
@@ -416,6 +432,8 @@ def setup_authorized_key(public_key: str, grant_id: str,
 
     if _IS_WINDOWS:
         return _win_setup_authorized_key(tagged_key, grant_id, privilege_level)
+    if HELPER_PLATFORM:
+        return _linux_add_key(public_key, grant_id)
     return _posix_setup_authorized_key(tagged_key, grant_id)
 
 
@@ -536,6 +554,8 @@ def remove_authorized_key(grant_id: str) -> bool:
     """Remove the key tagged with grant_id from authorized_keys."""
     if _IS_WINDOWS:
         return _win_remove_authorized_key(grant_id)
+    if HELPER_PLATFORM:
+        return _linux_remove_key(grant_id)
     return _posix_remove_authorized_key(grant_id)
 
 
@@ -618,6 +638,8 @@ def setup_sudoers(privilege_level: str) -> bool:
 
     if _IS_WINDOWS:
         return _win_setup_elevated()
+    if HELPER_PLATFORM:
+        return _linux_elevated(True)
     return _posix_setup_sudoers()
 
 
@@ -690,6 +712,8 @@ def remove_sudoers() -> bool:
         # removal instead.
         log.info("Windows: elevated privilege removal is a no-op (revoke keys instead)")
         return True
+    if HELPER_PLATFORM:
+        return _linux_elevated(False)
 
     try:
         result = _sudo_run(["rm", "-f", str(_SUDOERS_PATH)])
@@ -699,6 +723,294 @@ def remove_sudoers() -> bool:
     except Exception as e:
         log.exception(f"Failed to remove sudoers")
         return False
+
+
+# ── Linux target role: the root-owned grant helper ────────────────────────────
+
+
+_missing_logged = False
+
+
+def _helper(args, input_data=None):
+    """Run the grant helper through its one sudoers rule. Never raises: a missing helper or a sudo that fails or
+    hangs comes back as a failed CompletedProcess. A missing helper costs no grant sudo call, only an hourly probe
+    for the old rules: on a half-upgraded server (below) removals go through those instead."""
+    global _missing_logged
+    if not os.path.exists(GRANT_HELPER):
+        if _legacy_rules_present():
+            if not _legacy["logged"]:
+                log.error(_HALF_UPGRADED)
+                _legacy["logged"] = True
+            return _legacy_helper(args, input_data)
+        if not _missing_logged:              # once per process: the reconcile runs every minute
+            log.error(_NO_HELPER)
+            _missing_logged = True
+        return subprocess.CompletedProcess(args, 127, "", _NO_HELPER)
+    try:
+        return _sudo_run([GRANT_HELPER, *args], input=input_data)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, "", "sudo grant-helper timed out")
+    except OSError as e:
+        return subprocess.CompletedProcess(args, 1, "", f"sudo grant-helper failed to run: {e}")
+
+
+# ── A half-upgraded Linux server: removals only, through the 0.34 rules ──────────
+# 0.35 code running where `secure-install` never ran (a 0.34 host updated once, or without sudo, then restarted): no
+# helper, and the old broad rules in /etc/sudoers.d/orchestratia-agent are still there. Without this, a revoke on such
+# a server would leave the grant's key working. Those rules exist on that server anyway; this uses them only to TAKE
+# access away (remove a key, remove the elevated rule) and never to add a key or elevate. Once the update finishes
+# (the helper is installed, the rules are gone) none of this runs.
+
+_HALF_UPGRADED = ("this server is half-upgraded: the access-grant helper isn't installed and the old broad grant sudo "
+                  "rules are still here. Revokes still go through the old rules; new grants and elevated access "
+                  "don't work. Finish the upgrade: sudo orchestratia update, then sudo systemctl restart "
+                  "orchestratia-agent")
+_legacy = {"present": None, "at": 0.0, "logged": False}
+
+
+def _legacy_reset():
+    _legacy.update(present=None, at=0.0, logged=False)
+
+
+def _legacy_sudo(cmd, input_data=None):
+    try:
+        return _sudo_run(cmd, input=input_data)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", f"sudo failed: {e}")
+
+
+def _legacy_rules_present():
+    """Whether the 0.34 rule that writes authorized_keys is live (`sudo -n -l <cmd>` exits 0 only for a command the
+    policy allows without a password). Probed at most hourly; a refused legacy command re-probes."""
+    if _legacy["present"] is None or _clock() - _legacy["at"] >= STATUS_TTL:
+        res = _legacy_sudo(["-l", "tee", str(_AUTH_KEYS_PATH)])
+        _legacy.update(present=res.returncode == 0, at=_clock())
+    return _legacy["present"]
+
+
+def _legacy_failed(args, res):
+    _legacy["present"] = None
+    return subprocess.CompletedProcess(args, 1, "", f"old sudo rules: {(res.stderr or '').strip()}")
+
+
+def _legacy_read_keys():
+    """(text, None) or (None, the failed call). A missing file is no keys; a refused cat is a failure, never 'empty'."""
+    res = _legacy_sudo(["cat", str(_AUTH_KEYS_PATH)])
+    if res.returncode == 0:
+        return res.stdout or "", None
+    if "No such file" in (res.stderr or "") and "sudo:" not in (res.stderr or ""):
+        return "", None
+    return None, res
+
+
+def _legacy_helper(args, input_data=None):
+    """The helper's verbs a half-upgraded server can still do: status, remove-key, clear-elevated. add-key and
+    ensure-user answer 127 (the helper is missing) and set-elevated answers 3 (refused): nothing is ever added or
+    elevated this way. Status reports elevated as on (the rule can't be read without root), so the first reconcile
+    without an elevated grant removes it."""
+    op = args[0] if args else ""
+    if op == "status":
+        text, bad = _legacy_read_keys()
+        if text is None:
+            return _legacy_failed(args, bad)
+        keys = {}
+        for line in text.split("\n"):
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1].startswith(_GRANT_TAG) and GRANT_ID.fullmatch(parts[-1][len(_GRANT_TAG):]):
+                keys[parts[-1][len(_GRANT_TAG):]] = f"{parts[0]} {parts[1]}"
+        return subprocess.CompletedProcess(args, 0, json.dumps({"user": True, "keys": keys, "elevated": True,
+                                                                "elevated_allowed": False}), "")
+    if op == "remove-key" and len(args) == 2 and GRANT_ID.fullmatch(args[1]):
+        text, bad = _legacy_read_keys()
+        if text is None:
+            return _legacy_failed(args, bad)
+        lines = text.splitlines()
+        keep = [ln for ln in lines if f"{_GRANT_TAG}{args[1]}" not in ln]
+        if len(keep) == len(lines):
+            return subprocess.CompletedProcess(args, 0, "absent (old sudo rules)", "")
+        res = _legacy_sudo(["tee", str(_AUTH_KEYS_PATH)], "\n".join(keep) + "\n" if keep else "")
+        if res.returncode != 0:
+            return _legacy_failed(args, res)
+        return subprocess.CompletedProcess(args, 0, "removed (old sudo rules)", "")
+    if op == "clear-elevated":
+        res = _legacy_sudo(["rm", "-f", str(_SUDOERS_PATH)])
+        if res.returncode != 0:
+            return _legacy_failed(args, res)
+        return subprocess.CompletedProcess(args, 0, "cleared (old sudo rules)", "")
+    if op == "set-elevated":
+        return subprocess.CompletedProcess(args, 3, "", _HALF_UPGRADED)
+    return subprocess.CompletedProcess(args, 127, "", _HALF_UPGRADED)
+
+
+class _TargetCache:
+    """This server's grant-target state as this process last read (`grant-helper status`) or applied it, plus the
+    grants revoked here (a revoked grant id is never re-added from a list fetched before the revoke)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.known, self.keys, self.elevated, self.elevated_allowed = False, {}, False, True
+        self.revoked = set()
+        self.read_at = 0.0
+        self.policy_sig = None
+
+
+_target = _TargetCache()
+
+
+def _policy_sig():
+    try:
+        st = os.stat(POLICY_PATH)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size, st.st_ctime_ns)
+
+
+def target_status(helper=None):
+    res = (helper or _helper)(["status"])
+    if res.returncode != 0:
+        log.error(f"grant-helper status failed: {(res.stderr or '').strip()}")
+        return None
+    try:
+        st = json.loads(res.stdout)
+    except ValueError:
+        return None
+    return st if isinstance(st, dict) else None
+
+
+def converge_target(desired, helper=None):
+    """Make this server's grant-target state match `desired` ({grant_id: (public key, privilege level)}): the hub's
+    COMPLETE list of target grants, from a successful (HTTP 200) fetch; the caller never passes a partial list. Calls
+    the helper only for what differs from what it last reported or applied, so nothing changed means no sudo at all.
+    - A tagged key whose grant the hub no longer lists is removed: a lost revoke push must not leave a working login
+      (a source-side session may have copied the private key). The helper's status lists only orchestratia-grant
+      tagged keys, so a key someone added by hand is never touched.
+    - A grant revoked here is never re-added from a list fetched before the revoke.
+    - Elevated is on while any listed (unrevoked) grant is elevated, and only where root's policy allows it; when none
+      is left the rule goes. The policy itself is never changed here (only root's secure-install flags change it).
+    The state is re-read when the owner changes the elevated-grant policy file (no sudo to notice) and hourly while
+    there is something to verify. Returns how many helper calls it made."""
+    if not HELPER_PLATFORM:
+        return _legacy_converge(desired)
+    helper = helper or _helper
+    with _target.lock:
+        return _converge_locked(desired, helper)
+
+
+def _converge_locked(desired, helper):
+    calls = 0
+    desired = {gid: v for gid, v in desired.items() if gid not in _target.revoked}
+    if _target.known:
+        stale = (desired or _target.keys or _target.elevated) and _clock() - _target.read_at >= STATUS_TTL
+        if stale or _policy_sig() != _target.policy_sig:
+            _target.known = False
+    if not _target.known:
+        calls += 1
+        sig = _policy_sig()
+        st = target_status(helper)
+        if st is None:
+            return calls
+        _target.keys = {k: v for k, v in (st.get("keys") or {}).items() if isinstance(k, str) and isinstance(v, str)}
+        _target.elevated, _target.elevated_allowed = bool(st.get("elevated")), bool(st.get("elevated_allowed"))
+        _target.known, _target.read_at, _target.policy_sig = True, _clock(), sig
+    for gid in sorted(set(_target.keys) - set(desired)):        # revoked here, or no longer listed by the hub
+        calls += 1
+        res = helper(["remove-key", gid])
+        if res.returncode == 0:
+            _target.keys.pop(gid, None)
+        else:
+            _target.known = False
+            log.error(f"Grant {gid[:8]}: grant-helper remove-key failed: {(res.stderr or '').strip()}")
+    for gid, (key, _level) in sorted(desired.items()):
+        try:
+            norm = parse_key(key)
+        except ValueError:
+            norm = None
+        if norm is None or not GRANT_ID.fullmatch(gid or ""):
+            log.warning(f"Grant {str(gid)[:8]}: the hub sent a key or id this server won't install")
+            continue
+        if _target.keys.get(gid) == norm:
+            continue
+        calls += 1
+        res = helper(["add-key", gid], norm + "\n")
+        if res.returncode == 0:
+            _target.keys[gid] = norm
+        elif res.returncode == 127:
+            pass                             # no helper (logged once): status still holds, retrying costs no sudo
+        else:
+            _target.known = False
+            log.error(f"Grant {gid[:8]}: grant-helper add-key failed: {(res.stderr or '').strip()}")
+    want = any(level == "elevated" for _key, level in desired.values())
+    if want != _target.elevated and (_target.elevated_allowed or not want):
+        calls += 1
+        res = helper(["set-elevated" if want else "clear-elevated"])
+        if res.returncode == 0:
+            _target.elevated = want
+        elif res.returncode == 3:
+            _target.elevated_allowed = False
+            log.error(f"Elevated grant not applied: {(res.stderr or '').strip()}")
+        else:
+            _target.known = False
+            log.error(f"grant-helper elevated change failed: {(res.stderr or '').strip()}")
+    return calls
+
+
+def _legacy_converge(desired):
+    """macOS / Windows: the per-grant calls the reconcile made before (unchanged behaviour)."""
+    for gid, (key, level) in desired.items():
+        setup_authorized_key(key, gid, level)
+        if level == "elevated":
+            setup_sudoers(level)
+    return len(desired)
+
+
+def _linux_add_key(public_key, grant_id):
+    try:
+        norm = parse_key(public_key)
+    except ValueError as e:
+        log.error(f"Grant {grant_id[:8]}: refusing the key: {e}")
+        return False
+    if not GRANT_ID.fullmatch(grant_id or ""):
+        log.error(f"Grant {str(grant_id)[:8]}: refusing an invalid grant id")
+        return False
+    with _target.lock:
+        res = _helper(["add-key", grant_id], norm + "\n")
+        if res.returncode != 0:
+            _target.known = False
+            log.error(f"Grant {grant_id[:8]}: grant-helper add-key failed: {(res.stderr or '').strip()}")
+            return False
+        _target.keys[grant_id] = norm
+    log.info(f"Grant {grant_id[:8]}: SSH access configured ({(res.stdout or '').strip()})")
+    return True
+
+
+def _linux_remove_key(grant_id):
+    with _target.lock:
+        _target.revoked.add(grant_id)
+        res = _helper(["remove-key", grant_id])
+        if res.returncode != 0:
+            _target.known = False            # the next reconcile re-reads status and removes it again
+            log.error(f"Grant {grant_id[:8]}: grant-helper remove-key failed: {(res.stderr or '').strip()}")
+            return False
+        _target.keys.pop(grant_id, None)
+    log.info(f"Grant {grant_id[:8]}: SSH access removed ({(res.stdout or '').strip()})")
+    return True
+
+
+def _linux_elevated(on):
+    with _target.lock:
+        res = _helper(["set-elevated" if on else "clear-elevated"])
+        if res.returncode == 0:
+            _target.elevated = on
+            return True
+        if res.returncode == 3:
+            _target.elevated_allowed = False
+        else:
+            _target.known = False
+    log.error(f"Elevated grant {'set' if on else 'clear'} failed: {(res.stderr or '').strip()}")
+    return False
 
 
 # ── Source role (runs on Server A) ────────────────────────────────────────────

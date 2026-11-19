@@ -1,0 +1,306 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "/tmp/orc-pin/r/requirements.txt",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "django",
+            "version": "2.2.0",
+            "ecosystem": "PyPI",
+            "purl": "pkg:pypi/django@2.2.0"
+          },
+          "groups": [
+            {
+              "ids": [
+                "PYSEC-2019-10",
+                "GHSA-6c7v-2f49-8h26"
+              ],
+              "aliases": [
+                "CVE-2019-12781",
+                "GHSA-6c7v-2f49-8h26",
+                "PYSEC-2019-10"
+              ],
+              "max_severity": "6.9"
+            },
+            {
+              "ids": [
+                "PYSEC-2019-11",
+                "GHSA-c4qh-4vgv-qc6g"
+              ],
+              "aliases": [
+                "CVE-2019-14232",
+                "GHSA-c4qh-4vgv-qc6g",
+                "PYSEC-2019-11"
+              ],
+              "max_severity": "8.7"
+            },
+            {
+              "ids": [
+                "PYSEC-2019-12",
+                "GHSA-h5jv-4p7w-64jg"
+              ],
+              "aliases": [
+                "CVE-2019-14233",
+                "GHSA-h5jv-4p7w-64jg",
+                "PYSEC-2019-12"
+              ],
+              "max_severity": "8.7"
+            },
+            {
+              "ids": [
+                "PYSEC-2019-13",
+                "GHSA-6r97-cj55-9hrq"
+              ],
+              "aliases": [
+                "CVE-2019-14234",
+                "GHSA-6r97-cj55-9hrq",
+                "PYSEC-2019-13"
+              ],
+              "max_severity": "9.8"
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "aliases": [
+                "CVE-2019-12781",
+                "GHSA-6c7v-2f49-8h26"
+              ],
+              "id": "PYSEC-2019-10",
+              "modified": "2023-11-08T04:01:06.373410Z",
+              "published": "2019-07-01T14:15:00Z",
+              "references": [
+                {
+                  "type": "WEB",
+                  "url": "https://groups.google.com/forum/#!topic/django-announce/Is4kLY9ZcZQ"
+                },
+                {
+                  "type": "ARTICLE",
+                  "url": "https://www.djangoproject.com/weblog/2019/jul/01/security-releases/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://docs.djangoproject.com/en/dev/releases/security/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://www.openwall.com/lists/oss-security/2019/07/01/3"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://usn.ubuntu.com/4043-1/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://www.securityfocus.com/bid/109018"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://security.netapp.com/advisory/ntap-20190705-0002/"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://www.debian.org/security/2019/dsa-4476"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://seclists.org/bugtraq/2019/Jul/10"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/5VXXWIOQGXOB7JCGJ3CVUW673LDHKEYL/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://lists.opensuse.org/opensuse-security-announce/2019-08/msg00006.html"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://lists.opensuse.org/opensuse-security-announce/2019-08/msg00025.html"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://github.com/advisories/GHSA-6c7v-2f49-8h26"
+                }
+              ],
+              "schema_version": "1.7.3"
+            },
+            {
+              "aliases": [
+                "CVE-2019-14232",
+                "GHSA-c4qh-4vgv-qc6g"
+              ],
+              "id": "PYSEC-2019-11",
+              "modified": "2023-11-08T04:01:09.281488Z",
+              "published": "2019-08-02T15:15:00Z",
+              "references": [
+                {
+                  "type": "ARTICLE",
+                  "url": "https://www.djangoproject.com/weblog/2019/aug/01/security-releases/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://docs.djangoproject.com/en/dev/releases/security/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://groups.google.com/forum/#!topic/django-announce/jIoju2-KLDs"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://lists.opensuse.org/opensuse-security-announce/2019-08/msg00006.html"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://seclists.org/bugtraq/2019/Aug/15"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://www.debian.org/security/2019/dsa-4498"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://lists.opensuse.org/opensuse-security-announce/2019-08/msg00025.html"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/STVX7X7IDWAH5SKE6MBMY3TEI6ZODBTK/"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://security.netapp.com/advisory/ntap-20190828-0002/"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://security.gentoo.org/glsa/202004-17"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://github.com/advisories/GHSA-c4qh-4vgv-qc6g"
+                }
+              ],
+              "schema_version": "1.7.3"
+            },
+            {
+              "aliases": [
+                "CVE-2019-14233",
+                "GHSA-h5jv-4p7w-64jg"
+              ],
+              "id": "PYSEC-2019-12",
+              "modified": "2023-11-08T04:01:09.343031Z",
+              "published": "2019-08-02T15:15:00Z",
+              "references": [
+                {
+                  "type": "ARTICLE",
+                  "url": "https://www.djangoproject.com/weblog/2019/aug/01/security-releases/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://docs.djangoproject.com/en/dev/releases/security/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://groups.google.com/forum/#!topic/django-announce/jIoju2-KLDs"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://lists.opensuse.org/opensuse-security-announce/2019-08/msg00006.html"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://seclists.org/bugtraq/2019/Aug/15"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://www.debian.org/security/2019/dsa-4498"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://lists.opensuse.org/opensuse-security-announce/2019-08/msg00025.html"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/STVX7X7IDWAH5SKE6MBMY3TEI6ZODBTK/"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://security.netapp.com/advisory/ntap-20190828-0002/"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://security.gentoo.org/glsa/202004-17"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://github.com/advisories/GHSA-h5jv-4p7w-64jg"
+                }
+              ],
+              "schema_version": "1.7.3"
+            },
+            {
+              "aliases": [
+                "CVE-2019-14234",
+                "GHSA-6r97-cj55-9hrq"
+              ],
+              "id": "PYSEC-2019-13",
+              "modified": "2023-11-08T04:01:09.403667Z",
+              "published": "2019-08-09T13:15:00Z",
+              "references": [
+                {
+                  "type": "ARTICLE",
+                  "url": "https://www.djangoproject.com/weblog/2019/aug/01/security-releases/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://docs.djangoproject.com/en/dev/releases/security/"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://groups.google.com/forum/#!topic/django-announce/jIoju2-KLDs"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://seclists.org/bugtraq/2019/Aug/15"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://www.debian.org/security/2019/dsa-4498"
+                },
+                {
+                  "type": "WEB",
+                  "url": "http://lists.opensuse.org/opensuse-security-announce/2019-08/msg00025.html"
+                },
+                {
+                  "type": "WEB",
+                  "url": "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/STVX7X7IDWAH5SKE6MBMY3TEI6ZODBTK/"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://security.netapp.com/advisory/ntap-20190828-0002/"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://security.gentoo.org/glsa/202004-17"
+                },
+                {
+                  "type": "ADVISORY",
+                  "url": "https://github.com/advisories/GHSA-6r97-cj55-9hrq"
+                }
+              ],
+              "schema_version": "1.7.3"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}

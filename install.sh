@@ -8,7 +8,8 @@
 # Usage:
 #   bash install.sh <REGISTRATION_TOKEN>
 #
-# Supports: Linux (systemd), macOS (launchd)
+# Supports: macOS (launchd). Linux: scripts/install-linux.sh (https://install.orchestratia.com/linux); this script
+# refuses to run there.
 #
 # What this does:
 #   0. Uninstalls any existing agent (clean slate)
@@ -56,6 +57,20 @@ case "$OS_TYPE" in
     Darwin) OS_TYPE="darwin" ;;
     *)      echo "Unsupported OS: $OS_TYPE"; exit 1 ;;
 esac
+
+# This legacy installer is retired on Linux. It pip-installs the agent into the daemon user's ~/.local and hands that
+# user /opt/orchestratia-agent, so root (sudo orchestratia …, the scan-data timer) would run code another account
+# can change. The supported Linux installer keeps the agent's code root-owned.
+if [ "$OS_TYPE" = "linux" ]; then
+    echo ""
+    echo "This installer is no longer used on Linux. Install with:"
+    echo ""
+    echo "  curl -fsSL https://install.orchestratia.com/linux | sudo bash -s -- <REGISTRATION_TOKEN>"
+    echo ""
+    echo "(from a clone of this repository: sudo bash scripts/install-linux.sh <REGISTRATION_TOKEN>)"
+    echo ""
+    exit 1
+fi
 
 LAUNCHD_LABEL="com.orchestratia.agent"
 LAUNCHD_PLIST="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
@@ -848,20 +863,10 @@ else
             sudo chown -R orchestratia:orchestratia "$ORCH_SSH_DIR" 2>/dev/null
             ok "SSH directory configured: ${ORCH_SSH_DIR}"
 
-            # Grant agent user sudo for specific SSH management commands
-            AGENT_SUDOERS="/etc/sudoers.d/orchestratia-agent"
-            cat <<SUDOERS_EOF | sudo tee "$AGENT_SUDOERS" > /dev/null
-# Allow the Orchestratia agent (running as ${RUN_USER}) to manage SSH keys
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/tee /home/orchestratia/.ssh/authorized_keys
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/cat /home/orchestratia/.ssh/authorized_keys
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/mkdir -p /home/orchestratia/.ssh
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/chmod * /home/orchestratia/.ssh*
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/chown * /home/orchestratia/.ssh*
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/sudoers.d/orchestratia
-${RUN_USER} ALL=(ALL) NOPASSWD: /usr/bin/rm -f /etc/sudoers.d/orchestratia
-SUDOERS_EOF
-            sudo chmod 440 "$AGENT_SUDOERS" 2>/dev/null
-            ok "Agent sudoers configured: ${AGENT_SUDOERS}"
+            # The broad sudo rules this installer once wrote let the agent's account become root, so they go. The
+            # root-owned access-grant helper that replaces them is Linux-only: macOS gets no grant sudo rules.
+            sudo rm -f /etc/sudoers.d/orchestratia-agent
+            info "This installer writes no sudo rules for access grants (the old ones let the agent's account become root)"
 
             # Check if sshd is running
             if command -v systemctl >/dev/null 2>&1; then

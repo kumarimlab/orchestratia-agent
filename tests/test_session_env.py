@@ -98,6 +98,124 @@ def test_env_var_name_carries_a_path_not_a_secret():
     assert se.ENV_VAR.endswith("_FILE"), se.ENV_VAR
 
 
+def test_standard_session_gets_a_token_file_path_never_the_token():
+    env, path, delivered = se.session_env("https://hub", "sess-std-123456", "standard", "orcs_std_tok", "")
+    try:
+        assert delivered and path, (env, path)
+        assert env[se.STANDARD_ENV_VAR] == path and se.ENV_VAR not in env, env
+        assert all("orcs_std_tok" not in v for v in env.values()), "the token must never be in env/argv"
+        st = os.stat(path)
+        assert st.st_uid == os.getuid() and st.st_mode & 0o077 == 0, oct(st.st_mode)
+        assert se.read_key_file(path) == "orcs_std_tok"
+    finally:
+        se.clear_session_key(path)
+
+
+def test_standard_session_without_a_token_is_unchanged():
+    env, path, delivered = se.session_env("https://hub", "sess-none", "standard", None, "")
+    assert delivered and path is None
+    assert env == {"ORCHESTRATIA_HUB_URL": "https://hub", "ORCHESTRATIA_SESSION_ID": "sess-none"}, env
+
+
+def test_standard_write_failure_still_starts_the_session():
+    real = se.write_own_session_key
+    se.write_own_session_key = lambda sid, tok: None
+    try:
+        env, path, delivered = se.session_env("https://hub", "sess-fail", "standard", "tok", "")
+        assert delivered and path is None and se.STANDARD_ENV_VAR not in env, env
+    finally:
+        se.write_own_session_key = real
+
+
+def test_restricted_undeliverable_token_refuses_the_session():
+    real = se.write_session_key
+    se.write_session_key = lambda sid, tok, user: None
+    try:
+        env, path, delivered = se.session_env("https://hub", "sess-r", "restricted", "tok", "orcp-x")
+        assert not delivered and path is None and se.ENV_VAR not in env, env
+    finally:
+        se.write_session_key = real
+
+
+def test_clear_session_keys_for_removes_every_file_of_that_session():
+    a = se.write_own_session_key("abcdefabcdef-rest", "t1")
+    b = se.write_own_session_key("abcdefabcdef-rest", "t2")
+    other = se.write_own_session_key("999999999999-x", "t3")
+    try:
+        se.clear_session_keys_for("abcdefabcdef-rest")
+        assert not os.path.exists(a) and not os.path.exists(b) and os.path.exists(other)
+    finally:
+        se.clear_session_key(other)
+
+
+def test_hub_session_start_goes_through_session_env():
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "orchestratia_agent", "hub.py")).read()
+    assert "session_env.session_env(" in src
+    assert 'session_token and privilege_tier == "restricted"' not in src
+    assert src.count("_release_session_keys(state, session_id,") == 2, "both close paths release key files"
+
+
+def test_stopping_daemon_keeps_key_files_of_surviving_sessions():
+    import asyncio
+    from orchestratia_agent import hub
+    class St: running = True
+    path = se.write_own_session_key("survivor-12345678", "t")
+    try:
+        st = St()
+        st.running = False  # SIGTERM: handle_signal sets it before readers' finally runs _on_close
+        hub._release_session_keys(st, "survivor-12345678", None)
+        assert os.path.exists(path), "a graceful stop must not delete surviving sessions' key files"
+        st.running = True   # an explicit close / the session really ended
+        hub._release_session_keys(st, "survivor-12345678", None)
+        assert not os.path.exists(path)
+    finally:
+        se.clear_session_key(path)
+
+
+def test_cleanup_sessions_from_running_state_keeps_surviving_key_files():
+    """The crash path: cleanup_sessions runs while state.running is still True. The real stop sequence
+    cancels each reader, whose finally releases keys; the survivors' files must still exist."""
+    import asyncio
+    from orchestratia_agent import hub
+
+    class Backend:
+        def supports_persistence(self): return True
+        def close_handle(self, h): pass
+
+    class Sess:
+        tmux_name = "orc-x"
+        handle = object()
+        reader_task = None
+
+    class St:
+        running = True
+        backend = Backend()
+        active_sessions = {}
+
+    path = se.write_own_session_key("crashsess-1234567", "t")
+
+    async def run():
+        st = St()
+        st.active_sessions = {}
+        async def reader():
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                hub._release_session_keys(st, "crashsess-1234567", None)
+        sess = Sess()
+        sess.reader_task = asyncio.ensure_future(reader())
+        st.active_sessions["crashsess-1234567"] = sess
+        await asyncio.sleep(0)
+        await hub.cleanup_sessions(st)
+        await asyncio.sleep(0.05)  # let the cancelled reader's finally run
+    try:
+        asyncio.run(run())
+        assert os.path.exists(path), "cleanup_sessions on a crash deleted a surviving session's key file"
+    finally:
+        se.clear_session_key(path)
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

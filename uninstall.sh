@@ -279,6 +279,50 @@ else
     skip "${RUN_DIR}"
 fi
 
+# Access grants to this server: once the agent is gone nothing revokes them, so every grant key goes now, through the
+# root-owned helper (root never edits /home/orchestratia itself: that user could point .ssh anywhere, /root/.ssh
+# included). Then the account is expired: sshd refuses an expired account for key logins too (PAM account check, and
+# sshd's own check without PAM), which also covers keys the helper couldn't remove or that were added by hand.
+# `usermod -L` is not enough (with PAM a locked password doesn't stop key logins) and can't be undone cleanly; the
+# account isn't deleted (the uid stays reserved, nothing under its home is removed as root). Expiry day 1 is the
+# marker the installer lifts on a reinstall.
+# >>> revoke_grant_keys
+revoke_grant_keys() {
+    local helper="$1" ids id n=0
+    [ -x "$helper" ] || return 1
+    ids="$(cd / && sudo "$helper" status | python3 -I -c 'import json, sys; print("\n".join(json.load(sys.stdin).get("keys") or {}))' 2>/dev/null)" || return 1
+    for id in $ids; do
+        sudo "$helper" remove-key "$id" >/dev/null || return 1
+        n=$((n + 1))
+    done
+    echo "$n"
+}
+# <<< revoke_grant_keys
+
+GRANT_HELPER="/usr/local/libexec/orchestratia/grant-helper"
+if [ "$OS_TYPE" = "linux" ] && id orchestratia >/dev/null 2>&1; then
+    if N_KEYS="$(revoke_grant_keys "$GRANT_HELPER")"; then
+        ok "Removed ${N_KEYS} access-grant key(s)"
+    else
+        warn "Could not remove the access-grant keys through ${GRANT_HELPER} (expiring the account instead)"
+    fi
+    if sudo usermod -e 1 orchestratia 2>/dev/null; then
+        ok "Expired the orchestratia account: access-grant logins are refused"
+    else
+        warn "Could not expire the orchestratia account — run: sudo usermod -e 1 orchestratia"
+    fi
+fi
+
+# The scan launcher, the access-grant helper, their sudoers rules, the elevated-grant rule and policy, and the
+# broad rules older installers wrote.
+for f in /etc/sudoers.d/orchestratia-scan /usr/local/libexec/orchestratia/scan-launch \
+         /etc/sudoers.d/orchestratia-grant /usr/local/libexec/orchestratia/grant-helper \
+         /etc/sudoers.d/orchestratia-agent /etc/sudoers.d/orchestratia /etc/orchestratia-grants.conf; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+        if sudo rm -f "$f" 2>/dev/null; then ok "Removed $f"; else warn "Could not remove $f"; fi
+    fi
+done
+
 # ── Summary ─────────────────────────────────────────────────────────
 
 echo ""

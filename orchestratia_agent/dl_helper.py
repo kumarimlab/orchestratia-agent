@@ -31,9 +31,15 @@ import os
 import re
 import stat as st
 import sys
+import tarfile
 import time
 import unicodedata
 import zipfile
+
+try:
+    import pwd
+except ImportError:          # Windows: no passwd database
+    pwd = None
 
 try:
     import fcntl
@@ -43,7 +49,7 @@ except ImportError:          # Windows imports this module for its pure helpers 
 # 2 = upload ops. Downloads accept any protocol >= 1, so a host whose installed
 # restricted helper has not been refreshed yet keeps downloading.
 PROTOCOL = 2
-OPS = ["stat", "read", "zip", "ul-prepare", "ul-write", "ul-cancel", "ul-sweep"]
+OPS = ["stat", "read", "zip", "ul-prepare", "ul-write", "ul-cancel", "ul-sweep", "snap"]
 CHUNK = 256 * 1024
 WALK_SECONDS = 5.0
 WALK_MAX_ENTRIES = 200_000
@@ -273,6 +279,291 @@ def cmd_zip(path, cwd):
                         "These entries could not be read by this session's user and were left out:\n"
                         + "\n".join(sorted(skipped)) + "\n")
     out.flush()
+
+
+SNAP_MAX_BYTES = 2 * 1024 ** 3
+SNAP_MAX_ENTRIES = 200_000
+# Credential directories are excluded where they live in practice: directly inside a home
+# directory (~/.ssh, ~/.claude, ...). Inside a repository the same names are ordinary project
+# files (.claude/settings.json is exactly what code.agent must see), so they are archived;
+# masking and code.secrets handle anything secret in them.
+SNAP_CRED_DIRS = {".ssh", ".gnupg", ".aws", ".kube", ".docker", ".claude", ".orchestratia"}
+# Files that only ever hold credentials: never archived, wherever they are.
+SNAP_CRED_FILES = {".credentials.json", ".netrc", ".git-credentials"}
+SNAP_HEAVY_DIRS = {"node_modules", ".venv", "venv", "target", "dist", "build", ".next", "__pycache__"}
+# code.deps (--deps-only) streams the files a dependency scanner reads, matched broadly: osv-scanner
+# decides what it understands, and an exact-name list left requirements-prod.txt, Pipfile, *.csproj,
+# packages.config, build.gradle, bun.lock ... out (the run said done with nothing scanned). Over-
+# including costs only bytes. build/, dist/ and target/ are ordinary source dirs in many projects,
+# so deps mode descends into them; node_modules and virtualenvs stay out (their lockfiles cover them).
+SNAP_MANIFEST_NAMES = {"requirements.txt", "requirements-dev.txt", "Pipfile", "Pipfile.lock", "pyproject.toml",
+                       "pylock.toml", "setup.py", "setup.cfg", "environment.yml", "package.json", "package-lock.json",
+                       "npm-shrinkwrap.json", "pnpm-lock.yaml", "deno.lock", "deno.json", "go.mod", "go.sum", "go.work",
+                       "go.work.sum", "Cargo.toml", "Gemfile", "gems.locked", "composer.json", "pom.xml",
+                       "build.gradle", "build.gradle.kts", "verification-metadata.xml", "packages.config",
+                       "packages.lock.json", "project.assets.json", "Directory.Packages.props", "paket.dependencies",
+                       "pubspec.yaml", "Package.resolved", "Package.swift", "cabal.project.freeze", "vcpkg.json",
+                       "mix.exs", "conanfile.txt", "renv.lock", "DESCRIPTION"}
+SNAP_MANIFEST_SUFFIXES = (".lock", ".lockb", ".lockfile", ".locked", ".csproj", ".fsproj", ".vbproj",
+                          ".deps.json", ".cdx.json", ".spdx.json", ".spdx", ".cdx.xml", ".gemspec")
+SNAP_DEPS_SKIP_DIRS = {"node_modules", ".venv", "venv", "__pycache__", ".next"}
+SNAP_INCLUDES_MAX = 500
+_REQ_INCLUDE = re.compile(r"^\s*(?:-r|-c|--requirement|--constraint)(?:\s*=\s*|\s+)(\S+)")
+
+
+def _is_requirements(rel_parts, name):
+    low = name.lower()
+    return low.endswith((".txt", ".in")) and (
+        "requirements" in low or "constraints" in low or any("requirements" in p.lower() for p in rel_parts[-1:]))
+
+
+def _is_manifest(rel_parts, name):
+    return (name in SNAP_MANIFEST_NAMES or name.lower().endswith(SNAP_MANIFEST_SUFFIXES)
+            or _is_requirements(rel_parts, name))
+
+
+def _home_dirs():
+    try:
+        return {os.path.realpath(e.pw_dir) for e in pwd.getpwall() if e.pw_dir}
+    except Exception:
+        return {os.path.realpath(os.path.expanduser("~"))}
+
+
+def _snap_skip_dir(parent_real, rel_dir, name, excludes, homes, deps_only=False):
+    """Skip a directory while walking: heavy dirs, --exclude names, a credential dir sitting
+    directly inside a home directory, and .config/orchestratia anywhere."""
+    if name in (SNAP_DEPS_SKIP_DIRS if deps_only else SNAP_HEAVY_DIRS) or name in excludes or name in SNAP_CRED_FILES:
+        return True
+    if name in SNAP_CRED_DIRS and parent_real in homes:
+        return True
+    return _has_cred_pair(os.path.join(rel_dir, name).split(os.sep))
+
+
+def _has_cred_pair(parts):
+    """True when ".config","orchestratia" appear as consecutive path components."""
+    return any(a == ".config" and b == "orchestratia" for a, b in zip(parts, parts[1:]))
+
+
+def _is_cred_path(real, homes):
+    """PATH is, or is inside, a credential dir sitting directly in a home dir, or inside
+    .config/orchestratia, or a credentials-only file name."""
+    parts = real.split(os.sep)
+    for i in range(1, len(parts)):
+        if parts[i] in SNAP_CRED_DIRS and (os.sep.join(parts[:i]) or os.sep) in homes:
+            return True
+    return any(c in SNAP_CRED_FILES for c in parts) or _has_cred_pair(parts)
+
+
+def _is_home_ancestor(real, homes):
+    """PATH is a proper ancestor of some home directory (e.g. /home): scanning it reads homes."""
+    prefix = real.rstrip(os.sep) + os.sep
+    return any(h != real and h.startswith(prefix) for h in homes)
+
+
+# Never snapshotted, whatever the session's directory says (adversarial review L4): system trees
+# and Orchestratia's own install, state and config — nor any directory that contains one. A
+# standard-tier snapshot is read as the daemon's user (root), outside the sandbox.
+SNAP_REFUSED_TREES = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/boot",
+                      "/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/orchestratia", "/var/lib/private",
+                      "/var/lib/orc-scan", "/opt/orchestratia", "/opt/orchestratia-agent", "/opt/orchestratia-venv")
+_O_SNAP = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+
+
+def _is_system_path(real):
+    prefix = real.rstrip("/") + "/"
+    return any(real == t or real.startswith(t + "/") or t.startswith(prefix) for t in SNAP_REFUSED_TREES)
+
+
+def _fd_path(fd, fallback):
+    """Where an open directory really is (Linux /proc), else the path it was opened by."""
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return fallback
+
+
+def _open_beneath(dirfd, rel, flags=_O_SNAP):
+    """Open rel below dirfd one component at a time, never following a symlink on the way."""
+    parts = [c for c in rel.split(os.sep) if c not in ("", ".")]
+    if not parts or ".." in parts:
+        raise OSError(errno.EINVAL, "bad path")
+    fd = os.dup(dirfd)
+    try:
+        for c in parts[:-1]:
+            nfd = os.open(c, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | _DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return os.open(parts[-1], flags, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def _tarinfo(arc, s, linkname=""):
+    ti = tarfile.TarInfo(arc)
+    ti.mode, ti.mtime = st.S_IMODE(s.st_mode), int(s.st_mtime)
+    ti.uid = ti.gid = 0
+    ti.uname = ti.gname = ""
+    if st.S_ISDIR(s.st_mode):
+        ti.type = tarfile.DIRTYPE
+    elif st.S_ISLNK(s.st_mode):
+        ti.type, ti.linkname = tarfile.SYMTYPE, linkname
+    else:
+        ti.size = s.st_size
+    return ti
+
+
+class _Budget:
+    """The snapshot caps. The size counted is always the fstat of the open file that is streamed
+    (L1: counting one lstat and streaming another let a 3 GiB file pass as 1 byte)."""
+
+    def __init__(self, max_entries):
+        self.entries, self.total, self.max_entries = 0, 0, max_entries
+
+    def take(self, size):
+        self.entries += 1
+        self.total += size
+        if self.entries > self.max_entries or self.total > SNAP_MAX_BYTES:
+            sys.stdout.buffer.flush()
+            os._exit(3)
+
+
+def _add_regular(tf, budget, dirfd, name, arc):
+    """Archive one regular file: open (no symlink), fstat the fd, count, stream exactly that size.
+    False when it isn't a readable regular file."""
+    try:
+        fd = os.open(name, _O_SNAP, dir_fd=dirfd)
+    except OSError:
+        return False
+    return _add_fd(tf, budget, fd, arc)
+
+
+def _add_fd(tf, budget, fd, arc):
+    """Archive the open file fd (closes it)."""
+    with os.fdopen(fd, "rb") as fh:
+        s = os.fstat(fh.fileno())
+        if not st.S_ISREG(s.st_mode):
+            return False
+        budget.take(s.st_size)
+        tf.addfile(_tarinfo(arc, s), fh)
+    return True
+
+
+def cmd_snap(path, cwd, deps_only=False, excludes=()):
+    """A repo as an uncompressed tar stream, for a sandboxed scan (spec 7.3-7.4).
+
+    Runs AS THE SESSION'S USER, so it reads exactly what that user can read. Never
+    follows a symlink (a link is archived as a link; the sandbox's `data` extraction
+    filter refuses links that leave the tree), skips special files, never archives
+    credential directories that sit in a home directory or credentials-only files,
+    refuses `/`, home directories themselves and their ancestors, system trees and
+    Orchestratia's own directories. The walk is fd-based (os.fwalk + openat with
+    O_NOFOLLOW): a directory swapped for a symlink after it was listed is skipped, not
+    followed (M11)."""
+    p = _resolve(path, cwd)
+    real = os.path.realpath(p)
+    homes = _home_dirs()
+    if real == "/":
+        _fail("refused_root")
+    if real in homes or _is_home_ancestor(real, homes):
+        _fail("refused_home")
+    if _is_cred_path(real, homes):
+        _fail("refused_cred")
+    if _is_system_path(real):
+        _fail("refused_system")
+    try:
+        topfd = os.open(real, os.O_RDONLY | _DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as e:
+        if e.errno in (errno.ENOTDIR, errno.ELOOP):
+            _fail("not_dir")
+        _fail(_err_code(e))
+    if _fd_path(topfd, real) != real:                     # moved between the check and the open
+        _fail("not_found")
+    max_entries = SNAP_MAX_ENTRIES
+    # Test hook. -I does not drop ordinary environment variables, but the helper's environment
+    # is set by the daemon (root) through sudo, so only root can lower the cap. Ignored unless
+    # it is a positive integer; it can only LOWER the cap.
+    try:
+        lowered = int(os.environ.get("ORC_SNAP_MAX_ENTRIES_FOR_TEST", ""))
+        if 0 < lowered < max_entries:
+            max_entries = lowered
+    except ValueError:
+        pass
+    excludes = set(excludes)
+    _header({"ok": True, "status": 200, "name": "snapshot.tar"})
+    out = _Counting(sys.stdout.buffer)
+    budget = _Budget(max_entries)
+    archived, pending = set(), []
+    with tarfile.open(fileobj=out, mode="w|", format=tarfile.PAX_FORMAT) as tf:
+        for root, dirs, files, rootfd in os.fwalk(".", dir_fd=topfd, follow_symlinks=False):
+            rel_root = os.path.normpath(root)
+            rel_root = "" if rel_root == "." else rel_root
+            rel_parts = rel_root.split(os.sep) if rel_root else []
+            root_real = _fd_path(rootfd, os.path.join(real, rel_root))
+            dirs[:] = [d for d in dirs if not _snap_skip_dir(root_real, rel_root, d, excludes, homes, deps_only)]
+            for name in dirs + files:
+                arc = os.path.join(rel_root, name).replace(os.sep, "/")
+                if name in SNAP_CRED_FILES or (name == "orchestratia" and os.path.basename(root_real) == ".config"):
+                    continue                                     # e.g. a .netrc FILE, a .config/orchestratia FILE
+                try:
+                    ls = os.stat(name, dir_fd=rootfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if st.S_ISREG(ls.st_mode):
+                    if deps_only and not _is_manifest(rel_parts, name):
+                        continue
+                    if _add_regular(tf, budget, rootfd, name, arc):
+                        archived.add(arc)
+                        if deps_only and _is_requirements(rel_parts, name):
+                            pending.append(arc)
+                elif deps_only or not (st.S_ISDIR(ls.st_mode) or st.S_ISLNK(ls.st_mode)):
+                    continue                                     # FIFO, socket, device; deps: files only
+                else:
+                    try:
+                        link = os.readlink(name, dir_fd=rootfd) if st.S_ISLNK(ls.st_mode) else ""
+                    except OSError:
+                        continue
+                    budget.take(0)
+                    tf.addfile(_tarinfo(arc, ls, link))
+        if deps_only:
+            _snap_includes(tf, topfd, real, pending, archived, homes, budget)
+    os.close(topfd)
+    out.flush()
+
+
+def _snap_includes(tf, topfd, top_real, pending, archived, homes, budget):
+    """Deps mode: add the files requirements files pull in (-r/-c/--requirement/--constraint), so
+    osv-scanner can follow them. Only regular files inside the repository, opened component by
+    component with no symlink on the way, never a credentials path; at most SNAP_INCLUDES_MAX,
+    counted against the same caps."""
+    added = 0
+    while pending and added < SNAP_INCLUDES_MAX:
+        arc = pending.pop(0)
+        try:
+            with os.fdopen(_open_beneath(topfd, arc), "rb") as fh:
+                text = fh.read(1024 * 1024).decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = _REQ_INCLUDE.match(line)
+            if not m or "://" in m.group(1):
+                continue
+            rel = os.path.normpath(os.path.join(os.path.dirname(arc), m.group(1)))
+            parts = rel.split(os.sep)
+            if rel.startswith("..") or os.path.isabs(rel) or rel in archived:
+                continue
+            if (_is_cred_path(os.path.join(top_real, rel), homes) or any(c in SNAP_CRED_FILES for c in parts)
+                    or _has_cred_pair(parts)):
+                continue
+            try:
+                fd = _open_beneath(topfd, rel)
+            except OSError:
+                continue
+            if _add_fd(tf, budget, fd, rel.replace(os.sep, "/")):
+                archived.add(rel)
+                pending.append(rel)
+                added += 1
+            if added >= SNAP_INCLUDES_MAX:
+                break
 
 
 # ── Uploads ──────────────────────────────────────────────────────────────────
@@ -936,7 +1227,19 @@ UPLOAD_OPS = {"ul-prepare": cmd_ul_prepare, "ul-write": cmd_ul_write,
               "ul-cancel": cmd_ul_cancel, "ul-sweep": cmd_ul_sweep}
 
 
+def _not_dumpable():
+    """prctl(PR_SET_DUMPABLE, 0): the helper runs as the session's uid, and any process of that uid
+    could open /proc/<pid>/fd/1 and write its own stream into the scan or download (M3). A
+    non-dumpable process's /proc/<pid>/fd belongs to root. Best effort, Linux only."""
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)
+    except Exception:
+        pass
+
+
 def main(argv=None):
+    _not_dumpable()
     ap = argparse.ArgumentParser(prog="dl-helper")
     sub = ap.add_subparsers(dest="op", required=True)
     for op in ("stat", "read", "zip"):
@@ -945,6 +1248,11 @@ def main(argv=None):
         p.add_argument("--range", default=None)
         p.add_argument("--if-range", default=None)
         p.add_argument("path")
+    sp = sub.add_parser("snap")
+    sp.add_argument("--cwd", default="")
+    sp.add_argument("--deps-only", action="store_true")
+    sp.add_argument("--exclude", action="append", default=[])
+    sp.add_argument("path")
     for op in UPLOAD_OPS:
         sub.add_parser(op).add_argument("--base", required=True)
     a = ap.parse_args(argv)
@@ -955,6 +1263,9 @@ def main(argv=None):
         return
     if "\x00" in a.path:
         _fail("invalid")
+    if a.op == "snap":
+        cmd_snap(a.path, a.cwd, a.deps_only, [e for e in a.exclude if e and "/" not in e and e not in (".", "..")])
+        return
     if a.op == "stat":
         cmd_stat(a.path, a.cwd)
     elif a.op == "read":

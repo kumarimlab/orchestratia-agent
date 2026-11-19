@@ -33,11 +33,12 @@ private) which is the coordination backend + dashboard.
 
 ## Deploy / propagation (Linux)
 
-- `/opt/orchestratia-agent` is a **git checkout on `main`**; the Python package
-  is pip-installed to `~/.local/lib/python3.12/site-packages/orchestratia_agent/`.
-- `orchestratia update` = `git fetch` + `git reset --hard origin/main` in
-  `/opt` (refreshes hooks + skills in place) **and** a pip reinstall (refreshes
-  the package). Then `sudo systemctl restart orchestratia-agent`.
+- `/opt/orchestratia-agent` (assets: skills, hooks) and `/opt/orchestratia-venv` (the package) are **root's**:
+  root runs this code (`sudo orchestratia …`, the scan-data timer), so no other account may change it.
+- `sudo orchestratia update` (root only) clones fresh, upgrades the venv (rebuilds it when it isn't root's alone),
+  swaps the asset tree, then runs the new `orchestratia-agent secure-install`. Then
+  `sudo systemctl restart orchestratia-agent`. From 0.34 or older run the update TWICE before restarting (the
+  first run is the old updater); until then removals fall back to the old sudo rules (`ssh_setup._legacy_helper`).
 - A daemon restart drops any local orchestrator's native MCP tools until the
   loopback MCP route is re-pinned.
 

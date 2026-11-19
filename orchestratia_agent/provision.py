@@ -45,7 +45,10 @@ SENSITIVE_ENTRIES = (".ssh", ".gnupg", ".aws", ".kube",
                      os.path.join(".docker", "config.json"),
                      os.path.join(".claude", ".credentials.json"),
                      os.path.join(".orchestratia", "ssh_keys"))
-ORCHESTRATIA_PATHS = ("/opt/orchestratia-agent", "/opt/orchestratia-venv")
+# /opt/orchestratia holds the scanner pack, which runs in every tenant's scan sandbox; a project
+# user granted it could change what every other tenant's scan executes (adversarial review L3).
+ORCHESTRATIA_PATHS = ("/opt/orchestratia-agent", "/opt/orchestratia-venv", "/opt/orchestratia",
+                      "/var/lib/orchestratia")
 
 RESERVED_USERS = {"root", "daemon", "bin", "sys", "adm", "sudo", "docker"}
 
@@ -245,7 +248,13 @@ def install_dl_helper(target: str | None = None, python: str | None = None, veri
     Root-owned and writable by nobody else: sudo runs this file AS a project user, so
     a writable copy would let its writer run code as every project user. The shebang
     pins this box's python3 in isolated mode (-I). Verified by running it — a helper
-    that can't start would turn every restricted download into a cryptic failure."""
+    that can't start would turn every restricted download into a cryptic failure. As root it first refuses
+    when this agent's own code isn't root's alone (hardening plan Task 3)."""
+    from orchestratia_agent import codetrust
+    # The code roots AND the dir dl_helper.py is copied from: an editable (.pth) install's package lives outside
+    # the venv, so the venv check alone wouldn't cover what root copies.
+    codetrust.require_trusted("install the download helper",
+                              roots=codetrust.code_roots() + [os.path.dirname(os.path.abspath(__file__))])
     import json as _json
     import subprocess
     import tempfile

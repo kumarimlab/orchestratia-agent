@@ -9,6 +9,7 @@ CI instead of by an adversarial reviewer, or by a customer.
 
   tier_bounded   — runs at the tier of the session it names
   no_execution   — moves data or state; executes nothing on the host
+  sandboxed      — runs only inside a per-run systemd sandbox
   unconfined     — runs as the daemon user by design; MUST be unreachable from
                    a session-scoped credential
 """
@@ -16,6 +17,7 @@ CI instead of by an adversarial reviewer, or by a customer.
 TIER_BOUNDED = "tier_bounded"
 NO_EXECUTION = "no_execution"
 UNCONFINED = "unconfined"
+SANDBOXED = "sandboxed"   # runs only inside a per-run systemd sandbox; the daemon streams bytes in/out
 
 PRIVILEGE_CLASSIFICATION = {
     # Session lifecycle — the tier is chosen by the hub and enforced at spawn.
@@ -103,6 +105,14 @@ PRIVILEGE_CLASSIFICATION = {
 
     # Scanning.
     "scan_architecture": UNCONFINED,
+    # Security scans (spec 2026-11-16 §7). Scan content executes only inside a DynamicUser
+    # systemd unit with no network. The READ is tier-bounded, not sandboxed: dl-helper
+    # reads the snapshot at the session's tier, outside the sandbox — as the daemon's
+    # own user (root) for a standard session. So the runner pins the user and directory
+    # to the daemon's live session (never a wider one from the message), and dl-helper
+    # refuses /, homes, credential dirs, system trees and Orchestratia's own paths.
+    "scan_run": SANDBOXED,
+    "scan_cancel": SANDBOXED,
 
     # code-server editor. start spawns code-server AS the project's restricted
     # OS user (kernel-bounded to that tier, Spec A) — tier_bounded, not

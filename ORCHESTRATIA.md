@@ -248,10 +248,18 @@ Use `orchestratia grants --json` for machine-readable output.
 To upgrade to the latest version, use the built-in CLI command:
 
 ```bash
-orchestratia update
+sudo orchestratia update
 ```
 
-This will pull the latest code from GitHub and reinstall the package. On Linux (installed via `install.sh`), it does `git pull` + `pip reinstall` from `/opt/orchestratia-agent`. On macOS, it does `pip install --upgrade` from GitHub.
+On Linux it clones the agent fresh and upgrades the root-owned venv in `/opt/orchestratia-venv` (root runs this code, so it runs as root). On macOS: `brew upgrade orchestratia-agent`.
+
+**Coming from 0.34 or older (Linux): run it twice, then restart.** The first run is still the old updater: it installs the new code but not its root-owned pieces. The second run secures the install, removes the old broad sudo rules and installs the access-grant helper. On servers with restricted sessions the first run prints a red `tier: refresh failed (refusing to install the download helper…)` line; that is expected, and the second run fixes it.
+
+```bash
+sudo orchestratia update && sudo orchestratia update && sudo systemctl restart orchestratia-agent
+```
+
+Until the second run, the server is half-upgraded: revoking an access grant still works, but new grants and elevated access don't, and the log says "finish the upgrade".
 
 **Do NOT run** `pip3 install --upgrade orchestratia-agent` — the package is not on PyPI.
 

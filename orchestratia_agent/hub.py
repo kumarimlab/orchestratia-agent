@@ -95,6 +95,31 @@ def _editor_capability() -> dict | None:
             "version": code_server_install.VERSION}
 
 
+def _scanners_capability():
+    try:
+        from orchestratia_agent.scanning import pack
+        return pack.capability()
+    except Exception:
+        return {"scans": [], "sandbox": {"ok": False, "reason": "scanner pack unavailable"}}
+
+
+_SCAN_RUNNER = None
+
+
+def _scan_runner(state):
+    global _SCAN_RUNNER
+    if _SCAN_RUNNER is None:
+        from orchestratia_agent.scanning.runner import HubClient, ScanRunner
+        from orchestratia_agent.tls import httpx_verify
+        base = state.hub_url.replace("wss://", "https://").replace("ws://", "http://")
+        if base.endswith("/ws/server"):
+            base = base[: -len("/ws/server")]
+        _SCAN_RUNNER = ScanRunner(HubClient(base, state.api_key, httpx_verify(state=state)), _tier_config(state),
+                                  send=lambda msg: ws_send(state, msg),
+                                  sessions=lambda sid: state.active_sessions.get(sid))
+    return _SCAN_RUNNER
+
+
 def _tier_config(state):
     """Tier config, resolving lazily if startup has not set it yet.
 
@@ -186,6 +211,7 @@ async def register_with_hub(
         return None
 
     try:
+        scanners = await asyncio.to_thread(_scanners_capability)      # systemctl + file reads: off the loop
         payload = {
             "name": state.config.get("server_name", platform.node()),
             "hostname": platform.node(),
@@ -198,7 +224,7 @@ async def register_with_hub(
             "mac_address": get_mac_address(),
             "capabilities": privilege.merge_capabilities(
                 state.config.get("capabilities"), _tier_config(state), _editor_capability()
-            ),
+            ) | {"scanners": scanners},
         }
 
         resp = await client.post(
@@ -242,6 +268,7 @@ async def register_with_hub(
 async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
     """Send a heartbeat with system stats to the hub."""
     try:
+        scanners = await asyncio.to_thread(_scanners_capability)      # systemctl + file reads: off the loop
         resp = await client.post(
             f"{state.hub_url}/api/v1/servers/heartbeat",
             json={
@@ -250,7 +277,7 @@ async def send_heartbeat(client: httpx.AsyncClient, state: DaemonState) -> bool:
                 # the next heartbeat rather than needing a re-registration.
                 "capabilities": privilege.merge_capabilities(
                     state.config.get("capabilities"), _tier_config(state), _editor_capability()
-                ),
+                ) | {"scanners": scanners},
             },
             headers={"X-API-Key": state.api_key},
         )
@@ -732,6 +759,48 @@ def _inject_escape(session: "ManagedSession"):
         session.write_input(b"\x1b")
 
 
+_BOX_TOP = "\u2554" + "\u2550" * 54 + "\u2557"
+_BOX_BOTTOM = "\u255a" + "\u2550" * 54 + "\u255d"
+_TERM_CTRL = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b.?|[\x00-\x1f\x7f-\x9f]")
+
+
+def _box_text(value, n: int) -> str:
+    """A pushed string as one plain line for a notification box: escape sequences and control characters
+    (C0, C1 — line breaks included) dropped, then cut to n characters."""
+    return _TERM_CTRL.sub("", value if isinstance(value, str) else "")[:n]
+
+
+def _task_label(msg: dict, n: int) -> str:
+    """How a notification box names a pushed task. The box is written to the session's pane — Claude's input — so
+    a title the hub marks untrusted (a task filed from a security finding: scanner-derived text) is never written;
+    the task key and "security finding" are."""
+    if "title" in (msg.get("untrusted_fields") or []):
+        ref = _box_text(msg.get("key"), 24) or "#" + _box_text(msg.get("task_id"), 8)
+        return f"{ref} (security finding)"
+    return '"' + _box_text(msg.get("title"), n) + '"'
+
+
+def _pending_approval_notice(msg: dict) -> str:
+    task_id = _box_text(msg.get("task_id"), 8)
+    return (
+        f"\r\n\033[38;2;212;114;47m{_BOX_TOP}\r\n"
+        f"\u2551  ORCHESTRATIA: Task pending approval                 \u2551\r\n"
+        f"\u2551  #{task_id}: {_task_label(msg, 40)}                     \r\n"
+        f"\u2551  Waiting for admin to approve before starting...      \r\n"
+        f"{_BOX_BOTTOM}\033[0m\r\n"
+    )
+
+
+def _rejected_notice(msg: dict) -> str:
+    return (
+        f"\r\n\033[38;2;220;50;50m{_BOX_TOP}\r\n"
+        f"\u2551  ORCHESTRATIA: Task rejected by admin                 \u2551\r\n"
+        f"\u2551  {_task_label(msg, 45)}                                       \r\n"
+        f"\u2551  Reason: {_box_text(msg.get('reason') or 'No reason given', 40)}                                \r\n"
+        f"{_BOX_BOTTOM}\033[0m\r\n"
+    )
+
+
 def _inject_task_trigger(state: "DaemonState", session: "ManagedSession", task_id: str):
     """Inject a user prompt into the session to trigger task pickup."""
     message = (
@@ -755,7 +824,7 @@ async def ws_receive_loop(ws, state: DaemonState):
     def _on_session_close(session_id: str):
         session = state.active_sessions.pop(session_id, None)
         # A secret must not outlive the session it was issued for.
-        session_env.clear_session_key(getattr(session, "key_file", None))
+        _release_session_keys(state, session_id, session)
         # Trigger architecture scan if session had a working directory
         if session and hasattr(session, 'working_directory') and session.working_directory:
             project_id = getattr(session, 'project_id', '') or ''
@@ -796,36 +865,28 @@ async def ws_receive_loop(ws, state: DaemonState):
                     # key sat readable by every local account for 14 weeks
                     # exactly this way.
                     #
-                    # standard   -> nothing to deliver: the session runs as the
-                    #               daemon's user and the CLI reads config.yaml
-                    #               (0600, same owner) itself.
+                    # standard   -> since 0.35.0 its own session token goes to a
+                    #               0600 file of the daemon user; only the PATH
+                    #               travels in argv.
                     # restricted -> runs as a different user that cannot read
                     #               config.yaml, so its scoped token goes to a
                     #               0600 file ACL'd to that user, and only the
                     #               PATH travels in argv.
-                    env_vars = {
-                        "ORCHESTRATIA_HUB_URL": state.hub_url,
-                        "ORCHESTRATIA_SESSION_ID": session_id,
-                    }
-                    key_file = None
-                    session_token = msg.get("session_token")
-                    if session_token and privilege_tier == "restricted":
-                        run_as = _priv_user_for(state, privilege_tier, project_id)
-                        key_file = session_env.write_session_key(
-                            session_id, session_token, run_as or "")
-                        if key_file:
-                            env_vars[session_env.ENV_VAR] = key_file
-                        else:
-                            log.error(
-                                f"Refusing session {session_id[:8]}: could not "
-                                f"deliver its scoped key without putting it in argv"
-                            )
-                            await ws_send(state, {
-                                "type": "session_error",
-                                "session_id": session_id,
-                                "error": "could not deliver session credential securely",
-                            })
-                            continue
+                    env_vars, key_file, delivered = session_env.session_env(
+                        state.hub_url, session_id, privilege_tier, msg.get("session_token"),
+                        (_priv_user_for(state, privilege_tier, project_id) or "")
+                        if privilege_tier == "restricted" else "")
+                    if not delivered:
+                        log.error(
+                            f"Refusing session {session_id[:8]}: could not "
+                            f"deliver its scoped key without putting it in argv"
+                        )
+                        await ws_send(state, {
+                            "type": "session_error",
+                            "session_id": session_id,
+                            "error": "could not deliver session credential securely",
+                        })
+                        continue
 
                     handle = backend.spawn(
                         session_id, working_dir, cols, rows,
@@ -985,16 +1046,9 @@ async def ws_receive_loop(ws, state: DaemonState):
                 session = state.active_sessions.get(target_session_id)
                 if session and not session.closed:
                     if pending_approval:
-                        # Show notification only — wait for admin approval
-                        notification = (
-                            f"\r\n\033[38;2;212;114;47m"
-                            f"\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\r\n"
-                            f"\u2551  ORCHESTRATIA: Task pending approval                 \u2551\r\n"
-                            f"\u2551  #{task_id[:8]}: \"{title[:40]}\"                     \r\n"
-                            f"\u2551  Waiting for admin to approve before starting...      \r\n"
-                            f"\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"
-                            f"\033[0m\r\n"
-                        )
+                        # Show notification only — wait for admin approval. The box is written to the pane's
+                        # input, so a title the hub marks untrusted is never in it (final review I4).
+                        notification = _pending_approval_notice(msg)
                         session.write_notification(notification)
                         log.info(f"Task #{task_id[:8]} pending approval, notification shown in session {target_session_id[:8]}")
                     elif require_plan:
@@ -1025,15 +1079,7 @@ async def ws_receive_loop(ws, state: DaemonState):
                 title = msg.get("title", "Unknown")
                 session = state.active_sessions.get(session_id)
                 if session and not session.closed:
-                    notification = (
-                        f"\r\n\033[38;2;220;50;50m"
-                        f"\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\r\n"
-                        f"\u2551  ORCHESTRATIA: Task rejected by admin                 \u2551\r\n"
-                        f"\u2551  \"{title[:45]}\"                                       \r\n"
-                        f"\u2551  Reason: {reason[:40]}                                \r\n"
-                        f"\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"
-                        f"\033[0m\r\n"
-                    )
+                    notification = _rejected_notice(msg)
                     session.write_notification(notification)
                     log.info(f"Task '{title}' rejected, notification sent to session {session_id[:8]}")
 
@@ -1284,54 +1330,16 @@ async def ws_receive_loop(ws, state: DaemonState):
             # them on the default thread executor — subprocess.run inside
             # a worker thread is the standard Python pattern.
             elif msg_type == "setup_ssh_access":
-                # Target role: add public key to orchestratia user
-                from orchestratia_agent.ssh_setup import setup_authorized_key, setup_sudoers
-                grant_id = msg.get("grant_id", "")
-                pub_key = msg.get("ssh_public_key", "")
-                priv_level = msg.get("privilege_level", "standard")
-                if grant_id and pub_key:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        None, setup_authorized_key, pub_key, grant_id, priv_level,
-                    )
-                    if priv_level == "elevated":
-                        await loop.run_in_executor(None, setup_sudoers, priv_level)
+                await _target_grant_push(msg)
 
             elif msg_type == "revoke_ssh_access":
-                # Target role: remove public key
-                from orchestratia_agent.ssh_setup import remove_authorized_key, remove_sudoers
-                grant_id = msg.get("grant_id", "")
-                if grant_id:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, remove_authorized_key, grant_id)
-                    # Check if any elevated grants remain before removing sudoers
-                    await loop.run_in_executor(None, remove_sudoers)
+                await _revoke_target_grant(state, sender, msg.get("grant_id", ""))
 
             elif msg_type == "grant_ssh_access":
-                # Source role: store private key + start TCP listener
-                from orchestratia_agent.ssh_setup import store_private_key, clean_known_hosts
-                from orchestratia_agent import s2s_tunnel
-                grant_id = msg.get("grant_id", "")
-                priv_key = msg.get("ssh_private_key", "")
-                bind_port = msg.get("local_bind_port", 0)
-                target_port = msg.get("target_port", 22)
-                if grant_id and priv_key and bind_port:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, store_private_key, grant_id, priv_key)
-                    await loop.run_in_executor(None, clean_known_hosts, bind_port)
-                    asyncio.create_task(
-                        s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
-                    )
+                await _source_grant_push(msg, sender)
 
             elif msg_type == "revoke_grant_access":
-                # Source role: remove private key + stop listener
-                from orchestratia_agent.ssh_setup import remove_private_key
-                from orchestratia_agent import s2s_tunnel
-                grant_id = msg.get("grant_id", "")
-                if grant_id:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, remove_private_key, grant_id)
-                    asyncio.create_task(s2s_tunnel.teardown_grant(grant_id))
+                await _source_grant_revoke(msg)
 
             elif msg_type == "git_changes":
                 request_id = msg.get("request_id")
@@ -1455,6 +1463,12 @@ async def ws_receive_loop(ws, state: DaemonState):
                         state, working_dir, session_id, project_id, "on_demand",
                     ))
 
+            elif msg_type == "scan_run":
+                asyncio.create_task(_scan_runner(state).handle(msg))
+
+            elif msg_type == "scan_cancel":
+                asyncio.create_task(_scan_runner(state).cancel(str(msg.get("run_id") or "")))
+
             elif msg_type == "pong":
                 pass
 
@@ -1484,6 +1498,7 @@ async def report_alive_sessions(state: DaemonState):
 
     def _on_session_close(session_id: str):
         state.active_sessions.pop(session_id, None)
+        _release_session_keys(state, session_id, None)
 
     sender = _make_ws_sender(state)
 
@@ -1623,6 +1638,92 @@ async def report_alive_sessions(state: DaemonState):
     await _restore_grants(state, sender)
 
 
+_revoke_reconciles: set = set()      # strong refs: a fire-and-forget task must not be garbage-collected mid-run
+
+# Grant pushes and the reconcile's apply step are serialised by one lock, and every push bumps a generation. A
+# reconcile notes the generation before it fetches its list and applies the list only if no push landed meanwhile:
+# a list fetched before a push must never undo it (remove a key it just added, tear down a listener it just made).
+_grant_sync = {"gen": 0, "lock": None, "loop": None}
+
+
+def _grant_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    if _grant_sync["loop"] is not loop:          # one lock per event loop (tests run several loops)
+        _grant_sync["lock"], _grant_sync["loop"] = asyncio.Lock(), loop
+    return _grant_sync["lock"]
+
+
+def _grant_generation() -> int:
+    return _grant_sync["gen"]
+
+
+async def _target_grant_push(msg: dict):
+    """setup_ssh_access: add the grant's key (and, elevated, the rule where the policy allows it)."""
+    from orchestratia_agent import ssh_setup as _ssh
+    grant_id = msg.get("grant_id", "")
+    pub_key = msg.get("ssh_public_key", "")
+    priv_level = msg.get("privilege_level", "standard")
+    if not (grant_id and pub_key):
+        return
+    async with _grant_lock():
+        _grant_sync["gen"] += 1
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _ssh.setup_authorized_key, pub_key, grant_id, priv_level)
+        if priv_level == "elevated":
+            await loop.run_in_executor(None, _ssh.setup_sudoers, priv_level)
+
+
+async def _source_grant_push(msg: dict, sender):
+    """grant_ssh_access (source role): store the private key, start the TCP listener."""
+    from orchestratia_agent import ssh_setup as _ssh
+    from orchestratia_agent import s2s_tunnel
+    grant_id = msg.get("grant_id", "")
+    priv_key = msg.get("ssh_private_key", "")
+    bind_port = msg.get("local_bind_port", 0)
+    target_port = msg.get("target_port", 22)
+    if not (grant_id and priv_key and bind_port):
+        return
+    async with _grant_lock():
+        _grant_sync["gen"] += 1
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _ssh.store_private_key, grant_id, priv_key)
+        await loop.run_in_executor(None, _ssh.clean_known_hosts, bind_port)
+        asyncio.create_task(s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender))
+
+
+async def _source_grant_revoke(msg: dict):
+    """revoke_grant_access (source role): remove the private key, stop the listener."""
+    from orchestratia_agent import ssh_setup as _ssh
+    from orchestratia_agent import s2s_tunnel
+    grant_id = msg.get("grant_id", "")
+    if not grant_id:
+        return
+    async with _grant_lock():
+        _grant_sync["gen"] += 1
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _ssh.remove_private_key, grant_id)
+        asyncio.create_task(s2s_tunnel.teardown_grant(grant_id))
+
+
+async def _revoke_target_grant(state: DaemonState, sender, grant_id: str):
+    """Target role: remove the revoked grant's key at once. On Linux elevated access follows the hub's list: a
+    reconcile clears it only when no other live grant is elevated (the old unconditional removal took it from every
+    remaining elevated grant). Elsewhere the old unconditional removal stays."""
+    from orchestratia_agent import ssh_setup as _ssh
+    if not grant_id:
+        return
+    async with _grant_lock():
+        _grant_sync["gen"] += 1
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _ssh.remove_authorized_key, grant_id)
+        if not _ssh.HELPER_PLATFORM:
+            await loop.run_in_executor(None, _ssh.remove_sudoers)
+    if _ssh.HELPER_PLATFORM:
+        task = asyncio.create_task(_reconcile_grants(state, sender))
+        _revoke_reconciles.add(task)
+        task.add_done_callback(_revoke_reconciles.discard)
+
+
 async def _restore_grants(state: DaemonState, sender):
     """Compatibility wrapper — historical name, called from the WS reconnect
     path. Now just dispatches to the reconciling implementation."""
@@ -1650,18 +1751,20 @@ async def _reconcile_grants(state: DaemonState, sender):
          before: WS push reliability was assumed, so a lost
          `revoke_grant_access` left a phantom listener forever.
 
-    Target-side cleanup is intentionally NOT done here. Removing an
-    authorized_key for a grant the hub no longer knows about would race
-    with humans who manually added keys; the existing revoke push is the
-    right path for target-side teardown. (Worst case of a missed target
-    revoke is an extra pubkey in authorized_keys — not a security
-    regression as long as the source no longer has the matching privkey,
-    which IS reconciled here.)
+    Target role: converge_target (ssh_setup) applies the hub's target grants
+    through the root-owned grant helper, only for what changed. It runs only
+    after an HTTP 200 list (any other answer returns early), and that list is
+    authoritative: a tagged grant key the hub no longer lists is removed. A
+    missed target revoke is NOT harmless once the source drops its private key:
+    a source-side session may have copied that key, so the login would outlive
+    the grant. Keys added by hand carry no orchestratia-grant tag and are never
+    touched.
     """
     try:
         import httpx
         from orchestratia_agent.tls import httpx_verify
 
+        fetched_at_gen = _grant_generation()     # a push after this makes the list we fetch stale
         async with httpx.AsyncClient(verify=httpx_verify(state=state)) as client:
             resp = await client.get(
                 f"{state.hub_url}/api/v1/server/access-grants",
@@ -1673,11 +1776,17 @@ async def _reconcile_grants(state: DaemonState, sender):
                 return
 
             grants = resp.json() or []
+            if not isinstance(grants, list) or not all(isinstance(g, dict) for g in grants):
+                log.warning("Grant reconcile: the hub's answer isn't a grant list; nothing changed")
+                return
 
-            from orchestratia_agent.ssh_setup import (
-                setup_authorized_key, setup_sudoers,
-                store_private_key, remove_private_key,
-            )
+        async with _grant_lock():
+            if _grant_generation() != fetched_at_gen:
+                log.info("Grant reconcile: a grant push landed while the list was being fetched; this list is "
+                         "stale and is discarded (the next reconcile applies a fresh one)")
+                return
+
+            from orchestratia_agent.ssh_setup import converge_target, store_private_key, remove_private_key
             from orchestratia_agent import s2s_tunnel
 
             # Closes that couldn't be sent while the WS was down.
@@ -1716,7 +1825,7 @@ async def _reconcile_grants(state: DaemonState, sender):
                     log.debug(f"Reconcile: privkey cleanup failed for {stale_gid[:8]}", exc_info=True)
 
             # ── (1) Set up / refresh grants from the hub ──────────────
-            source_count = target_count = 0
+            source_count = 0
             for g in grants:
                 grant_id = g["grant_id"]
                 role = g["role"]
@@ -1733,20 +1842,16 @@ async def _reconcile_grants(state: DaemonState, sender):
                         await s2s_tunnel.setup_grant(grant_id, bind_port, target_port, sender)
                         source_count += 1
 
-                elif role == "target":
-                    pub_key = g.get("ssh_public_key", "")
-                    priv_level = g.get("privilege_level", "standard")
-                    if pub_key:
-                        await loop.run_in_executor(
-                            None, setup_authorized_key, pub_key, grant_id, priv_level,
-                        )
-                        if priv_level == "elevated":
-                            await loop.run_in_executor(None, setup_sudoers, priv_level)
-                        target_count += 1
+            # Target role: one call; it uses sudo only for what changed (no change -> no sudo at all), and
+            # elevated access follows this list (on while any target grant here is elevated).
+            target_desired = {g["grant_id"]: (g.get("ssh_public_key", ""), g.get("privilege_level", "standard"))
+                              for g in grants if g["role"] == "target" and g.get("ssh_public_key")}
+            target_calls = await loop.run_in_executor(None, converge_target, target_desired)
+            target_count = len(target_desired)
 
             # Log only when something actually happened — reconcile runs
             # on a 60s timer and would otherwise flood the journal.
-            if source_count or target_count or stale_source_grants:
+            if source_count or target_calls or stale_source_grants:
                 log.info(
                     f"Reconciled: {source_count} source + {target_count} target grants active; "
                     f"{len(stale_source_grants)} stale source grants torn down. "
@@ -2375,6 +2480,18 @@ async def _handle_remote_exec(sender, request_id: str, command: str,
         })
 
 
+def _release_session_keys(state, session_id: str, session) -> None:
+    """Delete a session's credential files because the session ENDED.
+
+    Not while the daemon is stopping: a graceful stop cancels every reader without killing the tmux
+    sessions, and the reader's finally still runs _on_close. Those sessions survive the restart and
+    their ORCHESTRATIA_*_FILE paths must stay valid, so a stopping daemon deletes nothing."""
+    if not state.running:
+        return
+    session_env.clear_session_key(getattr(session, "key_file", None))
+    session_env.clear_session_keys_for(session_id)
+
+
 async def cleanup_sessions(state: DaemonState):
     """Cleanup on daemon shutdown.
 
@@ -2384,6 +2501,9 @@ async def cleanup_sessions(state: DaemonState):
     Only non-persistent (plain PTY / direct ConPTY) sessions are
     terminated, since they cannot outlive the daemon anyway.
     """
+    # Every stop path (signal, crash, anything that cleans up) marks the daemon as stopping BEFORE the
+    # readers are cancelled: their finally blocks must not delete the key files of surviving sessions.
+    state.running = False
     # Close all active tunnels (regular + S2S)
     from orchestratia_agent.tunnel import close_all_tunnels
     close_all_tunnels()

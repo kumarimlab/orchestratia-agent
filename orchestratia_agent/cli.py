@@ -33,6 +33,9 @@ Usage:
   orchestratia code health                    # Codebase health score & factors
   orchestratia code debt                      # Tech debt summary
   orchestratia code priorities                # Top files to fix
+  orchestratia security catalog | scan <scan>... --here [--task ORC-42] [--wait]
+  orchestratia security runs [--mine] | run <id> | issues [--here] | issue <id>
+  orchestratia security note <issue> "text" [--cite path:line] | task <issue>
   orchestratia code review <task_id>          # Code review findings for a task
   orchestratia grants [--json]
   orchestratia init [--print]
@@ -52,49 +55,64 @@ import urllib.error
 from orchestratia_agent import __version__
 import ssl
 
-# Read config from environment (set by daemon when spawning PTY)
-HUB_URL = os.environ.get("ORCHESTRATIA_HUB_URL", "").rstrip("/")
-API_KEY = os.environ.get("ORCHESTRATIA_API_KEY", "")
+SECURITY_BASE = "/api/v1/server/security"
+TOKEN_DEAD = "Invalid session token"
+TOKEN_LOST = "<session token file unreadable>"  # sentinel: never sent; see _api_request
+
+
+def _read_secret(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _credentials(env, cfg, read=_read_secret):
+    """(hub_url, api_key, session_token, fallback_key).
+
+    config.yaml beats the environment for hub_url and api_key: env vars go stale in long-running tmux sessions
+    after a reinstall (registration mints a new key). Then:
+      ORCHESTRATIA_KEY_FILE (restricted): this session's scoped token is api_key AND session_token, and there is
+        never a fallback: a confined session must not end up with the server key, even if it could read it.
+      ORCHESTRATIA_SESSION_TOKEN_FILE (standard, agent >= 0.35.0): requests carry the session token, so the hub
+        knows which session acts (reporter, mentions, "Claude in …"). api_key stays the server key (status,
+        grants), and it is the fallback when the hub says the token is no longer valid.
+    Secrets come only from files: the environment carries paths."""
+    hub = (env.get("ORCHESTRATIA_HUB_URL", "") or "").rstrip("/")
+    key = env.get("ORCHESTRATIA_API_KEY", "")
+    if cfg.get("hub_url"):
+        hub = cfg["hub_url"].rstrip("/")
+    if cfg.get("api_key"):
+        key = cfg["api_key"]
+    restricted = read(env.get("ORCHESTRATIA_KEY_FILE", ""))
+    if restricted:
+        return hub, restricted, restricted, ""
+    token_file = env.get("ORCHESTRATIA_SESSION_TOKEN_FILE", "")
+    standard = read(token_file)
+    if standard:
+        return hub, key, standard, key
+    if token_file:
+        # Set but unreadable (aged out of /tmp...): this session HAD a token. Ordinary commands use the server
+        # key; security routes see TOKEN_LOST and tell the user to start a new session.
+        return hub, key, TOKEN_LOST, key
+    return hub, key, "", ""
+
+
+def _load_config():
+    try:
+        from orchestratia_agent.config import default_config_path, load_config
+        path = default_config_path()
+        return (load_config(path) or {}) if os.path.exists(path) else {}
+    except Exception:
+        return {}
+
+
 SESSION_ID = os.environ.get("ORCHESTRATIA_SESSION_ID", "")
 PROJECT_ID = os.environ.get("ORCHESTRATIA_PROJECT_ID", "")
-
-# Config file: ALWAYS read for hub_url and api_key.
-# The config file is the source of truth — env vars can become stale in
-# long-running tmux sessions after daemon reinstall/re-registration
-# (registration generates a new key, but existing shells keep the old env).
-try:
-    from orchestratia_agent.config import default_config_path, load_config
-    _cfg_path = default_config_path()
-    if os.path.exists(_cfg_path):
-        _cfg = load_config(_cfg_path)
-        # Config file always wins for hub_url and api_key
-        _cfg_hub = _cfg.get("hub_url", "")
-        _cfg_key = _cfg.get("api_key", "")
-        if _cfg_hub:
-            HUB_URL = _cfg_hub.rstrip("/")
-        if _cfg_key:
-            API_KEY = _cfg_key
-except Exception:
-    pass
-
-# LAST, so it beats config.yaml. A restricted session cannot normally read
-# config.yaml (different OS user), but if it ever could, silently preferring the
-# SERVER key over this session's scoped one would be an escalation — the caller
-# would hold fleet authority while believing it was confined. Presence of this
-# file means "you are a confined session; use your own credential".
-#
-# Only the PATH is in the environment. Secrets never go in argv or env:
-# /proc/<pid>/cmdline is world-readable, and a tmux server outlives the session
-# it was started for.
-_KEY_FILE = os.environ.get("ORCHESTRATIA_KEY_FILE", "")
-if _KEY_FILE:
-    try:
-        with open(_KEY_FILE) as _fh:
-            _file_key = _fh.read().strip()
-        if _file_key:
-            API_KEY = _file_key
-    except OSError:
-        pass
+HUB_URL, API_KEY, SESSION_TOKEN, _FALLBACK_KEY = _credentials(os.environ, _load_config())
 
 # JSON output mode (set in main() before command dispatch)
 JSON_MODE = False
@@ -127,44 +145,62 @@ def _error_exit(msg, code=1):
     sys.exit(code)
 
 
-def _api_request(method: str, path: str, data: dict | None = None, base: str = "/api/v1/server/tasks") -> dict:
-    """Make an authenticated API request to the hub."""
-    if not HUB_URL:
-        _error_exit("ORCHESTRATIA_HUB_URL not set (set env var or configure config.yaml)")
-    if not API_KEY:
-        _error_exit("ORCHESTRATIA_API_KEY not set (set env var or configure config.yaml)")
-
-    url = f"{HUB_URL}{base}{path}"
-    headers = {
-        "X-API-Key": API_KEY,
-        "Content-Type": "application/json",
-    }
-
+def _send(method: str, url: str, data: dict | None, key: str):
+    """One request. (status, parsed JSON body or text); (None, reason) on a connection error."""
+    headers = {"X-API-Key": key, "Content-Type": "application/json"}
     body = json.dumps(data).encode() if data else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-
-    # Verify TLS certs against the OS trust store by default. Honor the
-    # shared ORCHESTRATIA_INSECURE_TLS env var. Auto-opt-out for
-    # localhost only (can't get a valid public cert for a loopback name).
+    # Verify TLS against the OS trust store; ORCHESTRATIA_INSECURE_TLS is honoured; localhost opts out.
     from orchestratia_agent.tls import build_ssl_context
-    is_localhost = (
-        HUB_URL.startswith("https://localhost")
-        or HUB_URL.startswith("https://127.")
-    )
+    is_localhost = url.startswith("https://localhost") or url.startswith("https://127.")
     ctx = build_ssl_context(explicit_insecure=True) if is_localhost else build_ssl_context()
-
     try:
         resp = urllib.request.urlopen(req, context=ctx)
-        return json.loads(resp.read())
+        raw = resp.read()
+        return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
-        body = e.read().decode()
+        text = e.read().decode(errors="replace")
         try:
-            detail = json.loads(body).get("detail", body)
+            return e.code, json.loads(text)
         except json.JSONDecodeError:
-            detail = body
-        _error_exit(f"HTTP {e.code}: {detail}")
+            return e.code, text
     except urllib.error.URLError as e:
-        _error_exit(f"Connection error: {e.reason}")
+        return None, str(e.reason)
+
+
+def _detail(payload):
+    return payload.get("detail", payload) if isinstance(payload, dict) else payload
+
+
+def _api_request(method: str, path: str, data: dict | None = None, base: str = "/api/v1/server/tasks") -> dict:
+    """An authenticated request to the hub with this session's credential (see _credentials)."""
+    if not HUB_URL:
+        _error_exit("ORCHESTRATIA_HUB_URL not set (set env var or configure config.yaml)")
+    security = base.startswith(SECURITY_BASE)
+    if SESSION_TOKEN == TOKEN_LOST:
+        if security:
+            _error_exit("This session's token file is gone: the hub cannot tell which session this is. "
+                        "Start a new session to use `orchestratia security`.")
+        key = API_KEY
+    else:
+        key = SESSION_TOKEN or API_KEY
+    if not key:
+        _error_exit("ORCHESTRATIA_API_KEY not set (set env var or configure config.yaml)")
+    url = f"{HUB_URL}{base}{path}"
+    status, payload = _send(method, url, data, key)
+    if (status == 401 and _detail(payload) == TOKEN_DEAD and key == SESSION_TOKEN and _FALLBACK_KEY
+            and not security):
+        if not JSON_MODE:
+            print(f"{DIM}(this session's token is no longer valid; using the server key){RESET}", file=sys.stderr)
+        status, payload = _send(method, url, data, _FALLBACK_KEY)
+    if status is None:
+        _error_exit(f"Connection error: {payload}")
+    if status >= 400:
+        if status == 401 and security and _detail(payload) == TOKEN_DEAD:
+            _error_exit("This session's token is no longer valid: the hub sees this session as ended. "
+                        "Start a new session to use `orchestratia security`.")
+        _error_exit(f"HTTP {status}: {_detail(payload)}")
+    return payload
 
 
 def _resolve_task_id(prefix: str) -> str:
@@ -225,7 +261,13 @@ def _print_task(task: dict, verbose: bool = False):
         "done": GREEN, "failed": RED, "needs_human": RED, "cancelled": DIM,
     }.get(task["status"], "")
 
-    print(f"  {BRAND}{task.get('key') or '#' + task['id']}{RESET} {BOLD}{task['title']}{RESET}")
+    if "title" in (task.get("untrusted_fields") or []):
+        from orchestratia_agent.security_cli import envelope
+        print(f"  {BRAND}{task.get('key') or '#' + task['id']}{RESET} "
+              f"{BOLD}(title from a security finding — untrusted, below){RESET}")
+        print(envelope([("title", task.get("title"))]))
+    else:
+        print(f"  {BRAND}{task.get('key') or '#' + task['id']}{RESET} {BOLD}{task['title']}{RESET}")
     print(f"    Status: {status_color}{task['status']}{RESET}  "
           f"Priority: {priority_color}{task['priority']}{RESET}", end="")
 
@@ -554,7 +596,16 @@ def cmd_intervention_list(args):
     for i in result:
         status_color = GREEN if i["status"] == "responded" else YELLOW
         itype = i.get("intervention_type", "help")
-        print(f"  {i['id'][:8]}  {status_color}{i['status']}{RESET}  [{itype}]  {i.get('question', '')[:60]}")
+        if "question" in (i.get("untrusted_fields") or []):
+            # An intervention on a task filed from a security finding: its question can quote the scanner-derived
+            # title (final review M4). Same rule as `status`: never on the row; only inside the untrusted envelope.
+            from orchestratia_agent.security_cli import envelope
+            ref = i.get("task_key") or (i.get("task_id") or "")[:8]
+            print(f"  {i['id'][:8]}  {status_color}{i['status']}{RESET}  [{itype}]  task {ref} (security finding — "
+                  f"question below, untrusted)")
+            print(envelope([("question", i.get("question"))]))
+        else:
+            print(f"  {i['id'][:8]}  {status_color}{i['status']}{RESET}  [{itype}]  {i.get('question', '')[:60]}")
 
 
 def cmd_intervention_respond(args):
@@ -983,7 +1034,14 @@ def cmd_agent_status(args):
                 "running": CYAN, "pending": YELLOW, "assigned": CYAN,
                 "planning": CYAN, "plan_review": YELLOW,
             }.get(t["status"], "")
-            print(f"    {BRAND}#{t['id'][:8]}{RESET} {BOLD}{t['title']}{RESET} ({status_color}{t['status']}{RESET})")
+            if "title" in (t.get("untrusted_fields") or []):
+                # This output is injected into the session's context: a title filed from a scan finding is
+                # scanner-derived text, so it is never printed here.
+                print(f"    {BRAND}#{t['id'][:8]}{RESET} {BOLD}{t.get('key') or ''}{RESET} (security finding — "
+                      f"run `orchestratia task view {t.get('key') or t['id']}`) "
+                      f"({status_color}{t['status']}{RESET})")
+            else:
+                print(f"    {BRAND}#{t['id'][:8]}{RESET} {BOLD}{t['title']}{RESET} ({status_color}{t['status']}{RESET})")
     else:
         print(f"  {DIM}No assigned tasks{RESET}")
 
@@ -1095,10 +1153,10 @@ def _service_user(unit_path: str = AGENT_UNIT) -> str | None:
 
 
 def _agent_bin() -> str:
-    """The daemon entry point of the package just installed (this venv)."""
-    import shutil
-    here = os.path.join(os.path.dirname(sys.executable), "orchestratia-agent")
-    return here if os.path.exists(here) else (shutil.which("orchestratia-agent") or "orchestratia-agent")
+    """The daemon entry point root runs after an update: always the root-owned venv's. Never this interpreter's
+    directory or PATH, which on a legacy (non-venv) host lead into the daemon user's ~/.local."""
+    from orchestratia_agent import codetrust
+    return os.path.join(codetrust.VENV_DIR, "bin", "orchestratia-agent")
 
 
 def tier_refresh_plan(euid: int, restricted_cfg: str | None, daemon_user: str | None, agent_bin: str,
@@ -1143,7 +1201,8 @@ def _after_update_refresh(results: dict | None = None, euid: int | None = None,
             print(f"  {YELLOW}Restricted tier / upload folders:{RESET} also run as root: {cmd}")
         return kind
     try:
-        res = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+        from orchestratia_agent.linux_update import safe_env
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=180, cwd="/", env=safe_env())
         good, detail = res.returncode == 0, (res.stderr or res.stdout or "").strip()[-300:]
     except (OSError, subprocess.TimeoutExpired) as e:
         good, detail = False, str(e)
@@ -1157,10 +1216,57 @@ def _after_update_refresh(results: dict | None = None, euid: int | None = None,
     return kind
 
 
+def _agent_update_linux(args, *, update=None, euid=None, run=None):
+    """Linux: root only. linux_update.update (a fresh clone; the venv upgraded or rebuilt), then the NEW entry
+    point's `secure-install`, then the restricted-tier refresh."""
+    import subprocess
+    from orchestratia_agent import codetrust, linux_update
+    if (euid or os.geteuid)() != 0:
+        _error_exit("orchestratia update installs code that root runs, so it runs as root: sudo orchestratia update")
+    source, branch = getattr(args, "source", None) or codetrust.REPO_URL, getattr(args, "branch", None) or "main"
+    results = {"source": source, "branch": branch, "steps": []}
+    if not JSON_MODE:
+        print(f"{BRAND}[ORCHESTRATIA]{RESET} Updating the agent from {source} ({branch})...")
+    try:
+        info = (update or linux_update.update)(source=source, branch=branch)
+    except (linux_update.UpdateError, codetrust.CodeTrustError, OSError) as e:
+        _error_exit(f"update failed: {e}")
+    step = f"{info['old']} -> {info['new']} ({info['commit']}); venv {info['venv']}"
+    results["steps"].append({"update": step})
+    if not JSON_MODE:
+        print(f"  {GREEN}update:{RESET} {step}")
+    user = _service_user(AGENT_UNIT)
+    argv = [_agent_bin(), "secure-install"] + (["--daemon-user", user] if user else [])
+    try:
+        res = (run or subprocess.run)(argv, capture_output=True, text=True, timeout=900, cwd="/",
+                                      env=linux_update.safe_env())
+        good = res.returncode == 0
+        # Every step's line (stdout) and, on failure, why (stderr): a later step's failure never hides what ran.
+        detail = "\n".join(x.strip() for x in (res.stdout, None if good else res.stderr) if x and x.strip())[-2000:]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        good, detail = False, str(e)
+    results["steps"].append({"secure_install": "ok" if good else "failed", "detail": detail})
+    if not JSON_MODE:
+        print(f"  {GREEN if good else RED}secure-install:{RESET}")
+        for ln in (detail or ("ok" if good else "failed")).splitlines():
+            print(f"    {ln}")
+    _after_update_refresh(results if JSON_MODE else None)
+    if JSON_MODE:
+        _json_output(results)
+    elif good:
+        print(f"\n{GREEN}[ORCHESTRATIA]{RESET} Update complete.")
+        print(f"  {DIM}Restart the daemon to apply: sudo systemctl restart orchestratia-agent{RESET}")
+    else:
+        print(f"\n{RED}[ORCHESTRATIA]{RESET} The new code is installed, but secure-install failed (see above): "
+              f"the install isn't fully secured. Fix what it names, then run: sudo orchestratia update")
+    if not good:
+        sys.exit(1)
+
+
 def cmd_agent_update(args):
     """Update the agent: pull latest code, reinstall package.
 
-    On Linux: git pull + pip reinstall from /opt/orchestratia-agent.
+    On Linux: root only — a fresh clone, the root-owned venv upgraded or rebuilt (linux_update).
     On macOS: pip install --upgrade (pip-based install, no git repo).
     On Windows (standalone exe): re-runs the PowerShell install script in upgrade mode.
     """
@@ -1168,6 +1274,10 @@ def cmd_agent_update(args):
 
     if sys.platform == "win32":
         _agent_update_windows()
+        return
+
+    if sys.platform.startswith("linux"):
+        _agent_update_linux(args)
         return
 
     # Detect install method: git repo (Linux) or pip-only (macOS)
@@ -2167,7 +2277,11 @@ def main():
     subparsers.add_parser("status", help="Show agent status: connection, session, tasks")
 
     # ── update subcommand ──
-    subparsers.add_parser("update", help="Update agent: pull latest code, reinstall package, refresh skill")
+    agent_update_p = subparsers.add_parser(
+        "update", help="Update the agent (Linux: as root — sudo orchestratia update)")
+    agent_update_p.add_argument("--source", default=None,
+                                help="https git URL or a root-owned local repository to update from (default: GitHub)")
+    agent_update_p.add_argument("--branch", default=None, help="branch to update to (default: main)")
 
     # ── code subcommand (CodeLens self-vetting) ──
     code_parser = subparsers.add_parser("code", help="Code quality & architecture commands")
@@ -2182,6 +2296,18 @@ def main():
 
     code_review_p = code_sub.add_parser("review", help="Check code review findings for a task")
     code_review_p.add_argument("task_id", help="Task ID to check review for")
+
+    scanners_parser = subparsers.add_parser("scanners", help="Security scanner pack on this server (owner, root)")
+    scanners_sub = scanners_parser.add_subparsers(dest="scanners_action")
+    scanners_install_p = scanners_sub.add_parser(
+        "install", help="Install the pinned scanners, the daily data refresh and the root-owned scan launcher")
+    scanners_install_p.add_argument("--daemon-user", default=None,
+                                    help="the agent service's user (default: its systemd User=)")
+    scanners_sub.add_parser("status", help="Show installed scanners, data date and sandbox support")
+    scanners_sub.add_parser("refresh", help="Refresh vulnerability data now")
+
+    from orchestratia_agent import security_cli
+    security_parser = security_cli.add_parser(subparsers)
 
     # ── init subcommand ──
     init_parser = subparsers.add_parser("init", help="Generate ORCHESTRATIA.md for this repo")
@@ -2303,6 +2429,54 @@ def main():
     elif args.command == "update":
         cmd_agent_update(args)
 
+    elif args.command == "scanners":
+        from orchestratia_agent import codetrust
+        from orchestratia_agent.scanning import pack
+        if args.scanners_action == "install":
+            # Root copies this code into the runner dir and has the timer run it: it must be root's alone.
+            try:
+                codetrust.require_trusted("install the scanner pack")
+            except codetrust.CodeTrustError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                pack.install()
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                pack.refresh_osv()
+            except Exception as e:
+                print(f"Warning: first vulnerability data refresh failed ({e}); "
+                      "data will be fetched on the next daily run.", file=sys.stderr)
+            try:
+                pack.install_timer(sys.executable)
+            except Exception as e:
+                print(f"Error: could not install the daily refresh timer: {e}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                pack.install_launcher(args.daemon_user or pack.service_user())
+            except Exception as e:
+                print(f"Error: could not install the scan launcher: {e}", file=sys.stderr)
+                sys.exit(1)
+            print(json.dumps(pack.status(), indent=2))
+        elif args.scanners_action == "refresh":
+            if os.geteuid() != 0:
+                print("Error: run as root: sudo orchestratia scanners refresh", file=sys.stderr)
+                sys.exit(1)
+            try:
+                codetrust.require_trusted("refresh vulnerability data")
+            except codetrust.CodeTrustError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                print(f"Vulnerability data as of {pack.refresh_osv()}")
+            except Exception as e:
+                print(f"Error: refresh failed: {e}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(json.dumps(pack.status(), indent=2))
+
     elif args.command == "code":
         if not args.action:
             code_parser.print_help()
@@ -2316,6 +2490,9 @@ def main():
             "priorities": cmd_code_priorities,
         }
         code_actions[args.action](args)
+
+    elif args.command == "security":
+        security_cli.dispatch(args, security_parser)
 
     elif args.command == "init":
         cmd_init(args)

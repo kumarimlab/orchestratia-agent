@@ -74,6 +74,7 @@ _STEERING_SETTINGS = {"settings.json", "settings.local.json"}
 _STUBS = {"pass", "...", "return None"}
 _HIDDEN = re.compile("[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c\U000e0000-\U000e007f]")
 _TEXT_MAX = 1024 * 1024
+_BINARY_SNIFF = 8000
 _LINE_MAX = 4096
 _MAX_FINDINGS = 5001
 _HEAVY = {".git", "node_modules", ".venv", "venv", "__pycache__", ".tox", "dist", "build", "target", ".mypy_cache"}
@@ -235,17 +236,39 @@ def _split(text):
     return [p[:-1] if p.endswith("\r") else p for p in parts]
 
 
-def _read_regular(path):
-    """Text of a regular, non-symlink file <= _TEXT_MAX, else None. Never opens a FIFO/device/symlink."""
+def _read_bytes(path, limit):
+    """Up to `limit` bytes of a regular, non-symlink file, else None. Never opens a FIFO/device/symlink."""
     try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > _TEXT_MAX:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
             return None
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace", newline="") as fh:
-            return fh.read(_TEXT_MAX + 1)
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read(limit)
     except OSError:
         return None
+
+
+def _binary(data):
+    """git's test: a NUL in the first 8000 bytes. A PNG's or PDF's bytes can decode to bidi controls."""
+    return b"\0" in data[:_BINARY_SNIFF]
+
+
+def _is_binary_file(path):
+    data = _read_bytes(path, _BINARY_SNIFF)
+    return data is not None and _binary(data)
+
+
+def _read_regular(path):
+    """Text of a regular, non-symlink, non-binary file <= _TEXT_MAX, else None."""
+    try:
+        if os.lstat(path).st_size > _TEXT_MAX:
+            return None
+    except OSError:
+        return None
+    data = _read_bytes(path, _TEXT_MAX + 1)
+    if data is None or _binary(data):
+        return None
+    return data.decode("utf-8", errors="replace")
 
 
 def _reasonless(line):
@@ -377,7 +400,8 @@ def _change(src, since, git):
     ls = _git_bytes(src, git, "ls-files", "--others", "-z")      # no --exclude-standard: a new .gitignore must not hide files
     if ls.returncode != 0:
         raise GitError()
-    files = _parse_diff(p.stdout)
+    files = {path: d for path, d in _parse_diff(p.stdout).items()     # diff --text shows binaries as lines
+             if not _is_binary_file(os.path.join(src, path))}
     for raw in filter(None, ls.stdout.split(b"\0")):
         rel = os.fsdecode(raw)                      # surrogateescape: round-trips to the filesystem
         text = _read_regular(os.path.join(src, rel))

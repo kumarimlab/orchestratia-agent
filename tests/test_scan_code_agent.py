@@ -284,6 +284,32 @@ with tempfile.TemporaryDirectory() as repo:
     ok("C2 scanner_config_files lists them without following links",
        sorted(code_agent.scanner_config_files(repo)) == [".gitleaks.toml", "gitleaks.toml", "sub/.gitleaksignore"])
 
+# Binary files (git's test: a NUL in the first 8000 bytes) are not text: bytes that happen to decode to bidi
+# controls in a PNG or PDF are not hidden Unicode (found on a real repo: .png and .pdf flagged high).
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\xe2\x80\xae\xf3\xa0\x80\x81 # noqa\n" * 3
+PDF = b"%PDF-1.4\n1 0 obj\nstream\n\x00\x01\xe2\x80\xae\nendstream\n"
+with tempfile.TemporaryDirectory() as repo:
+    git(repo, "init", "-q")
+    with open(os.path.join(repo, "old.png"), "wb") as f:
+        f.write(PNG)
+    write(repo, "a.py", "a = 1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    with open(os.path.join(repo, "old.png"), "ab") as f:            # tracked binary changed: shows in the diff
+        f.write(PNG)
+    os.makedirs(os.path.join(repo, "docs"))
+    with open(os.path.join(repo, "docs/guide.pdf"), "wb") as f:     # untracked binary
+        f.write(PDF)
+    write(repo, "b.py", "x = 'a\u202eb'  # noqa\n")                 # real text still flagged
+    for mode, since in (("change", base), ("full", None)):
+        fs, _ = code_agent.run(repo, since)
+        paths = {f["location"]["path"] for f in fs}
+        ok(f"binary {mode}: a PNG and a PDF with bidi-looking bytes report nothing",
+           not paths & {"old.png", "docs/guide.pdf"}, sorted(paths))
+        ok(f"binary {mode}: hidden Unicode in a text file is still flagged",
+           hits(fs, "agent:hidden-unicode", "b.py") != [] and hits(fs, "agent:suppression-no-reason", "b.py") != [])
+
 # M9: git failures are plain.
 with tempfile.TemporaryDirectory() as d:
     write(d, "a.py", "a = 1\n")

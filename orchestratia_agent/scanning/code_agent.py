@@ -75,6 +75,11 @@ _STUBS = {"pass", "...", "return None"}
 _HIDDEN = re.compile("[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c\U000e0000-\U000e007f]")
 _TEXT_MAX = 1024 * 1024
 _BINARY_SNIFF = 8000
+_BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".psd", ".avif", ".heic",
+               ".pdf", ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war", ".whl", ".egg",
+               ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi", ".webm", ".ogg", ".wav",
+               ".flac", ".wasm", ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a", ".class", ".pyc",
+               ".sqlite", ".db", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".keynote", ".sketch", ".fig"}
 _LINE_MAX = 4096
 _MAX_FINDINGS = 5001
 _HEAVY = {".git", "node_modules", ".venv", "venv", "__pycache__", ".tox", "dist", "build", "target", ".mypy_cache"}
@@ -248,25 +253,29 @@ def _read_bytes(path, limit):
         return None
 
 
-def _binary(data):
-    """git's test: a NUL in the first 8000 bytes. A PNG's or PDF's bytes can decode to bidi controls."""
-    return b"\0" in data[:_BINARY_SNIFF]
+def _binary(path, data):
+    """A known binary type (by extension) whose bytes look binary (git's test: a NUL in the first 8000 bytes).
+    A PNG's or PDF's bytes can decode to bidi controls. Both are required: a NUL alone must not switch the scan
+    off for a source or steering file (Node runs JS with a NUL in a comment, Markdown has no parser at all)."""
+    return os.path.splitext(path)[1].lower() in _BINARY_EXT and b"\0" in data[:_BINARY_SNIFF]
 
 
 def _is_binary_file(path):
+    if os.path.splitext(path)[1].lower() not in _BINARY_EXT:
+        return False
     data = _read_bytes(path, _BINARY_SNIFF)
-    return data is not None and _binary(data)
+    return data is not None and _binary(path, data)
 
 
 def _read_regular(path):
-    """Text of a regular, non-symlink, non-binary file <= _TEXT_MAX, else None."""
+    """Text of a regular, non-symlink file <= _TEXT_MAX that isn't a known binary type, else None."""
     try:
         if os.lstat(path).st_size > _TEXT_MAX:
             return None
     except OSError:
         return None
     data = _read_bytes(path, _TEXT_MAX + 1)
-    if data is None or _binary(data):
+    if data is None or _binary(path, data):
         return None
     return data.decode("utf-8", errors="replace")
 
@@ -400,8 +409,10 @@ def _change(src, since, git):
     ls = _git_bytes(src, git, "ls-files", "--others", "-z")      # no --exclude-standard: a new .gitignore must not hide files
     if ls.returncode != 0:
         raise GitError()
-    files = {path: d for path, d in _parse_diff(p.stdout).items()     # diff --text shows binaries as lines
-             if not _is_binary_file(os.path.join(src, path))}
+    files = _parse_diff(p.stdout)
+    for path, d in files.items():          # diff --text shows binaries as lines; path-based checks still see them
+        if _is_binary_file(os.path.join(src, path)):
+            d["added"], d["removed"] = [], []
     for raw in filter(None, ls.stdout.split(b"\0")):
         rel = os.fsdecode(raw)                      # surrogateescape: round-trips to the filesystem
         text = _read_regular(os.path.join(src, rel))

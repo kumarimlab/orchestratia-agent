@@ -15,7 +15,12 @@ the typist doesn't have. The limits:
 - only a user whose uids are all equal at the terminal (terminal_user);
 - only if the agent can become them (`sudo -n -u <user>` runs the helper);
 - a user the hub carries back (`os_user`) only if this agent saw it at THIS
-  session's terminal, or it is there now — the hub can never name anyone else.
+  session's terminal, or it is there now — the hub can never name anyone else;
+- never a project user (orcp-*): their folders are another tenant's.
+
+Only the first step of a transfer (download stat, upload prepare) decides; open
+and cancel continue with the user it chose, which the hub carries back. Without a
+carried user they act as the session user, exactly as before this existed.
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ import time
 from dataclasses import dataclass
 
 from orchestratia_agent import privilege, upload_dirs
-from orchestratia_agent.terminal_user import foreground_uid, snapshot, user_for_uid
+from orchestratia_agent.terminal_user import foreground_uid, pane_start, snapshot, user_for_uid
 
 log = logging.getLogger("orchestratia-agent.transfer_user")
 
@@ -68,26 +73,47 @@ def helper_cmd() -> list[str]:
 
 
 def _terminal_uid(session_id: str, sessions) -> int | None:
-    """uid at the session's terminal (blocking: tmux + /proc). None if unknown."""
+    """uid at the session's terminal (blocking: tmux + /proc). None if unknown.
+
+    tmux sessions only: the pane must be alive and its first process still on the
+    pane's own terminal, or a reused pid (anyone's) could pick the user."""
     managed = (sessions or {}).get(session_id)
     handle = getattr(managed, "handle", None)
-    if handle is None:
+    if handle is None or not getattr(handle, "tmux_name", ""):
         return None
-    pane_pid = None
-    if getattr(handle, "tmux_name", ""):
-        from orchestratia_agent.session_posix import _tmux
-        try:
-            r = _tmux(handle, ["display-message", "-p", "-t", handle.tmux_name, "#{pane_pid}"],
-                      timeout=3, text=True)
-            if r.returncode == 0 and r.stdout.strip().isdigit():
-                pane_pid = int(r.stdout.strip())
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-    elif isinstance(getattr(handle, "pid", None), int):
-        pane_pid = handle.pid
-    if not pane_pid:
+    from orchestratia_agent.session_posix import _tmux
+    try:
+        r = _tmux(handle, ["display-message", "-p", "-t", handle.tmux_name,
+                           "#{pane_pid} #{pane_dead} #{pane_tty}"], timeout=3, text=True)
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    return foreground_uid(pane_pid, snapshot())
+    parts = r.stdout.split() if r.returncode == 0 else []
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[2].startswith("/dev/"):
+        return None
+    try:
+        rdev = os.stat(parts[2]).st_rdev
+    except OSError:
+        return None
+    snap = snapshot()
+    start = pane_start(int(parts[0]), rdev, parts[1] != "0", snap)
+    return foreground_uid(start, snap) if start else None
+
+
+def _uid_of(name: str) -> int | None:
+    import pwd
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return None
+
+
+def _owns_folder(user: str) -> bool:
+    """`<base>/<user>` exists as a real folder owned by `user`. (blocking)"""
+    try:
+        s = os.lstat(os.path.join(upload_dirs.ensure_base(), user))
+    except (OSError, upload_dirs.UploadDirError):
+        return False
+    return st.S_ISDIR(s.st_mode) and s.st_uid == _uid_of(user)
 
 
 def _can_become(user: str) -> bool:
@@ -121,9 +147,13 @@ def _remember(session_id: str, user: str) -> None:
         _seen.pop(next(iter(_seen)))
 
 
-async def resolve(msg: dict, tc, sessions) -> Acting:
+async def resolve(msg: dict, tc, sessions, purpose: str = "decide") -> Acting:
     """The user this transfer acts as. Raises privilege.PrivilegeError (tier can't be
-    honoured) or TerminalChanged (a carried user this agent can't vouch for)."""
+    honoured) or TerminalChanged (a carried user this agent can't vouch for).
+
+    purpose: "decide" (download stat / upload prepare: may follow the terminal),
+    "continue" (open: only the carried user), "cancel" (as continue, and also a carried
+    user whose folder is there — cancelling only deletes that upload's own files)."""
     tier = msg.get("privilege_tier") or privilege.TIER_STANDARD
     run_as = privilege.resolve_user(tier, msg.get("project_id"), tc)
     if run_as is not None:
@@ -136,25 +166,39 @@ async def resolve(msg: dict, tc, sessions) -> Acting:
         return session_user
     sid = str(msg.get("session_id") or "")
     loop = asyncio.get_running_loop()
-    uid = await loop.run_in_executor(None, _terminal_uid, sid, sessions) if sid else None
-    now = user_for_uid(uid) if uid is not None else None
-    carried = msg.get("os_user")
+    project_users = {pt.user for pt in tc.projects.values()}
 
-    if carried is not None:                          # open / cancel: continue what stat/prepare chose
-        if carried == own:
+    async def at_terminal() -> tuple[int | None, str | None]:
+        uid = await loop.run_in_executor(None, _terminal_uid, sid, sessions) if sid else None
+        name = await loop.run_in_executor(None, user_for_uid, uid) if uid else None
+        return uid, name
+
+    if purpose != "decide":                          # open / cancel: continue what stat/prepare chose
+        carried = msg.get("os_user")
+        if carried is None or carried == own:
             return session_user
-        vouched = isinstance(carried, str) and sid and carried != "root" and (
-            carried in _seen.get(sid, ()) or carried == now)
-        if vouched and await _reachable(carried):
-            _remember(sid, carried)
+        if not isinstance(carried, str) or not sid or carried == "root" or carried in project_users:
+            raise TerminalChanged(str(carried)[:32])
+        vouched = carried in _seen.get(sid, ())
+        if not vouched:
+            vouched = (await at_terminal())[1] == carried
+        by_folder = False
+        if not vouched and purpose == "cancel":
+            uid = await loop.run_in_executor(None, _uid_of, carried)
+            by_folder = (uid is not None and await loop.run_in_executor(None, user_for_uid, uid) == carried
+                         and await loop.run_in_executor(None, _owns_folder, carried))
+        if (vouched or by_folder) and await _reachable(carried):
+            if vouched:                              # a folder alone never vouches for later writes
+                _remember(sid, carried)
             return Acting(carried, carried, followed=True)
-        raise TerminalChanged(str(carried)[:32])
+        raise TerminalChanged(carried[:32])
 
+    uid, now = await at_terminal()
     if uid is None:
         return session_user
     if uid == 0:
         return Acting(None, own, terminal_user="root")
-    if now is None or now == own:
+    if now is None or now == own or now in project_users:
         return session_user
     if not await _reachable(now):
         return Acting(None, own, terminal_user=now)

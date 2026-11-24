@@ -126,6 +126,36 @@ def test_missing_and_odd():
     ok("unknown pane: unknown", tu.foreground_uid(100, {}) is None)
 
 
+def test_login_users_only():
+    defs = os.path.join(tempfile.mkdtemp(), "login.defs")
+    with open(defs, "w") as fh:
+        fh.write("# comment\nUID_MIN\t\t\t 1000\nUID_MAX\t\t\t60000\n")
+    ok("login.defs range read", tu.login_uid_range(defs) == (1000, 60000), tu.login_uid_range(defs))
+    ok("login.defs missing: 1000..60000", tu.login_uid_range("/nonexistent") == (1000, 60000))
+    ok("a system account (uid 1) is never named", tu.user_for_uid(1) is None)
+    ok("nobody (65534) is never named", tu.user_for_uid(65534) is None)
+    me = os.getuid()
+    if 1000 <= me <= 60000:
+        import pwd
+        ok("a login user is named", tu.user_for_uid(me) == pwd.getpwuid(me).pw_name)
+    import pwd as _pwd
+    real = _pwd.getpwnam
+    try:                                   # a name that maps back to a different uid (duplicate / NSS shadow)
+        _pwd.getpwnam = lambda n: type("P", (), {"pw_uid": 4242})()
+        ok("uid -> name -> uid must round-trip", tu.user_for_uid(me) is None)
+    finally:
+        _pwd.getpwnam = real
+
+
+def test_pane_start():
+    snap = tu.snapshot(fake_proc([(100, "bash", 1, 100, TTY_A, 100, PPT)]))
+    ok("live pane on its own terminal: its pid", tu.pane_start(100, TTY_A, False, snap) == 100)
+    ok("dead pane (remain-on-exit): refused", tu.pane_start(100, TTY_A, True, snap) is None)
+    ok("pid now on another terminal (reused): refused", tu.pane_start(100, TTY_B, False, snap) is None)
+    ok("pid gone: refused", tu.pane_start(101, TTY_A, False, snap) is None)
+    ok("no terminal known: refused", tu.pane_start(100, None, False, snap) is None)
+
+
 def test_live_self():
     # against the real /proc: this test process's own uid
     if not os.path.isdir("/proc/self"):
@@ -145,6 +175,8 @@ test_setuid_foreground()
 test_ambiguous()
 test_loop_is_bounded()
 test_missing_and_odd()
+test_login_users_only()
+test_pane_start()
 test_live_self()
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if results and all(results) else 1)

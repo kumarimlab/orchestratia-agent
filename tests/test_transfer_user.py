@@ -38,6 +38,9 @@ class World:
             self.asked.append(session_id), self.uid if session_id in sessions else None)[1]
         tu.user_for_uid = lambda uid: self.names.get(uid)
         tu._can_become = lambda user: user in self.reachable
+        tu._uid_of = lambda name: {v: k for k, v in self.names.items()}.get(name)
+        tu._owns_folder = lambda user: user in self.folders
+        self.folders = set()
         return self
 
 
@@ -47,8 +50,8 @@ def msg(**kw):
     return base
 
 
-def run(m, sessions=None):
-    return asyncio.run(tu.resolve(m, TC, sessions or {SID: object()}))
+def run(m, sessions=None, purpose="decide"):
+    return asyncio.run(tu.resolve(m, TC, sessions or {SID: object()}, purpose))
 
 
 def test_gate():
@@ -105,23 +108,23 @@ def test_carried_user():
     run(msg())                                    # prepare/stat saw ppt
     w.uid = os.geteuid()                          # ...then the user left the ppt shell
     w.names[os.geteuid()] = OWN
-    a = run(msg(os_user="ppt"))
+    a = run(purpose="continue", m=msg(os_user="ppt"))
     ok("open continues as ppt (seen for this session) after the terminal changed",
        a.run_as == "ppt" and a.followed, a)
-    a = run(msg(os_user=OWN))
+    a = run(purpose="continue", m=msg(os_user=OWN))
     ok("carried session user: the session user", a.run_as is None and a.name == OWN, a)
     try:
-        run(msg(os_user="mallory"))
+        run(purpose="continue", m=msg(os_user="mallory"))
         ok("carried user never seen here: refused", False)
     except tu.TerminalChanged:
         ok("carried user never seen here: refused", True)
     try:
-        run(msg(os_user="ppt", session_id="other"), sessions={"other": object()})
+        run(purpose="continue", m=msg(os_user="ppt", session_id="other"), sessions={"other": object()})
         ok("ppt seen in another session doesn't count", False)
     except tu.TerminalChanged:
         ok("ppt seen in another session doesn't count", True)
     try:
-        run(msg(os_user="root"))
+        run(purpose="continue", m=msg(os_user="root"))
         ok("carried root: refused", False)
     except tu.TerminalChanged:
         ok("carried root: refused", True)
@@ -129,12 +132,12 @@ def test_carried_user():
 
 def test_carried_after_restart():
     w = World(uid=1001, names={1001: "ppt"}, reachable={"ppt"}).install()   # empty memory
-    a = run(msg(os_user="ppt"))
+    a = run(purpose="continue", m=msg(os_user="ppt"))
     ok("after an agent restart: accepted while the terminal is still ppt", a.run_as == "ppt", a)
     tu._seen.clear()
     w.uid = None
     try:
-        run(msg(os_user="ppt"))
+        run(purpose="continue", m=msg(os_user="ppt"))
         ok("after a restart with the terminal changed: refused", False)
     except tu.TerminalChanged:
         ok("after a restart with the terminal changed: refused", True)
@@ -146,10 +149,55 @@ def test_carried_unreachable():
     tu._probe_cache.clear()                       # the 5-minute probe cache expired
     tu._can_become = lambda user: False
     try:
-        run(msg(os_user="ppt"))
+        run(purpose="continue", m=msg(os_user="ppt"))
         ok("carried ppt but sudo to ppt now fails: refused", False)
     except tu.TerminalChanged:
         ok("carried ppt but sudo to ppt now fails: refused", True)
+
+
+def test_open_without_saved_user():
+    w = World(uid=1001, names={1001: "ppt"}, reachable={"ppt"}).install()
+    for purpose in ("continue", "cancel"):
+        a = run(msg(), purpose=purpose)
+        ok(f"{purpose} with no saved user: the session user, terminal not read (I-1)",
+           a.run_as is None and a.name == OWN and w.asked == [], a)
+
+
+def test_project_users_never_followed():
+    World(uid=1500, names={1500: "orcp-0123456789ab"}, reachable={"orcp-0123456789ab"}).install()
+    a = run(msg())
+    ok("terminal runs as a project user: not followed (tenant folder)", a.run_as is None and not a.followed, a)
+    try:
+        run(purpose="continue", m=msg(os_user="orcp-0123456789ab"))
+        ok("carried project user: refused", False)
+    except tu.TerminalChanged:
+        ok("carried project user: refused", True)
+
+
+def test_cancel_after_restart():
+    w = World(uid=None, names={1001: "ppt"}, reachable={"ppt"}).install()     # memory empty, terminal changed
+    w.folders = {"ppt"}
+    a = run(msg(os_user="ppt"), purpose="cancel")
+    ok("cancel after a restart: ppt's own folder still cleaned (M-9)", a.run_as == "ppt" and a.followed, a)
+    w.folders = set()
+    try:
+        run(msg(os_user="ppt"), purpose="cancel")
+        ok("cancel: no folder owned by ppt -> refused", False)
+    except tu.TerminalChanged:
+        ok("cancel: no folder owned by ppt -> refused", True)
+    try:
+        run(msg(os_user="ppt"), purpose="continue")
+        ok("but a write after a restart with the terminal changed: refused", False)
+    except tu.TerminalChanged:
+        ok("but a write after a restart with the terminal changed: refused", True)
+
+
+def test_seen_user_skips_proc():
+    w = World(uid=1001, names={1001: "ppt"}, reachable={"ppt"}).install()
+    run(msg())
+    w.asked.clear()
+    run(purpose="continue", m=msg(os_user="ppt"))
+    ok("a user already vouched for: no /proc scan on open (M-8)", w.asked == [], w.asked)
 
 
 def test_helper_argv():
@@ -182,6 +230,10 @@ test_unreachable()
 test_carried_user()
 test_carried_after_restart()
 test_carried_unreachable()
+test_open_without_saved_user()
+test_project_users_never_followed()
+test_cancel_after_restart()
+test_seen_user_skips_proc()
 test_helper_argv()
 test_helper_cmd()
 print(f"\n{sum(results)}/{len(results)} passed")

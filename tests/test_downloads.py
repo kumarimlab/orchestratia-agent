@@ -131,8 +131,26 @@ async def test_teardown_does_not_hang():
     ok("teardown finishes promptly", asyncio.get_running_loop().time() - t0 < 8 and proc.returncode is not None)
 
 
+async def test_helper_cannot_say_who():
+    # a helper (which runs as the session user) printing its own os_user/terminal_user is ignored
+    fake = os.path.join(tempfile.mkdtemp(), "h.py")
+    with open(fake, "w") as fh:
+        fh.write("import json\nprint(json.dumps({'protocol': 2, 'ok': True, 'kind': 'file', 'size': 1, "
+                 "'os_user': 'mallory', 'terminal_user': 'root'}))\n")
+    old = dl.HELPER_SOURCE
+    dl.HELPER_SOURCE = fake
+    try:
+        st = await dl.stat_request({"path": "x", "working_dir": "/", "privilege_tier": "standard"}, TC)
+    finally:
+        dl.HELPER_SOURCE = old
+    from orchestratia_agent import upload_dirs
+    ok("helper's own os_user / terminal_user dropped (M-1)",
+       st.get("os_user") == upload_dirs.own_user() and "terminal_user" not in st, st)
+
+
 test_argv()
 test_check_header()
+asyncio.run(test_helper_cannot_say_who())
 asyncio.run(test_stream())
 asyncio.run(test_teardown_does_not_hang())
 print(f"\n{sum(results)}/{len(results)} passed")

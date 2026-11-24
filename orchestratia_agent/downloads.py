@@ -136,7 +136,9 @@ async def stat_request(msg: dict, tc, sessions=None) -> dict:
         except asyncio.TimeoutError:
             pass
     await _stop(proc)
-    return {**(_check_header(header, err_text) or header), **_who(acting)}
+    reply = {k: v for k, v in (_check_header(header, err_text) or header).items()
+             if k not in ("os_user", "terminal_user")}            # only the agent says who
+    return {**reply, **_who(acting)}
 
 
 async def _wait_credit(more: asyncio.Event, reader: asyncio.Task) -> None:
@@ -164,7 +166,7 @@ async def open_download(msg: dict, tc, api_key: str, ssl_ctx=None, sessions=None
                 await ws.send(json.dumps({"type": "error", "code": code, "message": code, "size": size}))
 
             try:
-                acting = await transfer_user.resolve(msg, tc, sessions)
+                acting = await transfer_user.resolve(msg, tc, sessions, "continue")
             except privilege.PrivilegeError:
                 await error("privilege")
                 return

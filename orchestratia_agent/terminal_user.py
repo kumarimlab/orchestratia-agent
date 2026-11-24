@@ -134,13 +134,46 @@ def foreground_uid(pane_pid: int, snap: dict[int, Proc]) -> int | None:
     return None
 
 
+def login_uid_range(path: str = "/etc/login.defs") -> tuple[int, int]:
+    """UID_MIN..UID_MAX: the uids of people's login accounts (not root, system or service users)."""
+    lo, hi = 1000, 60000
+    try:
+        with open(path) as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    if parts[0] == "UID_MIN":
+                        lo = int(parts[1])
+                    elif parts[0] == "UID_MAX":
+                        hi = int(parts[1])
+    except OSError:
+        pass
+    return lo, hi
+
+
 def user_for_uid(uid: int | None) -> str | None:
-    """Login name for a uid; None for root, an unknown uid or a name unsafe to pass on."""
+    """Login name for a uid, or None: root, system and service accounts (outside
+    UID_MIN..UID_MAX), unknown uids, names unsafe to pass on, and names that don't map
+    back to the same uid (duplicates, NSS shadowing)."""
     if uid is None or uid == 0:
+        return None
+    lo, hi = login_uid_range()
+    if not lo <= uid <= hi:
         return None
     import pwd
     try:
         name = pwd.getpwuid(uid).pw_name
+        if pwd.getpwnam(name).pw_uid != uid:
+            return None
     except KeyError:
         return None
     return name if _NAME_RE.fullmatch(name) else None
+
+
+def pane_start(pane_pid: int | None, pane_rdev: int | None, dead: bool, snap: dict[int, Proc]) -> int | None:
+    """The pane's first process, only if the pane is alive and that pid is still on the
+    pane's own terminal (a dead pane's pid can be reused by anyone's process)."""
+    if dead or not pane_pid or not pane_rdev:
+        return None
+    p = snap.get(pane_pid)
+    return pane_pid if p is not None and p.tty_nr == pane_rdev else None

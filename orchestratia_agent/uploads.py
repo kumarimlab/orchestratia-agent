@@ -302,7 +302,7 @@ async def open_upload(msg: dict, tc, api_key: str, ssl_ctx=None, sessions=None) 
                     await error("busy", "this upload is already being received")
                     return
             try:
-                acting = await transfer_user.resolve(msg, tc, sessions)
+                acting = await transfer_user.resolve(msg, tc, sessions, "continue")
             except privilege.PrivilegeError:
                 await error("privilege")
                 return
@@ -361,7 +361,7 @@ async def cancel(msg: dict, tc, sessions=None) -> None:
         proc = live_links.get(uid)
         if proc is not None:
             await _stop(proc)
-        acting = await transfer_user.resolve(msg, tc, sessions)
+        acting = await transfer_user.resolve(msg, tc, sessions, "cancel")
         folder = await _folder(acting)
         res: dict = {}
         for _ in range(3):

@@ -1355,7 +1355,8 @@ async def ws_receive_loop(ws, state: DaemonState):
                     from orchestratia_agent import downloads as _dl
                     from orchestratia_agent.tls import build_ssl_context
                     asyncio.create_task(_dl.open_download(
-                        msg, _tier_config(state), state.api_key, build_ssl_context(state=state)))
+                        msg, _tier_config(state), state.api_key, build_ssl_context(state=state),
+                        sessions=state.active_sessions))
 
             elif msg_type == "upload_prepare":
                 if msg.get("request_id"):
@@ -1366,12 +1367,13 @@ async def ws_receive_loop(ws, state: DaemonState):
                     from orchestratia_agent import uploads as _ul
                     from orchestratia_agent.tls import build_ssl_context
                     asyncio.create_task(_ul.open_upload(
-                        msg, _tier_config(state), state.api_key, build_ssl_context(state=state)))
+                        msg, _tier_config(state), state.api_key, build_ssl_context(state=state),
+                        sessions=state.active_sessions))
 
             elif msg_type == "upload_cancel":
                 if msg.get("upload_id"):
                     from orchestratia_agent import uploads as _ul
-                    asyncio.create_task(_ul.cancel(msg, _tier_config(state)))
+                    asyncio.create_task(_ul.cancel(msg, _tier_config(state), sessions=state.active_sessions))
 
             elif msg_type == "remote_exec":
                 request_id = msg.get("request_id")
@@ -2352,7 +2354,7 @@ async def _handle_download_stat(state: DaemonState, sender, msg: dict):
     """Preflight for a download: stat the path AS the session user."""
     from orchestratia_agent import downloads as _dl
     try:
-        result = await _dl.stat_request(msg, _tier_config(state))
+        result = await _dl.stat_request(msg, _tier_config(state), sessions=state.active_sessions)
     except Exception as e:  # noqa: BLE001
         log.exception("download_stat failed")
         result = {"ok": False, "error": "invalid", "detail": type(e).__name__}
@@ -2363,7 +2365,7 @@ async def _handle_upload_prepare(state: DaemonState, sender, msg: dict):
     """Preflight for an upload: folder, name and free space checked AS the session user."""
     from orchestratia_agent import uploads as _ul
     try:
-        result = await _ul.prepare_request(msg, _tier_config(state))
+        result = await _ul.prepare_request(msg, _tier_config(state), sessions=state.active_sessions)
     except Exception as e:  # noqa: BLE001
         log.exception("upload_prepare failed")
         result = {"ok": False, "error": "invalid", "detail": type(e).__name__}

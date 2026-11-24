@@ -16,7 +16,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import websockets  # noqa: E402
 
-from orchestratia_agent import uploads as ul  # noqa: E402
+from orchestratia_agent import upload_dirs, uploads as ul  # noqa: E402
 from orchestratia_agent.privilege import TierConfig  # noqa: E402
 
 results = []
@@ -25,7 +25,11 @@ PORT = 18793
 CS = 1024 * 1024
 PIECE = 256 * 1024
 FOLDER = tempfile.mkdtemp(prefix="ul-link-")
-ul._folder = lambda run_as: FOLDER          # never the real /tmp/orchestratia-uploads
+async def _test_folder(acting):
+    return FOLDER
+
+
+ul._folder = _test_folder                     # never the real /tmp/orchestratia-uploads
 ul.REOPEN_WAIT = 1
 
 
@@ -268,7 +272,8 @@ async def test_link(relay):
         await asyncio.wait_for(task, 15)
         pre = await ul.prepare_request({"upload_id": uid, "name": "old.bin", "size": 10, "chunk_size": CS,
                                         "privilege_tier": "standard"}, TC)
-        ok("old helper -> prepare says helper_outdated", pre == {"ok": False, "error": "helper_outdated"}, pre)
+        ok("old helper -> prepare says helper_outdated (and who it acted as)",
+           pre == {"ok": False, "error": "helper_outdated", "os_user": upload_dirs.own_user()}, pre)
     finally:
         ul.HELPER_SOURCE = old_src
 

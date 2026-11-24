@@ -25,9 +25,9 @@ from urllib.parse import urlsplit
 
 import websockets
 
-from orchestratia_agent import privilege, upload_dirs
+from orchestratia_agent import privilege, transfer_user, upload_dirs
 from orchestratia_agent.dl_helper import valid_name
-from orchestratia_agent.downloads import HELPER_INSTALL_PATH, HELPER_SOURCE, _check_header, _run_as, _stop
+from orchestratia_agent.downloads import HELPER_INSTALL_PATH, HELPER_SOURCE, _check_header, _stop, _who
 
 log = logging.getLogger("orchestratia-agent.uploads")
 
@@ -43,7 +43,7 @@ TERMINAL = ("tampered", "name_exhausted", "io")
 # Link error codes the relay maps (Phase B contract note 4); anything else -> internal.
 LINK_ERRORS = frozenset({"checksum_mismatch", "no_space", "helper_outdated", "tampered", "offset_mismatch",
                          "busy", "io", "internal", "unsafe_destination", "permission_denied", "privilege",
-                         "invalid_name", "name_exhausted", "invalid", "protocol"})
+                         "invalid_name", "name_exhausted", "invalid", "protocol", "terminal_changed"})
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _LOOPBACK = ("127.0.0.1", "localhost", "::1")
@@ -88,10 +88,12 @@ def _relay_url_ok(url: str) -> bool:
 live_links: dict[str, asyncio.subprocess.Process] = {}
 
 
-def helper_argv(run_as, tc, op: str, folder: str) -> list[str]:
+def helper_argv(run_as, tc, op: str, folder: str, followed: bool = False) -> list[str]:
     """Nothing about the upload goes in argv (ps, sudo's log): it all goes on stdin."""
     if run_as is None:
         return [sys.executable, "-I", HELPER_SOURCE, op, "--base", folder]
+    if followed:
+        return privilege.sudo_prefix(run_as, tc) + transfer_user.helper_cmd() + [op, "--base", folder]
     return privilege.sudo_prefix(run_as, tc) + [HELPER_INSTALL_PATH, op, "--base", folder]
 
 
@@ -101,9 +103,10 @@ def _request(msg: dict) -> dict:
             "reservation": msg.get("reservation") or 0}
 
 
-def _folder(run_as) -> str:
-    """The session user's upload folder (created/verified by upload_dirs)."""
-    return upload_dirs.folder_for(run_as)
+async def _folder(acting) -> str:
+    """The acting user's upload folder (created/verified by upload_dirs; a followed
+    user's may need sudo, so off the event loop)."""
+    return await asyncio.get_running_loop().run_in_executor(None, transfer_user.folder_for, acting)
 
 
 async def _spawn(argv):
@@ -141,10 +144,10 @@ async def _stderr_text(proc) -> str:
 
 
 async def _run_once(run_as, tc, op: str, folder: str, req: dict, timeout: float = OP_TIMEOUT,
-                    need_op: str | None = None) -> dict:
+                    need_op: str | None = None, followed: bool = False) -> dict:
     """Run a one-line helper op (ul-prepare / ul-cancel / ul-sweep) and return its header,
     or an error dict ({"ok": False, "error": ...})."""
-    proc = await _spawn(helper_argv(run_as, tc, op, folder))
+    proc = await _spawn(helper_argv(run_as, tc, op, folder, followed))
     try:
         await _write(proc, json.dumps(req).encode() + b"\n")
         try:
@@ -161,21 +164,23 @@ async def _run_once(run_as, tc, op: str, folder: str, req: dict, timeout: float 
     return _check_header(header, err_text, need_op=need_op or op) or header
 
 
-async def prepare_request(msg: dict, tc) -> dict:
-    """Preflight AS the session user: folder safety, name, free space (minus the
-    hub-supplied reservation), the journal's offset, a finished upload's done record."""
+async def prepare_request(msg: dict, tc, sessions=None) -> dict:
+    """Preflight AS the acting user (transfer_user): folder safety, name, free space
+    (minus the hub-supplied reservation), the journal's offset, a finished upload's done record."""
     try:
-        run_as = _run_as(msg, tc)
+        acting = await transfer_user.resolve(msg, tc, sessions)
     except privilege.PrivilegeError:
         return {"ok": False, "error": "privilege"}
+    except transfer_user.TerminalChanged:
+        return {"ok": False, "error": "terminal_changed"}
     try:
-        folder = _folder(run_as)
+        folder = await _folder(acting)
     except upload_dirs.UploadDirError as e:
         log.warning("upload %s: %s", str(msg.get("upload_id"))[:8], e)
-        return {"ok": False, "error": e.code}
-    header = await _run_once(run_as, tc, "ul-prepare", folder, _request(msg), PREPARE_TIMEOUT,
-                             need_op="ul-write")
-    out = {"ok": header.get("ok") is True}
+        return {"ok": False, "error": e.code, **_who(acting)}
+    header = await _run_once(acting.run_as, tc, "ul-prepare", folder, _request(msg), PREPARE_TIMEOUT,
+                             need_op="ul-write", followed=acting.followed)
+    out = {"ok": header.get("ok") is True, **_who(acting)}
     for key in ("error", "dir", "free_bytes", "offset", "done", "protocol"):
         if header.get(key) is not None:
             out[key] = header[key]
@@ -264,7 +269,7 @@ async def _helper_to_relay(proc, send, folder: str) -> None:
             pass
 
 
-async def open_upload(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
+async def open_upload(msg: dict, tc, api_key: str, ssl_ctx=None, sessions=None) -> None:
     """Dial the relay for ONE upload and bridge it to a ul-write helper until either
     side ends. Never raises."""
     uid = str(msg.get("upload_id") or "")
@@ -297,16 +302,19 @@ async def open_upload(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
                     await error("busy", "this upload is already being received")
                     return
             try:
-                run_as = _run_as(msg, tc)
+                acting = await transfer_user.resolve(msg, tc, sessions)
             except privilege.PrivilegeError:
                 await error("privilege")
                 return
+            except transfer_user.TerminalChanged:
+                await error("terminal_changed", "the terminal no longer runs as the user this upload started as")
+                return
             try:
-                folder = _folder(run_as)
+                folder = await _folder(acting)
             except upload_dirs.UploadDirError as e:
                 await error(e.code, str(e)[:160])
                 return
-            proc = await _spawn(helper_argv(run_as, tc, "ul-write", folder))
+            proc = await _spawn(helper_argv(acting.run_as, tc, "ul-write", folder, acting.followed))
             live_links[uid] = proc
             await _write(proc, json.dumps(_request(msg)).encode() + b"\n")
             try:
@@ -345,7 +353,7 @@ async def open_upload(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
                 live_links.pop(uid, None)
 
 
-async def cancel(msg: dict, tc) -> None:
+async def cancel(msg: dict, tc, sessions=None) -> None:
     """The hub ended this upload (cancelled / expired / denied / failed). Stop a live
     link first — its helper holds the part's lock — then remove the files. Never raises."""
     uid = str(msg.get("upload_id") or "")
@@ -353,18 +361,19 @@ async def cancel(msg: dict, tc) -> None:
         proc = live_links.get(uid)
         if proc is not None:
             await _stop(proc)
-        run_as = _run_as(msg, tc)
-        folder = _folder(run_as)
+        acting = await transfer_user.resolve(msg, tc, sessions)
+        folder = await _folder(acting)
         res: dict = {}
         for _ in range(3):
-            res = await _run_once(run_as, tc, "ul-cancel", folder, {"upload_id": uid})
+            res = await _run_once(acting.run_as, tc, "ul-cancel", folder, {"upload_id": uid},
+                                  followed=acting.followed)
             if res.get("error") != "busy":
                 break
             await asyncio.sleep(1)
         if not res.get("ok"):
             log.info("upload %s: cancel left files behind (%s); the hourly sweep removes them",
                      uid[:8], res.get("error"))
-    except (privilege.PrivilegeError, upload_dirs.UploadDirError) as e:
+    except (privilege.PrivilegeError, upload_dirs.UploadDirError, transfer_user.TerminalChanged) as e:
         log.info("upload %s: nothing to cancel here (%s)", uid[:8], e)
     except Exception as e:                               # noqa: BLE001
         log.warning("upload %s: cancel failed: %s", uid[:8], e)
@@ -374,14 +383,20 @@ async def sweep_all(tc) -> None:
     """ul-sweep in the daemon user's folder and, as each project user, in theirs."""
     if sys.platform == "win32":
         return
-    users = [None] + sorted({pt.user for pid, pt in tc.projects.items() if pid != privilege.LEGACY_KEY})
-    for run_as in users:
+    loop = asyncio.get_running_loop()
+    actings = [transfer_user.Acting(None, "")] + [
+        transfer_user.Acting(u, u) for u in sorted({pt.user for pid, pt in tc.projects.items()
+                                                    if pid != privilege.LEGACY_KEY})]
+    for user in await loop.run_in_executor(None, transfer_user.followed_users, tc):
+        if await transfer_user._reachable(user):        # the folders transfers followed into
+            actings.append(transfer_user.Acting(user, user, followed=True))
+    for acting in actings:
         try:
-            folder = _folder(run_as)
+            folder = await _folder(acting)
         except upload_dirs.UploadDirError as e:
-            log.debug("upload sweep: skipping %s: %s", run_as or "daemon user", e)
+            log.debug("upload sweep: skipping %s: %s", acting.run_as or "daemon user", e)
             continue
-        res = await _run_once(run_as, tc, "ul-sweep", folder, {})
+        res = await _run_once(acting.run_as, tc, "ul-sweep", folder, {}, followed=acting.followed)
         if res.get("removed"):
             log.info("upload sweep: removed %d stale file(s) from %s", res["removed"], folder)
         elif not res.get("ok"):

@@ -18,7 +18,7 @@ import sys
 
 import websockets
 
-from orchestratia_agent import privilege
+from orchestratia_agent import privilege, transfer_user
 
 log = logging.getLogger("orchestratia-agent.downloads")
 
@@ -29,16 +29,28 @@ WINDOW = 4 * 1024 * 1024
 STAT_TIMEOUT = 30
 
 
-def helper_argv(run_as, tc, args: list[str], path: str) -> list[str]:
+def helper_argv(run_as, tc, args: list[str], path: str, followed: bool = False) -> list[str]:
     """`-I` keeps PYTHONPATH/user-site/cwd off sys.path; `--` keeps a path starting
-    with '-' from ever being read as an option."""
+    with '-' from ever being read as an option. `followed`: a user taken from the
+    terminal (transfer_user), not a project user with its own sudoers rule."""
     if run_as is None:
         return [sys.executable, "-I", HELPER_SOURCE, *args, "--", path]
+    if followed:
+        return privilege.sudo_prefix(run_as, tc) + transfer_user.helper_cmd() + [*args, "--", path]
     return privilege.sudo_prefix(run_as, tc) + [HELPER_INSTALL_PATH, *args, "--", path]
 
 
 def _run_as(msg: dict, tc):
     return privilege.resolve_user(msg.get("privilege_tier") or "standard", msg.get("project_id"), tc)
+
+
+def _who(acting) -> dict:
+    """What a reply says about the user: who it acted as, and the terminal's user when
+    that was someone else (the hub explains why)."""
+    out = {"os_user": acting.name} if acting.name else {}
+    if acting.terminal_user:
+        out["terminal_user"] = acting.terminal_user
+    return out
 
 
 async def _spawn(argv):
@@ -103,13 +115,15 @@ def _check_header(header: dict, stderr_text: str = "", need_op: str | None = Non
     return None
 
 
-async def stat_request(msg: dict, tc) -> dict:
+async def stat_request(msg: dict, tc, sessions=None) -> dict:
     try:
-        run_as = _run_as(msg, tc)
+        acting = await transfer_user.resolve(msg, tc, sessions)
     except privilege.PrivilegeError:
         return {"ok": False, "error": "privilege"}
-    proc = await _spawn(helper_argv(run_as, tc, ["stat", "--cwd", msg.get("working_dir") or ""],
-                                    msg.get("path") or ""))
+    except transfer_user.TerminalChanged:
+        return {"ok": False, "error": "terminal_changed"}
+    proc = await _spawn(helper_argv(acting.run_as, tc, ["stat", "--cwd", msg.get("working_dir") or ""],
+                                    msg.get("path") or "", followed=acting.followed))
     try:
         header = await asyncio.wait_for(_read_header(proc), timeout=STAT_TIMEOUT)
     except asyncio.TimeoutError:
@@ -122,7 +136,7 @@ async def stat_request(msg: dict, tc) -> dict:
         except asyncio.TimeoutError:
             pass
     await _stop(proc)
-    return _check_header(header, err_text) or header
+    return {**(_check_header(header, err_text) or header), **_who(acting)}
 
 
 async def _wait_credit(more: asyncio.Event, reader: asyncio.Task) -> None:
@@ -133,7 +147,7 @@ async def _wait_credit(more: asyncio.Event, reader: asyncio.Task) -> None:
         w.cancel()
 
 
-async def open_download(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
+async def open_download(msg: dict, tc, api_key: str, ssl_ctx=None, sessions=None) -> None:
     """Dial the relay for ONE browser request and stream it. Never raises."""
     target = f"{(msg.get('relay_url') or '').rstrip('/')}/ws/relay-dl"
     proc = None
@@ -150,9 +164,12 @@ async def open_download(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
                 await ws.send(json.dumps({"type": "error", "code": code, "message": code, "size": size}))
 
             try:
-                run_as = _run_as(msg, tc)
+                acting = await transfer_user.resolve(msg, tc, sessions)
             except privilege.PrivilegeError:
                 await error("privilege")
+                return
+            except transfer_user.TerminalChanged:
+                await error("terminal_changed")
                 return
             kind = "dir" if msg.get("kind") == "dir" else "file"
             args = ["zip" if kind == "dir" else "read", "--cwd", msg.get("working_dir") or ""]
@@ -160,7 +177,8 @@ async def open_download(msg: dict, tc, api_key: str, ssl_ctx=None) -> None:
                 args += ["--range", msg["range"]]
             if kind == "file" and msg.get("if_range"):
                 args += ["--if-range", msg["if_range"]]
-            proc = await _spawn(helper_argv(run_as, tc, args, msg.get("path") or ""))
+            proc = await _spawn(helper_argv(acting.run_as, tc, args, msg.get("path") or "",
+                                            followed=acting.followed))
             header = await _read_header(proc)
             bad = _check_header(header)
             if bad or not header.get("ok"):

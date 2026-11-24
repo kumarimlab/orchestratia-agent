@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass
 
 MAX_DEPTH = 8
-_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}")
 
 
 @dataclass(frozen=True)
@@ -143,4 +143,4 @@ def user_for_uid(uid: int | None) -> str | None:
         name = pwd.getpwuid(uid).pw_name
     except KeyError:
         return None
-    return name if _NAME_RE.match(name) else None
+    return name if _NAME_RE.fullmatch(name) else None
